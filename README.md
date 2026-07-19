@@ -7,6 +7,7 @@
 | 扩展 | 描述 |
 |------|------|
 | [notify](extensions/notify.ts) | 任务完成后发送桌面通知（支持 iTerm2、Kitty、Ghostty、WezTerm、Windows Terminal） |
+| [token-stats](extensions/token-stats.ts) | 统计 Token 用量，支持 `/tokens` 命令和 footer 实时显示 |
 
 ## 安装
 
