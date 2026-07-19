@@ -1,0 +1,23 @@
+{
+  "name": "@vkzha/pi-extensions",
+  "version": "0.1.0",
+  "description": "我的 Pi 编码助手扩展集合",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "extensions/",
+    "package.json"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "extensions": ["./extensions"]
+  }
+}
