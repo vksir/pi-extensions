@@ -5,9 +5,10 @@
  * 增量写入 ~/.pi/token-stats.json。不做任何 session 文件扫描。
  *
  * 命令：
- *   /tokens         — 全局累计统计 + 柱状图
- *   /tokens 7d      — 近 7 天
- *   /tokens 30d     — 近 30 天
+ *   /tokens             — 全局累计统计 + Input 柱状图
+ *   /tokens 7d          — 近 7 天
+ *   /tokens 30d         — 近 30 天
+ *   /tokens Out[put]    — 显示 Output 柱状图（可与天数组合，如 /tokens 7d Out）
  */
 
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -141,7 +142,7 @@ function renderBar(value: number, max: number, width: number): string {
 	return "█".repeat(Math.max(1, Math.round((value / max) * width)));
 }
 
-function renderStats(cache: GlobalCache, days: number): string[] {
+function renderStats(cache: GlobalCache, days: number, showOutput = false): string[] {
 	const lines: string[] = [];
 	const label = days === 0 ? "全部" : `近 ${days} 天`;
 	lines.push(`  📊 Token 用量趋势 (${label})`);
@@ -180,6 +181,9 @@ function renderStats(cache: GlobalCache, days: number): string[] {
 		for (const d of dateModelData) {
 			const val = getVal(d);
 			const dateLabel = d.date === prevDate ? "     " : d.date.slice(5);
+			if (d.date !== prevDate && prevDate !== "") {
+				lines.push("");
+			}
 			prevDate = d.date;
 			const bar = renderBar(val, maxVal, bw);
 			lines.push(`  ${dateLabel} ${bar}  ${fmt(val).padStart(8)}  ${d.model}`);
@@ -187,8 +191,11 @@ function renderStats(cache: GlobalCache, days: number): string[] {
 		lines.push("");
 	}
 
-	drawChart("Tokens per Day (Input)", (d) => d.input, maxIn);
-	drawChart("Tokens per Day (Output)", (d) => d.output, maxOut);
+	if (showOutput) {
+		drawChart("Tokens per Day (Output)", (d) => d.output, maxOut);
+	} else {
+		drawChart("Tokens per Day (Input)", (d) => d.input, maxIn);
+	}
 
 	// 模型汇总
 	const byModel = computeTotalsByModel(cache);
@@ -245,16 +252,21 @@ export default function (pi: ExtensionAPI) {
 	// ─── 命令 ───
 
 	pi.registerCommand("tokens", {
-		description: "Token 用量统计。参数: 7d / 30d",
+		description: "Token 用量统计。参数: 7d / 30d / Output / Out",
 		handler: async (args, ctx) => {
 			try {
-				const arg = args.trim().toLowerCase();
+				const parts = args.trim().split(/\s+/);
 				let days = 0;
-				if (arg === "7d") days = 7;
-				else if (arg === "30d") days = 30;
+				let showOutput = false;
+				for (const part of parts) {
+					const p = part.toLowerCase();
+					if (p === "7d") days = 7;
+					else if (p === "30d") days = 30;
+					else if (p === "output" || p === "out") showOutput = true;
+				}
 
 				const cache = loadCache();
-				const lines = renderStats(cache, days);
+				const lines = renderStats(cache, days, showOutput);
 				pi.appendEntry<TokenStatsEntry>("token-stats", { lines });
 			} catch (e) {
 				ctx.ui.notify(`[error] ${(e as Error).message}`, "error");
