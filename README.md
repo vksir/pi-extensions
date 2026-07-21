@@ -6,31 +6,7 @@
 
 | 扩展 | 描述 |
 |------|------|
-| [notify](extensions/notify.ts) | 任务完成后发送桌面通知（支持 iTerm2、Kitty、Ghostty、WezTerm、Windows Terminal） |
-| [token-stats](extensions/token-stats.ts) | 统计 Token 用量，支持 `/tokens` 命令和 footer 实时显示 |
-
-## 安装
-
-### 通过 npm（推荐）
-
-```bash
-# 全局安装
-pi install npm:@vkzha/pi-extensions
-
-# 或仅当前项目
-pi install -l npm:@vkzha/pi-extensions
-```
-
-### 通过 GitHub
-
-```bash
-pi install git:github.com/<你的用户名>/pi-extensions
-```
-
-### 手动使用
-
-也可以直接把扩展文件复制到扩展目录：
-
-```bash
-cp extensions/notify.ts ~/.pi/agent/extensions/
-```
+| [pi-balance](extensions/pi-balance.ts) | 查询 AI 模型提供商余额（支持 DeepSeek、Moonshot、OpenRouter） |
+| [pi-notify](extensions/pi-notify.ts) | 任务完成后发送桌面通知（支持 iTerm2、Kitty、Ghostty、WezTerm、Windows Terminal） |
+| [pi-title-animation](extensions/pi-title-animation.ts) | Agent 运行时在窗口标题显示旋转动画，结束后恢复原标题 |
+| [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 用量，支持 `/tokens` 命令和 footer 实时显示 |

@@ -10,6 +10,16 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+function basename(p: string): string {
+    const idx = Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/"));
+    return idx >= 0 ? p.slice(idx + 1) : p;
+}
+
+function getTitle(): string {
+    const cwdName = basename(process.cwd());
+    return `π - ${cwdName}`;
+}
+
 function notifyOSC777(title: string, body: string): void {
 	process.stdout.write(`\x1b]777;notify;${title};${body}\x07`);
 }
@@ -23,7 +33,7 @@ function notifyOSC99(title: string, body: string): void {
 function notifyWindows(title: string, body: string): void {
 	// Install-Module -Name BurntToast
 	const { execFile } = require("child_process");
-	execFile("powershell.exe", ["-NoProfile", "-Command", `New-BurntToastNotification -Text '${title}', '${body}'`]);
+	execFile("powershell.exe", ["-NoProfile", "-Command", `New-BurntToastNotification -Text '${title}', '${body}'`], { windowsHide: true });
 }
 
 function notify(title: string, body: string): void {
@@ -43,8 +53,10 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.signal?.aborted) aborted = true;
 	});
 
-	pi.on("agent_settled", async () => {
-		if (!aborted) notify("Pi", "Task Completed");
+	pi.on("agent_settled", async (_event, ctx) => {
+		if (!aborted) {
+			notify(getTitle(), "Task Completed");
+		}
 		aborted = false;
 	});
 }
