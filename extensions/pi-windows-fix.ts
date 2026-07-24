@@ -4,9 +4,10 @@
 
 import { isToolCallEventType, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { normalize } from "node:path";
+import { tmpdir } from "node:os";
 
 const IS_WIN32 = process.platform === "win32";
-const TEMP_DIR = "C:\\Windows\\Temp";
+const TEMP_DIR = tmpdir();
 const PATH_TOOLS = new Set(["write", "read", "edit", "grep", "find", "ls"]);
 
 function fixPath(p: string): string {
