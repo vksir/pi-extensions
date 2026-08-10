@@ -19,7 +19,7 @@ function fixPath(p: string): string {
 }
 
 function fixBashCommand(cmd: string): string {
-  return cmd.replace(/> nul/gi, "> /dev/null");
+  return cmd.replace(/> ?nul\b/gi, ">/dev/null");
 }
 
 export default function (pi: ExtensionAPI) {
