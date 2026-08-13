@@ -9,8 +9,13 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 const FRAMES = ["⠂", "⠐"];
 const INTERVAL_MS = 960;
+
+type SessionKey = ExtensionContext["sessionManager"];
+
+// 活跃 session → 其 ctx。主 session 先插入，Map 迭代按插入序，主优先。
+const activeSessions = new Map<SessionKey, ExtensionContext>();
 let timer: ReturnType<typeof setInterval> | null = null;
-let i = 0;
+let frame = 0;
 
 function basename(p: string): string {
     const idx = Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/"));
@@ -23,23 +28,56 @@ function getTitle(ctx: ExtensionContext): string {
     return session ? `π - ${session} - ${cwdName}` : `π - ${cwdName}`;
 }
 
+function pickCtx(): ExtensionContext | undefined {
+    for (const ctx of activeSessions.values()) {
+        return ctx;
+    }
+    return undefined;
+}
+
+function tick() {
+    const ctx = pickCtx();
+    if (!ctx) return;
+    try {
+        ctx.ui.setTitle(FRAMES[frame++ % FRAMES.length]);
+    } catch {
+        // ctx 可能已 stale（session 正在 shutdown），忽略本次写入。
+    }
+}
+
 function start(ctx: ExtensionContext) {
-    if (timer !== null) return;
-    i = 0;
-    const tick = () => {
-        ctx.ui.setTitle(FRAMES[i++ % FRAMES.length]);
-    };
-    tick();
-    timer = setInterval(tick, INTERVAL_MS);
+    const sm = ctx.sessionManager;
+    if (!activeSessions.has(sm)) {
+        activeSessions.set(sm, ctx);
+    }
+    if (timer === null) {
+        frame = 0;
+        tick();
+        timer = setInterval(tick, INTERVAL_MS);
+    }
 }
 
 function stop(ctx: ExtensionContext, title: string) {
-    if (timer !== null) {
+    const sm = ctx.sessionManager;
+    activeSessions.delete(sm);
+    if (activeSessions.size === 0) {
+        if (timer !== null) {
+            clearInterval(timer);
+            timer = null;
+        }
+        frame = 0;
+        ctx.ui.setTitle(title);
+    }
+}
+
+function cleanup(ctx: ExtensionContext) {
+    const sm = ctx.sessionManager;
+    activeSessions.delete(sm);
+    if (activeSessions.size === 0 && timer !== null) {
         clearInterval(timer);
         timer = null;
+        frame = 0;
     }
-    i = 0;
-    ctx.ui.setTitle(title);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -48,15 +86,10 @@ export default function (pi: ExtensionAPI) {
     });
 
     pi.on("agent_settled", async (_event, ctx) => {
-        const title = getTitle(ctx);
-        stop(ctx, title);
+        stop(ctx, getTitle(ctx));
     });
 
-    pi.on("session_shutdown", async () => {
-        if (timer !== null) {
-            clearInterval(timer);
-            timer = null;
-        }
-        i = 0;
+    pi.on("session_shutdown", async (_event, ctx) => {
+        cleanup(ctx);
     });
 }
