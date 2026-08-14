@@ -6,7 +6,7 @@
  *
  * 命令：
  *   /tokens             — 全局累计统计 + Input 柱状图
- *   /tokens 7d          — 近 7 天
+ *   /tokens 3d          — 近 3 天（Nd 任意天数）
  *   /tokens 30d         — 近 30 天
  *   /tokens Out[put]    — 显示 Output 柱状图（可与天数组合，如 /tokens 7d Out）
  */
@@ -98,11 +98,23 @@ function shortDate(date?: Date): string {
 	return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+// 缓存命中率 = cacheRead / 总输入(含缓存)。不用 cacheRead/(cacheRead+cacheWrite)：
+// DeepSeek 等 OpenAI 兼容 provider 不报告 cache_write_tokens（pi 映射后 cacheWrite 恒 0，
+// 未命中 token 被计入 input），旧口径会恒显示 100%。
+// 新口径在 DeepSeek 下等价于 hit/(hit+miss)，在 Anthropic 下度量"输入中缓存命中占比"。
+function hitRate(cacheRead: number, totalInput: number): string {
+	if (totalInput === 0) return "-";
+	return `CH${((cacheRead / totalInput) * 100).toFixed(2)}%`;
+}
+
 // ─── 查询 ───
 
-function computeTotalsByModel(cache: GlobalCache): Map<string, ModelUsage> {
+function computeTotalsByModel(cache: GlobalCache, dates?: string[]): Map<string, ModelUsage> {
 	const byModel = new Map<string, ModelUsage>();
-	for (const day of Object.values(cache.byDate)) {
+	const dateKeys = dates && dates.length > 0 ? dates : Object.keys(cache.byDate);
+	for (const d of dateKeys) {
+		const day = cache.byDate[d];
+		if (!day) continue;
 		for (const [key, u] of Object.entries(day.models)) {
 			let acc = byModel.get(key);
 			if (!acc) {
@@ -150,7 +162,8 @@ function renderStats(cache: GlobalCache, days: number, showOutput = false): stri
 
 	const sortedDates = Object.keys(cache.byDate).sort();
 	const cutoff = days > 0 ? new Date() : null;
-	if (cutoff) cutoff.setDate(cutoff.getDate() - days);
+	// "近 N 天" = 含今天往前数 N 天：从 today-(N-1) 开始过滤，避免 d >= today-N 多出 1 天
+	if (cutoff) cutoff.setDate(cutoff.getDate() - days + 1);
 	const filtered = cutoff ? sortedDates.filter((d) => d >= shortDate(cutoff)) : sortedDates;
 
 	if (filtered.length === 0) {
@@ -158,7 +171,7 @@ function renderStats(cache: GlobalCache, days: number, showOutput = false): stri
 		return lines;
 	}
 
-	const dateModelData: Array<{ date: string; model: string; input: number; output: number }> = [];
+	const dateModelData: Array<{ date: string; model: string; input: number; output: number; cacheRead: number; cacheWrite: number }> = [];
 	let maxIn = 0, maxOut = 0;
 	for (const d of filtered) {
 		const day = cache.byDate[d];
@@ -167,7 +180,7 @@ function renderStats(cache: GlobalCache, days: number, showOutput = false): stri
 			const out = u.output;
 			if (inp > maxIn) maxIn = inp;
 			if (out > maxOut) maxOut = out;
-			dateModelData.push({ date: d, model, input: inp, output: out });
+			dateModelData.push({ date: d, model, input: inp, output: out, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite });
 		}
 	}
 	if (maxIn === 0) maxIn = 1;
@@ -175,7 +188,7 @@ function renderStats(cache: GlobalCache, days: number, showOutput = false): stri
 
 	const bw = barWidth((process.stdout as { columns?: number })?.columns ?? 80);
 
-	function drawChart(title: string, getVal: (d: typeof dateModelData[0]) => number, maxVal: number): void {
+	function drawChart(title: string, getVal: (d: typeof dateModelData[0]) => number, maxVal: number, showHit: boolean): void {
 		lines.push(`  ${title}`);
 		let prevDate = "";
 		for (const d of dateModelData) {
@@ -186,33 +199,34 @@ function renderStats(cache: GlobalCache, days: number, showOutput = false): stri
 			}
 			prevDate = d.date;
 			const bar = renderBar(val, maxVal, bw);
-			lines.push(`  ${dateLabel} ${bar}  ${fmt(val).padStart(8)}  ${d.model}`);
+			const hitPart = showHit ? `  ${hitRate(d.cacheRead, d.input).padStart(8)}` : "";
+			lines.push(`  ${dateLabel} ${bar}  ${fmt(val).padStart(8)}${hitPart}  ${d.model}`);
 		}
 		lines.push("");
 	}
 
 	if (showOutput) {
-		drawChart("Tokens per Day (Output)", (d) => d.output, maxOut);
+		drawChart("Tokens per Day (Output)", (d) => d.output, maxOut, false);
 	} else {
-		drawChart("Tokens per Day (Input)", (d) => d.input, maxIn);
+		drawChart("Tokens per Day (Input)", (d) => d.input, maxIn, true);
 	}
 
-	// 模型汇总
-	const byModel = computeTotalsByModel(cache);
+	// 模型汇总（按天数过滤后的日期，与柱状图一致）
+	const byModel = computeTotalsByModel(cache, filtered);
 	const total = sumUsage(byModel);
 	const totalInput = total.input + total.cacheRead + total.cacheWrite;
 
 	const modelList = [...byModel.entries()]
-		.map(([key, u]) => ({ key, input: u.input + u.cacheRead + u.cacheWrite, output: u.output, cost: u.cost }))
+		.map(([key, u]) => ({ key, input: u.input + u.cacheRead + u.cacheWrite, plainIn: u.input, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite, output: u.output, cost: u.cost }))
 		.sort((a, b) => b.input - a.input);
 
 	for (const m of modelList) {
 		const pct = totalInput > 0 ? ((m.input / totalInput) * 100).toFixed(1) : "0.0";
 		lines.push(`  ● ${m.key} (${pct}%)`);
-		lines.push(`    In: ${fmt(m.input)} · Out: ${fmt(m.output)} · ${fmtCost(m.cost)}`);
+		lines.push(`    In: ${fmt(m.plainIn)} (${hitRate(m.cacheRead, m.input)}) · Out: ${fmt(m.output)} · ${fmtCost(m.cost)}`);
 	}
 	lines.push("");
-	lines.push(`  Input: ${fmt(totalInput)} · Output: ${fmt(total.output)} · ${fmtCost(total.cost)}`);
+	lines.push(`  Input: ${fmt(total.input)} (${hitRate(total.cacheRead, totalInput)}) · Output: ${fmt(total.output)} · ${fmtCost(total.cost)}`);
 	lines.push("");
 
 	return lines;
@@ -238,21 +252,21 @@ export default function (pi: ExtensionAPI) {
 				? `${msg.provider}/${msg.model}`
 				: msg?.model || "unknown";
 			const cache = loadCache();
-		addUsage(cache, shortDate(), model, {
-			input: u.input ?? 0,
-			output: u.output ?? 0,
-			cacheRead: u.cacheRead ?? 0,
-			cacheWrite: u.cacheWrite ?? 0,
-			cost: u.cost?.total ?? 0,
-		});
-		saveCache(cache);
+			addUsage(cache, shortDate(), model, {
+				input: u.input ?? 0,
+				output: u.output ?? 0,
+				cacheRead: u.cacheRead ?? 0,
+				cacheWrite: u.cacheWrite ?? 0,
+				cost: u.cost?.total ?? 0,
+			});
+			saveCache(cache);
 		} catch { /* ignore */ }
 	});
 
 	// ─── 命令 ───
 
 	pi.registerCommand("tokens", {
-		description: "Token 用量统计。参数: 7d / 30d / Output / Out",
+		description: "Token 用量统计。参数: Nd(天数) / Output / Out",
 		handler: async (args, ctx) => {
 			try {
 				const parts = args.trim().split(/\s+/);
@@ -260,8 +274,8 @@ export default function (pi: ExtensionAPI) {
 				let showOutput = false;
 				for (const part of parts) {
 					const p = part.toLowerCase();
-					if (p === "7d") days = 7;
-					else if (p === "30d") days = 30;
+					const m = p.match(/^(\d+)d$/);
+					if (m) days = parseInt(m[1], 10);
 					else if (p === "output" || p === "out") showOutput = true;
 				}
 

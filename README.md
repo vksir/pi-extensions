@@ -10,3 +10,4 @@
 | [pi-notify](extensions/pi-notify.ts) | 任务完成后发送桌面通知（支持 iTerm2、Kitty、Ghostty、WezTerm、Windows Terminal） |
 | [pi-title-animation](extensions/pi-title-animation.ts) | Agent 运行时在窗口标题显示旋转动画，结束后恢复原标题 |
 | [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 用量，支持 `/tokens` 命令和 footer 实时显示 |
+| [pi-context](extensions/pi-context.ts) | 通过 `/context` 命令将当前系统提示词写入 `~/.pi/system-prompt.md` |
