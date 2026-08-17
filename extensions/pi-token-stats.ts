@@ -5,7 +5,8 @@
  * 增量写入 ~/.pi/token-stats.json。不做任何 session 文件扫描。
  *
  * 命令：
- *   /tokens             — 全局累计统计 + Input 柱状图
+ *   /tokens             — 近 7 天统计 + Input 柱状图（默认）
+ *   /tokens all         — 全部历史统计（/tokens 0d 亦可）
  *   /tokens 3d          — 近 3 天（Nd 任意天数）
  *   /tokens 30d         — 近 30 天
  *   /tokens Out[put]    — 显示 Output 柱状图（可与天数组合，如 /tokens 7d Out）
@@ -198,8 +199,10 @@ function renderStats(cache: GlobalCache, days: number, showOutput = false): stri
 				lines.push("");
 			}
 			prevDate = d.date;
-			const bar = renderBar(val, maxVal, bw);
-			const hitPart = showHit ? `  ${hitRate(d.cacheRead, d.input).padStart(8)}` : "";
+			// bar 区域固定宽度（padEnd），使数值+命中率列在所有行落在同一纵列
+			const bar = renderBar(val, maxVal, bw).padEnd(bw);
+			// 值右对齐固定列；命中率用括号括起，格式: 184.7k (CH93.78%)
+			const hitPart = showHit ? ` (${hitRate(d.cacheRead, d.input).padStart(8)})` : "";
 			lines.push(`  ${dateLabel} ${bar}  ${fmt(val).padStart(8)}${hitPart}  ${d.model}`);
 		}
 		lines.push("");
@@ -217,16 +220,18 @@ function renderStats(cache: GlobalCache, days: number, showOutput = false): stri
 	const totalInput = total.input + total.cacheRead + total.cacheWrite;
 
 	const modelList = [...byModel.entries()]
-		.map(([key, u]) => ({ key, input: u.input + u.cacheRead + u.cacheWrite, plainIn: u.input, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite, output: u.output, cost: u.cost }))
+		.map(([key, u]) => ({ key, input: u.input + u.cacheRead + u.cacheWrite, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite, output: u.output, cost: u.cost }))
 		.sort((a, b) => b.input - a.input);
 
 	for (const m of modelList) {
 		const pct = totalInput > 0 ? ((m.input / totalInput) * 100).toFixed(1) : "0.0";
 		lines.push(`  ● ${m.key} (${pct}%)`);
-		lines.push(`    In: ${fmt(m.plainIn)} (${hitRate(m.cacheRead, m.input)}) · Out: ${fmt(m.output)} · ${fmtCost(m.cost)}`);
+		// In 显示总输入（未命中+命中），括号内为缓存命中率
+		lines.push(`    In: ${fmt(m.input)} (${hitRate(m.cacheRead, m.input)}) · Out: ${fmt(m.output)} · ${fmtCost(m.cost)}`);
 	}
 	lines.push("");
-	lines.push(`  Input: ${fmt(total.input)} (${hitRate(total.cacheRead, totalInput)}) · Output: ${fmt(total.output)} · ${fmtCost(total.cost)}`);
+	// Input 显示总输入（未命中+命中）
+	lines.push(`  Input: ${fmt(totalInput)} (${hitRate(total.cacheRead, totalInput)}) · Output: ${fmt(total.output)} · ${fmtCost(total.cost)}`);
 	lines.push("");
 
 	return lines;
@@ -266,16 +271,18 @@ export default function (pi: ExtensionAPI) {
 	// ─── 命令 ───
 
 	pi.registerCommand("tokens", {
-		description: "Token 用量统计。参数: Nd(天数) / Output / Out",
+		description: "Token 用量统计。默认近7天。参数: all/Nd(天数) / Output / Out",
 		handler: async (args, ctx) => {
 			try {
 				const parts = args.trim().split(/\s+/);
-				let days = 0;
+				// 默认近 7 天；all / 0d 表示全部历史
+				let days = 7;
 				let showOutput = false;
 				for (const part of parts) {
 					const p = part.toLowerCase();
 					const m = p.match(/^(\d+)d$/);
 					if (m) days = parseInt(m[1], 10);
+					else if (p === "all") days = 0;
 					else if (p === "output" || p === "out") showOutput = true;
 				}
 
