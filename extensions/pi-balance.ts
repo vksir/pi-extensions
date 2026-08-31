@@ -4,10 +4,13 @@
  * 从 ~/.pi/agent/auth.json 读取 API Key，查询各 Provider 的账户余额。
  * 当前支持:
  *   - DeepSeek
+ *   - Moonshot
+ *   - OpenRouter
  *
  * 命令：
- *   /balance        — 查询所有已配置 Provider 的余额
- *   /balance deepseek — 只查某个 Provider
+ *   /balance            — 查询所有已配置 Provider 的余额
+ *   /balance deepseek   — 只查某个 Provider
+ *   /balance free          — 列出 OpenRouter 免费模型 Top 20（按 coding_index 排序，含 Latency/Throughput）
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -35,6 +38,21 @@ interface BalanceResult {
 interface BalanceEntry {
 	lines: string[];
 }
+
+interface FreeModel {
+	id: string;
+	/** benchmarks.artificial_analysis.coding_index，null 表示无评测数据 */
+	codingIndex: number | null;
+	/** 最快 endpoint 的延迟（ms），null 表示无数据 */
+	latency: number | null;
+	/** 最快 endpoint 的吞吐（tokens/s），null 表示无数据 */
+	throughput: number | null;
+}
+
+/** 免费模型最多展示数量 */
+const FREE_TOP_N = 20;
+/** 拉取 endpoints 时的并发数 */
+const ENDPOINTS_CONCURRENCY = 6;
 
 // ─── auth.json 读取 ───
 
@@ -252,6 +270,133 @@ function renderBalance(results: BalanceResult[]): string[] {
 
 // ─── 查询逻辑 ───
 
+async function queryFreeModels(): Promise<{ models: FreeModel[]; error?: string }> {
+	const auth = loadAuth();
+	const entry = auth["openrouter"];
+	const key = entry?.type === "api_key" ? entry.key : undefined;
+
+	if (!key) {
+		return { models: [], error: "auth.json 中未找到 openrouter 的 API Key" };
+	}
+
+	const headers: Record<string, string> = {
+		Accept: "application/json",
+		Authorization: `Bearer ${key}`,
+	};
+
+	try {
+		// 服务端过滤 + 排序：q 搜索 free 变体，sort 按 coding_index 降序（无评分的模型排最后）
+		const url = `https://openrouter.ai/api/v1/models?q=:free&sort=coding-high-to-low`;
+		const res = await fetch(url, { headers });
+		if (!res.ok) {
+			const body = await res.text().catch(() => "");
+			return { models: [], error: `HTTP ${res.status}${body ? `: ${body}` : ""}` };
+		}
+
+		const data = (await res.json()) as {
+			data?: Array<{
+				id: string;
+				benchmarks?: {
+					artificial_analysis?: { coding_index?: number | null };
+				};
+			}>;
+		};
+		if (!data.data) return { models: [], error: "未返回模型数据" };
+
+		// 过滤掉无 coding_index 评分的模型
+		const models = data.data
+			.filter((m) => m.benchmarks?.artificial_analysis?.coding_index != null)
+			.map((m): FreeModel => ({
+				id: m.id,
+				codingIndex: m.benchmarks?.artificial_analysis?.coding_index ?? null,
+				latency: null,
+				throughput: null,
+			}))
+			.slice(0, FREE_TOP_N);
+
+		// 逐模型拉取 endpoints，填充 Latency / Throughput（单个失败不影响整体）
+		for (let i = 0; i < models.length; i += ENDPOINTS_CONCURRENCY) {
+			await Promise.all(
+				models.slice(i, i + ENDPOINTS_CONCURRENCY).map(async (m) => {
+					try {
+						const er = await fetch(`https://openrouter.ai/api/v1/models/${m.id}/endpoints`, { headers });
+						if (!er.ok) return;
+						const ed = (await er.json()) as {
+							data?: {
+								endpoints?: Array<{
+									/** 认证请求返回百分位对象 {p50,p75,p90,p99}，未认证为 null */
+									latency_last_30m?: { p50?: number } | number | null;
+									throughput_last_30m?: { p50?: number } | number | null;
+								}>;
+							};
+						};
+						const eps = ed.data?.endpoints ?? [];
+						const lats = eps
+							.map((e) => toP50(e.latency_last_30m))
+							.filter((v): v is number => v !== null);
+						const thrs = eps
+							.map((e) => toP50(e.throughput_last_30m))
+							.filter((v): v is number => v !== null);
+						m.latency = lats.length > 0 ? Math.min(...lats) : null;
+						m.throughput = thrs.length > 0 ? Math.max(...thrs) : null;
+					} catch {
+						/* 忽略单个模型的 endpoints 错误 */
+					}
+				}),
+			);
+		}
+
+		return { models };
+	} catch (e) {
+		return { models: [], error: (e as Error).message };
+	}
+}
+
+/** 兼容数字或百分位对象 {p50,...}，返回 p50 中位数 */
+function toP50(v: { p50?: number } | number | null | undefined): number | null {
+	if (typeof v === "number") return v;
+	if (v && typeof v.p50 === "number") return v.p50;
+	return null;
+}
+
+function formatLatency(ms: number): string {
+	if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`;
+	return `${Math.round(ms)}ms`;
+}
+
+function formatThroughput(tps: number): string {
+	if (tps >= 1000) return `${(tps / 1000).toFixed(1)}K t/s`;
+	return `${Math.round(tps)} t/s`;
+}
+
+function renderFreeModels(models: FreeModel[], error?: string): string[] {
+	const lines: string[] = [];
+	lines.push(`  OpenRouter 免费模型（Top ${models.length}，按 Coding 排序）`);
+	lines.push(`  ─────────────────────────────`);
+
+	if (error) {
+		lines.push(`  ⚠ ${error}`);
+		return lines;
+	}
+	if (models.length === 0) {
+		lines.push("  （没有找到匹配的免费模型）");
+		return lines;
+	}
+
+	const maxLen = Math.max(...models.map((m) => m.id.length));
+	lines.push(`  Coding  ${"Model".padEnd(maxLen)}  Latency  Throughput`);
+	for (const m of models) {
+		const coding = m.codingIndex === null ? "—" : m.codingIndex.toFixed(1);
+		const latency = m.latency === null ? "—" : formatLatency(m.latency);
+		const throughput = m.throughput === null ? "—" : formatThroughput(m.throughput);
+		lines.push(
+			`  ${coding.padStart(6)}  ${m.id.padEnd(maxLen)}  ${latency.padStart(7)}  ${throughput.padStart(9)}`,
+		);
+	}
+
+	return lines;
+}
+
 async function queryBalances(target?: string): Promise<BalanceResult[]> {
 	const auth = loadAuth();
 
@@ -302,10 +447,19 @@ export default function (pi: ExtensionAPI) {
 	// ─── 命令 ───
 
 	pi.registerCommand("balance", {
-		description: "查询 Provider 余额。可指定名称过滤，如 /balance deepseek",
+		description: "查询 Provider 余额，或列出 OpenRouter 免费模型。用法: /balance，/balance free",
 		handler: async (args, ctx) => {
 			try {
-				const arg = args.trim().toLowerCase();
+				const tokens = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
+				const arg = tokens[0] ?? "";
+
+				// /balance free — 列出 OpenRouter 免费模型
+				if (arg === "free") {
+					const { models, error } = await queryFreeModels();
+					pi.appendEntry<BalanceEntry>("balance", { lines: renderFreeModels(models, error) });
+					return;
+				}
+
 				const target = arg || undefined;
 				const results = await queryBalances(target);
 
