@@ -88,7 +88,7 @@ export default function (pi: ExtensionAPI) {
 				captureNextRequest = true;
 
 				ctx.ui.notify(
-					`系统提示词 → ${SYSTEM_PROMPT_FILE}；工具定义 → ${TOOLS_FILE}；真实请求体将在下次请求时写入 ${REQUEST_FILE}`,
+					`系统提示词 → ${SYSTEM_PROMPT_FILE}\n工具定义 → ${TOOLS_FILE}\n真实请求体将在下次请求时写入 ${REQUEST_FILE}`,
 					"info",
 				);
 			} catch (e) {
