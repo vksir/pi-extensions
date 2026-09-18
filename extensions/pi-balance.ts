@@ -1,28 +1,59 @@
 /**
  * Provider 余额查询扩展
  *
- * 从 ~/.pi/agent/auth.json 读取 API Key，查询各 Provider 的账户余额。
+ * 从 ~/.pi/agent/auth.json 读取 API Key/OAuth 凭据，查询各 Provider 的账户余额或额度。
  * 当前支持:
  *   - DeepSeek
  *   - Moonshot
  *   - OpenRouter
+ *   - OpenAI Codex（ChatGPT Plus/Pro 额度）
  *
  * 命令：
- *   /balance            — 查询所有已配置 Provider 的余额
+ *   /balance            — 查询所有已配置 Provider 的余额/额度
  *   /balance deepseek   — 只查某个 Provider
- *   /balance free          — 列出 OpenRouter 免费模型 Top 20（按 coding_index 排序，含 Latency/Throughput）
+ *   /balance free       — 列出 OpenRouter 免费模型 Top 20（按 coding_index 排序，含 Latency/Throughput）
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Box, Text } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { Box, Text, type AutocompleteItem } from "@earendil-works/pi-tui";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
 // ─── 类型 ───
 
+interface AuthEntry {
+	type: string;
+	key?: string;
+	/** OAuth access token（Codex 凭据使用此字段） */
+	access?: string;
+	refresh?: string;
+	expires?: number;
+	accountId?: string;
+}
+
 interface AuthStore {
-	[key: string]: { type: string; key: string };
+	[key: string]: AuthEntry;
+}
+
+interface CodexUsageWindow {
+	usedPercent: number;
+	limitWindowSeconds?: number;
+	resetAfterSeconds?: number;
+	resetAt?: number;
+}
+
+interface CodexQuota {
+	planType?: string;
+	allowed?: boolean;
+	limitReached?: boolean;
+	primary?: CodexUsageWindow;
+	secondary?: CodexUsageWindow;
+	credits?: {
+		hasCredits?: boolean;
+		unlimited?: boolean;
+		balance?: string | number | null;
+	};
 }
 
 interface BalanceResult {
@@ -32,11 +63,35 @@ interface BalanceResult {
 		currency: string;
 		total: string;
 	}>;
+	/** 非金钱余额（例如 Codex 的时间窗口额度） */
+	quota?: CodexQuota;
 	error?: string;
 }
 
 interface BalanceEntry {
 	lines: string[];
+}
+
+interface CodexUsagePayload {
+	plan_type?: string;
+	rate_limit?: {
+		allowed?: boolean;
+		limit_reached?: boolean;
+		primary_window?: CodexUsageWindowPayload | null;
+		secondary_window?: CodexUsageWindowPayload | null;
+	} | null;
+	credits?: {
+		has_credits?: boolean;
+		unlimited?: boolean;
+		balance?: string | number | null;
+	} | null;
+}
+
+interface CodexUsageWindowPayload {
+	used_percent?: number | string;
+	limit_window_seconds?: number | string;
+	reset_after_seconds?: number | string;
+	reset_at?: number | string;
 }
 
 interface FreeModel {
@@ -76,9 +131,11 @@ interface ProviderChecker {
 	name: string;
 	/** 在 auth.json 中对应的键名 */
 	authId: string;
+	/** 可用于命令参数匹配的别名 */
+	aliases?: string[];
 	/** 余额 API URL */
 	apiUrl: string;
-	check(key: string): Promise<Omit<BalanceResult, "provider">>;
+	check(key: string, accountId?: string): Promise<Omit<BalanceResult, "provider">>;
 }
 
 const checkers: ProviderChecker[] = [
@@ -199,6 +256,41 @@ const checkers: ProviderChecker[] = [
 			};
 		},
 	},
+	{
+		name: "Codex",
+		authId: "openai-codex",
+		aliases: ["codex"],
+		apiUrl: "https://chatgpt.com/backend-api/wham/usage",
+		async check(accessToken: string, accountId?: string) {
+			const resolvedAccountId = accountId ?? getCodexAccountId(accessToken);
+			if (!resolvedAccountId) {
+				return { balances: [], error: "无法从 Codex OAuth Token 中解析 ChatGPT Account ID" };
+			}
+
+			const res = await fetch(this.apiUrl, {
+				headers: {
+					Accept: "application/json",
+					Authorization: `Bearer ${accessToken}`,
+					"ChatGPT-Account-Id": resolvedAccountId,
+					Originator: "pi",
+					"User-Agent": "pi",
+				},
+			});
+
+			if (!res.ok) {
+				const body = await res.text().catch(() => "");
+				return { balances: [], error: `HTTP ${res.status}${body ? `: ${body}` : ""}` };
+			}
+
+			const data = (await res.json()) as CodexUsagePayload;
+			const quota = normalizeCodexQuota(data);
+			if (!quota) {
+				return { balances: [], error: "未返回 Codex 额度数据" };
+			}
+
+			return { balances: [], quota };
+		},
+	},
 ];
 
 // ─── 格式化 ───
@@ -208,6 +300,69 @@ function formatBalance(value: number): string {
 	if (value >= 1) return value.toFixed(2);
 	if (value >= 0.01) return value.toFixed(4);
 	return value.toFixed(6);
+}
+
+function getCodexAccountId(accessToken: string): string | undefined {
+	try {
+		const payloadPart = accessToken.split(".")[1];
+		if (!payloadPart) return undefined;
+
+		const payload = JSON.parse(
+			Buffer.from(payloadPart.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8"),
+		) as Record<string, unknown>;
+		const auth = payload["https://api.openai.com/auth"];
+		if (!auth || typeof auth !== "object") return undefined;
+
+		const accountId = (auth as Record<string, unknown>).chatgpt_account_id;
+		return typeof accountId === "string" && accountId.length > 0 ? accountId : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function toNumber(value: number | string | undefined): number | undefined {
+	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+	if (typeof value !== "string" || value.trim() === "") return undefined;
+	const parsed = Number(value);
+	return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function normalizeCodexWindow(window: CodexUsageWindowPayload | null | undefined): CodexUsageWindow | undefined {
+	if (!window) return undefined;
+	const usedPercent = toNumber(window.used_percent);
+	if (usedPercent === undefined) return undefined;
+
+	return {
+		usedPercent,
+		limitWindowSeconds: toNumber(window.limit_window_seconds),
+		resetAfterSeconds: toNumber(window.reset_after_seconds),
+		resetAt: toNumber(window.reset_at),
+	};
+}
+
+function normalizeCodexQuota(data: CodexUsagePayload): CodexQuota | undefined {
+	if (!data || typeof data !== "object") return undefined;
+
+	const rateLimit = data.rate_limit;
+	const primary = normalizeCodexWindow(rateLimit?.primary_window);
+	const secondary = normalizeCodexWindow(rateLimit?.secondary_window);
+	const hasCredits = data.credits !== undefined && data.credits !== null;
+	if (!rateLimit && !hasCredits && !data.plan_type) return undefined;
+
+	return {
+		planType: data.plan_type,
+		allowed: rateLimit?.allowed,
+		limitReached: rateLimit?.limit_reached,
+		primary,
+		secondary,
+		credits: hasCredits
+			? {
+					hasCredits: data.credits?.has_credits,
+					unlimited: data.credits?.unlimited,
+					balance: data.credits?.balance,
+				}
+			: undefined,
+	};
 }
 
 function fmtBar(value: number, max: number, width: number): string {
@@ -220,6 +375,8 @@ function fmtBar(value: number, max: number, width: number): string {
 
 function renderBalance(results: BalanceResult[]): string[] {
 	const lines: string[] = [];
+	const balanceResults = results.filter((r) => !r.quota);
+	const quotaResults = results.filter((r) => r.quota);
 
 	// 收集行数据，分别计算数字和货币的对齐宽度
 	interface Row {
@@ -233,7 +390,7 @@ function renderBalance(results: BalanceResult[]): string[] {
 	const rows: Row[] = [];
 	let maxNumLen = 0;
 
-	for (const r of results) {
+	for (const r of balanceResults) {
 		if (r.error) {
 			rows.push({ provider: r.provider, isFirst: true, type: "error", num: "", currency: "", text: `⚠ ${r.error}` });
 		} else if (r.balances.length === 0) {
@@ -247,25 +404,101 @@ function renderBalance(results: BalanceResult[]): string[] {
 		}
 	}
 
-	const curWidth = 3;
-	lines.push(`  Provider       ${"Balance".padStart(maxNumLen)}`);
-	lines.push(`  ─────────────────────────────`);
+	if (balanceResults.length > 0) {
+		const curWidth = 3;
+		lines.push(`  Provider       ${"Balance".padStart(maxNumLen)}`);
+		lines.push(`  ─────────────────────────────`);
 
-	if (rows.length === 0) {
-		lines.push("  （没有已配置的 Provider）");
-		return lines;
-	}
-
-	for (const row of rows) {
-		const label = row.isFirst ? row.provider.padEnd(14) : "".padEnd(14);
-		if (row.type === "error") {
-			lines.push(`  ${label} ${row.text}`);
+		if (rows.length === 0) {
+			lines.push("  （没有已配置的 Provider）");
 		} else {
-			lines.push(`  ${label} ${row.num.padStart(maxNumLen)} ${row.currency.padStart(curWidth)}`);
+			for (const row of rows) {
+				const label = row.isFirst ? row.provider.padEnd(14) : "".padEnd(14);
+				if (row.type === "error") {
+					lines.push(`  ${label} ${row.text}`);
+				} else {
+					lines.push(`  ${label} ${row.num.padStart(maxNumLen)} ${row.currency.padStart(curWidth)}`);
+				}
+			}
 		}
 	}
 
+	for (const result of quotaResults) {
+		const quota = result.quota;
+		if (!quota) continue;
+
+		if (lines.length > 0) lines.push("");
+		const plan = quota.planType ? `（${formatPlanType(quota.planType)}）` : "";
+		lines.push(`  ${result.provider} 额度${plan}`);
+		lines.push(`  ─────────────────────────────`);
+
+		const windows: Array<{ label: string; window: CodexUsageWindow }> = [];
+		if (quota.primary) windows.push({ label: "Primary", window: quota.primary });
+		if (quota.secondary) windows.push({ label: "Secondary", window: quota.secondary });
+
+		for (const { label, window } of windows) {
+			const remaining = Math.max(0, Math.min(100, 100 - window.usedPercent));
+			const percentage = `${formatPercent(remaining)}% 剩余`;
+			const windowLabel = formatWindowLabel(window, label);
+			const reset = formatQuotaReset(window);
+			lines.push(`  ${windowLabel.padEnd(10)} ${percentage.padStart(10)}${reset ? `  ${reset}` : ""}`);
+		}
+
+		if (windows.length === 0) {
+			lines.push("  （没有可用的额度窗口）");
+		}
+
+		if (quota.limitReached === true) lines.push("  ⚠ 已达到额度限制");
+		if (quota.credits) {
+			let credits = "无";
+			if (quota.credits.unlimited) credits = "无限";
+			else if (quota.credits.balance !== undefined && quota.credits.balance !== null) credits = String(quota.credits.balance);
+			else if (quota.credits.hasCredits) credits = "可用";
+			lines.push(`  ${"Credits".padEnd(10)} ${credits}`);
+		}
+	}
+
+	if (lines.length === 0) lines.push("  （没有已配置的 Provider）");
 	return lines;
+}
+
+function formatPlanType(planType: string): string {
+	return planType
+		.replace(/[_-]+/g, " ")
+		.replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function formatPercent(value: number): string {
+	const rounded = Math.round(value * 10) / 10;
+	return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+
+function formatWindowLabel(window: CodexUsageWindow, fallback: string): string {
+	const seconds = window.limitWindowSeconds;
+	if (!seconds || seconds <= 0) return fallback;
+	if (seconds % 86_400 === 0) return `${seconds / 86_400}d`;
+	if (seconds % 3_600 === 0) return `${seconds / 3_600}h`;
+	if (seconds % 60 === 0) return `${seconds / 60}m`;
+	return `${Math.round(seconds)}s`;
+}
+
+function formatQuotaReset(window: CodexUsageWindow): string {
+	let seconds = window.resetAfterSeconds;
+	if (seconds === undefined && window.resetAt !== undefined) {
+		seconds = Math.max(0, window.resetAt - Date.now() / 1000);
+	}
+	if (seconds === undefined || !Number.isFinite(seconds)) return "";
+	if (seconds < 60) return "重置 <1m";
+
+	const totalMinutes = Math.ceil(seconds / 60);
+	const days = Math.floor(totalMinutes / (24 * 60));
+	const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+	const minutes = totalMinutes % 60;
+	const parts: string[] = [];
+	if (days > 0) parts.push(`${days}d`);
+	if (hours > 0) parts.push(`${hours}h`);
+	if (minutes > 0 && days === 0) parts.push(`${minutes}m`);
+	return `重置 ${parts.join(" ")}后`;
 }
 
 // ─── 查询逻辑 ───
@@ -397,29 +630,50 @@ function renderFreeModels(models: FreeModel[], error?: string): string[] {
 	return lines;
 }
 
-async function queryBalances(target?: string): Promise<BalanceResult[]> {
+function matchesProvider(c: ProviderChecker, target: string): boolean {
+	const normalized = target.toLowerCase();
+	return [c.name, c.authId, ...(c.aliases ?? [])].some((value) => value.toLowerCase() === normalized);
+}
+
+async function resolveProviderCredential(
+	checker: ProviderChecker,
+	entry: AuthEntry | undefined,
+	ctx?: ExtensionCommandContext,
+): Promise<{ key?: string; accountId?: string }> {
+	if (checker.authId !== "openai-codex") {
+		return { key: entry?.type === "api_key" ? entry.key : undefined };
+	}
+
+	// 通过 ModelRegistry 获取凭据，可复用 pi 对 OAuth token 的自动刷新逻辑。
+	const resolvedKey = await ctx?.modelRegistry.getApiKeyForProvider("openai-codex");
+	return {
+		key: resolvedKey ?? (entry?.type === "oauth" ? entry.access : undefined),
+		accountId: entry?.accountId,
+	};
+}
+
+async function queryBalances(target?: string, ctx?: ExtensionCommandContext): Promise<BalanceResult[]> {
 	const auth = loadAuth();
 
-	const active = target
-		? checkers.filter((c) => c.name.toLowerCase() === target.toLowerCase())
-		: checkers;
+	const active = target ? checkers.filter((c) => matchesProvider(c, target)) : checkers;
 
 	const promises = active.map(async (c) => {
-		const entry = auth[c.authId];
-		const key = entry?.type === "api_key" ? entry.key : undefined;
-
-		if (!key && target) {
-			return {
-				provider: c.name,
-				balances: [] as BalanceResult["balances"],
-				error: `auth.json 中未找到 ${c.authId} 的 API Key`,
-			} satisfies BalanceResult;
-		}
-		if (!key) return null; // 未指定目标时跳过
-
 		try {
-			const r = await c.check(key);
-			return { provider: c.name, balances: r.balances, error: r.error } satisfies BalanceResult;
+			const entry = auth[c.authId];
+			const { key, accountId } = await resolveProviderCredential(c, entry, ctx);
+
+			if (!key && target) {
+				const credentialType = c.authId === "openai-codex" ? "OAuth 凭据" : "API Key";
+				return {
+					provider: c.name,
+					balances: [] as BalanceResult["balances"],
+					error: `auth.json 中未找到 ${c.authId} 的 ${credentialType}`,
+				} satisfies BalanceResult;
+			}
+			if (!key) return null; // 未指定目标时跳过
+
+			const r = await c.check(key, accountId);
+			return { provider: c.name, ...r } satisfies BalanceResult;
 		} catch (e) {
 			return {
 				provider: c.name,
@@ -431,6 +685,18 @@ async function queryBalances(target?: string): Promise<BalanceResult[]> {
 
 	const results = (await Promise.all(promises)).filter((r) => r !== null) as BalanceResult[];
 	return results;
+}
+
+/** /balance 的参数候选：free + 各 provider。value 用别名优先，与 matchesProvider 的匹配口径一致 */
+function balanceTargets(): AutocompleteItem[] {
+	const items: AutocompleteItem[] = [
+		{ value: "free", label: "free", description: "列出 OpenRouter 免费模型" },
+	];
+	for (const c of checkers) {
+		const value = (c.aliases?.[0] ?? c.name).toLowerCase();
+		items.push({ value, label: value, description: c.name });
+	}
+	return items;
 }
 
 // ─── 扩展入口 ───
@@ -447,7 +713,14 @@ export default function (pi: ExtensionAPI) {
 	// ─── 命令 ───
 
 	pi.registerCommand("balance", {
-		description: "查询 Provider 余额，或列出 OpenRouter 免费模型。用法: /balance，/balance free",
+		description: "查询 Provider 余额/Codex 额度，或列出 OpenRouter 免费模型。用法: /balance，/balance codex，/balance free",
+		getArgumentCompletions: (prefix) => {
+			// 只补第一个参数；已输入空格后交由用户自由输入
+			if (prefix.trim().includes(" ")) return null;
+			const typed = prefix.trim().toLowerCase();
+			const items = balanceTargets().filter((i) => i.value.startsWith(typed));
+			return items.length > 0 ? items : null;
+		},
 		handler: async (args, ctx) => {
 			try {
 				const tokens = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
@@ -461,16 +734,16 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				const target = arg || undefined;
-				const results = await queryBalances(target);
+				const results = await queryBalances(target, ctx);
 
 				if (target && results.length === 0) {
 					ctx.ui.notify(`未找到 Provider: ${target}`, "warning");
 					return;
 				}
 
-				// 如果没有配置任何 Key 且未指定目标，提示用户
+				// 如果没有配置任何凭据且未指定目标，提示用户
 				if (results.length === 0) {
-					ctx.ui.notify("auth.json 中未找到任何已配置的 API Key", "info");
+					ctx.ui.notify("auth.json 中未找到任何已配置的 API Key 或 OAuth 凭据", "info");
 					return;
 				}
 
