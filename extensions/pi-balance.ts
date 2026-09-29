@@ -1,7 +1,7 @@
 /**
  * Provider 余额查询扩展
  *
- * 从 ~/.pi/agent/auth.json 读取 API Key/OAuth 凭据，查询各 Provider 的账户余额或额度。
+ * 从 Pi agent dir 下的 auth.json 读取 API Key/OAuth 凭据，查询各 Provider 的账户余额或额度。
  * 当前支持:
  *   - DeepSeek
  *   - Moonshot
@@ -14,11 +14,10 @@
  *   /balance free       — 列出 OpenRouter 免费模型 Top 20（按 coding_index 排序，含 Latency/Throughput）
  */
 
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text, type AutocompleteItem } from "@earendil-works/pi-tui";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 
 // ─── 类型 ───
 
@@ -112,7 +111,7 @@ const ENDPOINTS_CONCURRENCY = 6;
 // ─── auth.json 读取 ───
 
 function authPath(): string {
-	return join(homedir(), ".pi", "agent", "auth.json");
+	return join(getAgentDir(), "auth.json");
 }
 
 function loadAuth(): AuthStore {

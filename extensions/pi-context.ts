@@ -2,18 +2,14 @@
  * pi-context —— 系统提示词 + 当前工具定义 + 一次性真实请求体捕获
  *
  * 命令：
- *   /context — 将系统提示词写入 ~/.pi/pi-context/system-prompt.md，
- *              将当前会传入 LLM 的工具定义写入 ~/.pi/pi-context/tools.md，
- *              并挂起一次性钩子：下次请求 LLM 时把真实请求体写入 ~/.pi/pi-context/last-request.json
+ *   /context — 将系统提示词、工具定义和真实请求体写入 Pi agent dir 下的 pi-context/ 目录
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 
-const PI_DIR = join(homedir(), ".pi");
-const OUT_DIR = join(PI_DIR, "pi-context");
+const OUT_DIR = join(getAgentDir(), "pi-context");
 const SYSTEM_PROMPT_FILE = join(OUT_DIR, "system-prompt.md");
 const TOOLS_FILE = join(OUT_DIR, "tools.md");
 const REQUEST_FILE = join(OUT_DIR, "last-request.json");

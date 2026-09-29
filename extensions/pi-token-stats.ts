@@ -2,7 +2,7 @@
  * Token Stats Extension
  *
  * 全局 Token 用量统计。每次 turn_end 从事件中提取 usage，
- * 增量写入 ~/.pi/token-stats.json。不做任何 session 文件扫描。
+ * 增量写入 Pi agent dir 下的 token-stats.json。不做任何 session 文件扫描。
  *
  * 命令：
  *   /tokens             — 近 7 天统计 + Input 柱状图（默认）
@@ -12,11 +12,10 @@
  */
 
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text, type AutocompleteItem } from "@earendil-works/pi-tui";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 
 // ─── 类型 ───
 
@@ -46,7 +45,7 @@ interface TokenStatsEntry {
 // ─── 缓存 I/O ───
 
 function cachePath(): string {
-	return join(homedir(), ".pi", "token-stats.json");
+	return join(getAgentDir(), "token-stats.json");
 }
 
 function loadCache(): GlobalCache {
@@ -58,7 +57,7 @@ function loadCache(): GlobalCache {
 
 function saveCache(cache: GlobalCache): void {
 	const p = cachePath();
-	const dir = join(homedir(), ".pi");
+	const dir = getAgentDir();
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 	const tmp = p + ".tmp." + process.pid;
 	writeFileSync(tmp, JSON.stringify(cache, null, 2), "utf-8");
