@@ -1,9 +1,25 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, beforeEach, test } from "node:test";
-import type { ExecResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { closeResultServers } from "../extensions/pi-subagent/ipc.ts";
+import {
+	argValue,
+	calls,
+	childEnv,
+	definitionFile as harnessDefinitionFile,
+	dispatch,
+	fakeHerdr,
+	type FakeHerdr,
+	makeCtx,
+	piArgs,
+	RUNTIME_KEY,
+	setup as setupHarness,
+	type Tool,
+} from "./pi-subagent-harness.ts";
+
 
 // 在加载扩展前隔离 agent dir，不读写用户真实 agent 目录。
 const agentDir = mkdtempSync(join(tmpdir(), "pi-subagent-test-"));
@@ -26,132 +42,14 @@ after(() => {
 	rmSync(agentDir, { recursive: true, force: true });
 });
 
-const RUNTIME_KEY = Symbol.for("vkzha.pi-subagent.runtime");
-
 const { default: factory } = await import("../extensions/pi-subagent/index.ts");
 
-// ─── 测试骨架：mock pi + 假 Herdr ───
-
-type Handler = (event: unknown, ctx: unknown) => unknown;
-interface Tool {
-	execute: (id: string, params: Record<string, unknown>, signal: undefined, onUpdate: undefined, ctx: unknown) => Promise<{
-		content: { type: string; text: string }[];
-		details: Record<string, unknown>;
-	}>;
-	parameters: { properties?: Record<string, unknown> };
-	description: string;
-}
-
-/** 当前测试的假 Herdr；`makeCtx` 每次都会切换它，于是 pi.exec 与 ctx 指向同一套假环境。 */
-let activeHerdr: FakeHerdr | undefined;
-
-function setup() {
-	const handlers = new Map<string, Handler>();
-	const tools = new Map<string, Tool>();
-	const pi = {
-		on: (event: string, handler: Handler) => handlers.set(event, handler),
-		registerTool: (definition: Tool) => tools.set((definition as unknown as { name: string }).name, definition),
-		exec: (command: string, args: string[]) => {
-			assert.ok(activeHerdr, "派发前必须先构造 ctx（makeCtx）");
-			return activeHerdr.exec(command, args);
-		},
-	};
-	factory(pi as unknown as ExtensionAPI);
-	return { handlers, tools, pi };
-}
-
-interface FakeHerdr {
-	exec: (command: string, args: string[]) => Promise<ExecResult>;
-	calls: { command: string; args: string[] }[];
-	tabs: { tabId: string; paneId: string }[];
-	createFails?: string;
-	startFails?: string;
-	promptFails?: string;
-}
-
-function fakeHerdr(): FakeHerdr {
-	const fake: FakeHerdr = { calls: [], tabs: [], exec: async (command, args) => respond(fake, command, args) };
-	return fake;
-}
-
-async function respond(fake: FakeHerdr, command: string, args: string[]): Promise<ExecResult> {
-	fake.calls.push({ command, args });
-	const ok = (stdout: string): ExecResult => ({ stdout, stderr: "", code: 0, killed: false });
-	const bad = (stderr: string): ExecResult => ({ stdout: "", stderr, code: 1, killed: false });
-	if (command !== "herdr") return bad(`command not found: ${command}`);
-	if (args[0] === "tab" && args[1] === "create") {
-		if (fake.createFails) return bad(fake.createFails);
-		const n = fake.tabs.length + 1;
-		const tab = { tabId: `w1:t${n}`, paneId: `w1:p${n}` };
-		fake.tabs.push(tab);
-		return ok(JSON.stringify({ result: { tab: { tab_id: tab.tabId }, root_pane: { pane_id: tab.paneId } } }));
-	}
-	if (args[0] === "agent" && args[1] === "start") {
-		if (fake.startFails) return bad(fake.startFails);
-		return ok(JSON.stringify({ result: {} }));
-	}
-	if (args[0] === "agent" && args[1] === "prompt") {
-		if (fake.promptFails) return bad(fake.promptFails);
-		return ok(JSON.stringify({ result: {} }));
-	}
-	if (args[0] === "tab" && args[1] === "close") {
-		fake.tabs = fake.tabs.filter((tab) => tab.tabId !== args[2]);
-		return ok(JSON.stringify({ result: {} }));
-	}
-	return bad(`unsupported command: ${args.join(" ")}`);
-}
-
-interface CtxOptions {
-	sessionId?: string;
-	sessionFile?: string | undefined;
-	cwd?: string;
-}
-
-function makeCtx(fake: FakeHerdr, options: CtxOptions = {}): ExtensionContext {
-	activeHerdr = fake;
-	const sessionFile = "sessionFile" in options ? options.sessionFile : "D:/sessions/main-1.jsonl";
-	return {
-		cwd: options.cwd ?? "D:/work/project",
-		sessionManager: {
-			getSessionId: () => options.sessionId ?? "main-session-1",
-			getSessionFile: () => sessionFile,
-		},
-		ui: { notify: () => {} },
-		isIdle: () => true,
-		isProjectTrusted: () => true,
-	} as unknown as ExtensionContext;
-}
-
-async function dispatch(app: { tools: Map<string, Tool> }, ctx: ExtensionContext, params: Record<string, unknown>) {
-	const tool = app.tools.get("agent");
-	assert.ok(tool, "agent 工具必须已注册");
-	const result = await tool.execute("call-1", params, undefined, undefined, ctx);
-	return { text: result.content[0]?.text ?? "", details: result.details };
-}
-
-function definitionFile(name: string, frontmatter: string, body: string): void {
-	mkdirSync(join(agentDir, "agents"), { recursive: true });
-	writeFileSync(join(agentDir, "agents", name), `---\n${frontmatter}\n---\n${body}\n`, "utf8");
-}
-
-function calls(fake: FakeHerdr, ...head: string[]) {
-	return fake.calls.filter((call) => head.every((part, index) => call.args[index] === part));
-}
-
-function piArgs(fake: FakeHerdr): string[] {
-	const start = calls(fake, "agent", "start").at(-1);
-	assert.ok(start, "必须启动过 agent");
-	const marker = start.args.indexOf("--");
-	assert.ok(marker >= 0, "agent start 必须用 -- 传入 Pi 原生参数");
-	return start.args.slice(marker + 1);
-}
-
-function argValue(args: string[], flag: string): string | undefined {
-	const index = args.indexOf(flag);
-	return index >= 0 ? args[index + 1] : undefined;
-}
+const setup = () => setupHarness(factory);
+const define = (name: string, frontmatter: string, body: string) =>
+	harnessDefinitionFile(agentDir, name, frontmatter, body);
 
 beforeEach(() => {
+	closeResultServers();
 	delete (globalThis as unknown as Record<symbol, unknown>)[RUNTIME_KEY];
 	rmSync(join(agentDir, "agents"), { recursive: true, force: true });
 });
@@ -166,7 +64,7 @@ test("注册 agent 工具，参数为 type / name / prompt", () => {
 });
 
 test("主会话没有持久 session 文件时拒绝派发，不启动任何进程", async () => {
-	definitionFile("worker.md", "name: worker\ndescription: does work", "You are a worker.");
+	define("worker.md", "name: worker\ndescription: does work", "You are a worker.");
 	const app = setup();
 	const fake = fakeHerdr();
 	const result = await dispatch(app, makeCtx(fake, { sessionFile: undefined }), { type: "worker", name: "w1", prompt: "go" });
@@ -175,7 +73,7 @@ test("主会话没有持久 session 文件时拒绝派发，不启动任何进�
 });
 
 test("Herdr 不可用时报错，不启动任何进程", async () => {
-	definitionFile("worker.md", "name: worker", "You are a worker.");
+	define("worker.md", "name: worker", "You are a worker.");
 	delete process.env.HERDR_ENV;
 	try {
 		const app = setup();
@@ -191,7 +89,7 @@ test("Herdr 不可用时报错，不启动任何进程", async () => {
 // ─── 派发：新实例 ───
 
 test("新实例：Herdr 新建标签页、按主 cwd 启动 Pi、提交 prompt，并在提交后返回", async () => {
-	definitionFile("reviewer.md", "name: code-review\ndescription: reviews diffs", "You review code changes.");
+	define("reviewer.md", "name: code-review\ndescription: reviews diffs", "You review code changes.");
 	const app = setup();
 	const fake = fakeHerdr();
 	const result = await dispatch(app, makeCtx(fake), { type: "code-review", name: "reviewer-1", prompt: "Review the diff." });
@@ -234,8 +132,8 @@ test("新实例：Herdr 新建标签页、按主 cwd 启动 Pi、提交 prompt�
 });
 
 test("缺省类型名取文件名，frontmatter name 覆盖文件名", async () => {
-	definitionFile("plain.md", "description: no name field", "PLAIN BODY");
-	definitionFile("named.md", "name: custom-type", "NAMED BODY");
+	define("plain.md", "description: no name field", "PLAIN BODY");
+	define("named.md", "name: custom-type", "NAMED BODY");
 	const app = setup();
 	const fake = fakeHerdr();
 
@@ -249,8 +147,8 @@ test("缺省类型名取文件名，frontmatter name 覆盖文件名", async () 
 });
 
 test("未知类型报错并列出可用类型，不启动任何进程", async () => {
-	definitionFile("alpha.md", "name: alpha", "A");
-	definitionFile("beta.md", "name: beta", "B");
+	define("alpha.md", "name: alpha", "A");
+	define("beta.md", "name: beta", "B");
 	const app = setup();
 	const fake = fakeHerdr();
 	const result = await dispatch(app, makeCtx(fake), { type: "gamma", name: "g", prompt: "p" });
@@ -263,7 +161,7 @@ test("未知类型报错并列出可用类型，不启动任何进程", async ()
 // ─── 派发：复用运行实例 ───
 
 test("同名再次派发复用原 pane：不新建标签页、不重复启动 Pi", async () => {
-	definitionFile("worker.md", "name: worker", "You are a worker.");
+	define("worker.md", "name: worker", "You are a worker.");
 	const app = setup();
 	const fake = fakeHerdr();
 	const ctx = makeCtx(fake);
@@ -282,8 +180,8 @@ test("同名再次派发复用原 pane：不新建标签页、不重复启动 Pi
 });
 
 test("同名不同类型派发报错，不悄悄切换现有实例的角色", async () => {
-	definitionFile("worker.md", "name: worker", "W");
-	definitionFile("other.md", "name: other", "O");
+	define("worker.md", "name: worker", "W");
+	define("other.md", "name: other", "O");
 	const app = setup();
 	const fake = fakeHerdr();
 	const ctx = makeCtx(fake);
@@ -297,7 +195,7 @@ test("同名不同类型派发报错，不悄悄切换现有实例的角色", as
 });
 
 test("并行同名派发只创建一个逻辑实例，两次 prompt 都提交到同一 pane", async () => {
-	definitionFile("worker.md", "name: worker", "W");
+	define("worker.md", "name: worker", "W");
 	const app = setup();
 	const fake = fakeHerdr();
 	const ctx = makeCtx(fake);
@@ -317,7 +215,7 @@ test("并行同名派发只创建一个逻辑实例，两次 prompt 都提交到
 // ─── 稳定身份 ───
 
 test("子 session 定位由主会话身份与实例名确定，跨会话隔离", async () => {
-	definitionFile("worker.md", "name: worker", "W");
+	define("worker.md", "name: worker", "W");
 	const app = setup();
 	const fakeA = fakeHerdr();
 	const fakeB = fakeHerdr();
@@ -335,7 +233,7 @@ test("子 session 定位由主会话身份与实例名确定，跨会话隔离",
 });
 
 test("Herdr agent 名始终满足 Herdr 命名约束，且跨主会话不冲突", async () => {
-	definitionFile("worker.md", "name: worker", "W");
+	define("worker.md", "name: worker", "W");
 	const app = setup();
 	const fakeA = fakeHerdr();
 	const fakeB = fakeHerdr();
@@ -352,7 +250,7 @@ test("Herdr agent 名始终满足 Herdr 命名约束，且跨主会话不冲突"
 });
 
 test("运行位置挂在进程级载体上，重新导入模块后仍复用同一 pane", async () => {
-	definitionFile("worker.md", "name: worker", "W");
+	define("worker.md", "name: worker", "W");
 	const first = setup();
 	const fake = fakeHerdr();
 	await dispatch(first, makeCtx(fake), { type: "worker", name: "w1", prompt: "first" });
@@ -360,18 +258,15 @@ test("运行位置挂在进程级载体上，重新导入模块后仍复用同�
 	// 模拟 /reload：模块被重新导入，factory 内的一切局部状态归零。
 	const spec = `../extensions/pi-subagent/index.ts?reload=${Date.now()}`;
 	const reloaded = (await import(spec)) as { default: (pi: ExtensionAPI) => void };
-	const handlers = new Map<string, Handler>();
+	const handlers = new Map<string, (event: any, ctx: any) => unknown>();
 	const tools = new Map<string, Tool>();
 	reloaded.default({
-		on: (event: string, handler: Handler) => handlers.set(event, handler),
-		registerTool: (definition: Tool) => tools.set((definition as unknown as { name: string }).name, definition),
-		exec: (command: string, args: string[]) => {
-			assert.ok(activeHerdr, "派发前必须先构造 ctx（makeCtx）");
-			return activeHerdr.exec(command, args);
-		},
+		on: (event: string, handler: (event: any, ctx: any) => unknown) => handlers.set(event, handler),
+		registerTool: (definition: Tool) => tools.set(definition.name, definition),
+		exec: (command: string, args: string[]) => fake.exec(command, args),
 	} as unknown as ExtensionAPI);
 
-	const result = await dispatch({ tools }, makeCtx(fake), { type: "worker", name: "w1", prompt: "second" });
+	const result = await dispatch({ handlers, tools, sent: [] }, makeCtx(fake), { type: "worker", name: "w1", prompt: "second" });
 	assert.equal(calls(fake, "tab", "create").length, 1, "reload 后不得重复创建实例");
 	assert.equal(calls(fake, "agent", "prompt").length, 2);
 	assert.equal(result.details.action, "submitted");
@@ -380,7 +275,7 @@ test("运行位置挂在进程级载体上，重新导入模块后仍复用同�
 // ─── 失败路径 ───
 
 test("启动失败只报错，关闭半成品标签页，且不登记运行位置", async () => {
-	definitionFile("worker.md", "name: worker", "W");
+	define("worker.md", "name: worker", "W");
 	const app = setup();
 	const fake = fakeHerdr();
 	fake.startFails = "agent_not_found";
@@ -396,7 +291,7 @@ test("启动失败只报错，关闭半成品标签页，且不登记运行位�
 });
 
 test("提交失败时报错，但实例仍被登记，同名派发不再重复启动", async () => {
-	definitionFile("worker.md", "name: worker", "W");
+	define("worker.md", "name: worker", "W");
 	const app = setup();
 	const fake = fakeHerdr();
 	fake.promptFails = "agent_blocked";
@@ -412,7 +307,7 @@ test("提交失败时报错，但实例仍被登记，同名派发不再重复�
 });
 
 test("Herdr 返回非 JSON 与结构缺失时给出明确错误", async () => {
-	definitionFile("worker.md", "name: worker", "W");
+	define("worker.md", "name: worker", "W");
 	const app = setup();
 	const broken: FakeHerdr = {
 		...fakeHerdr(),

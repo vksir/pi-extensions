@@ -14,11 +14,14 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { loadAgentDefinitions, type AgentDefinition } from "./definitions.ts";
 import { createHerdr } from "./herdr.ts";
 import { childSessionIdOf, herdrAgentNameOf, ownerKeyOf } from "./identity.ts";
-import { getRuntime, runtimeKey, setRuntime } from "./runtime.ts";
+import { closeOtherResultServers, ensureResultServer } from "./ipc.ts";
+import type { SubagentResultMessage } from "./protocol.ts";
+import { getRuntime, runtimeKey, runtimeStore, setRuntime } from "./runtime.ts";
 
 const TOOL_NAME = "agent";
 
@@ -72,14 +75,21 @@ function resolveOwner(ctx: ExtensionContext): OwnerResolution {
 	return { ok: true, ownerKey: ownerKeyOf(ctx.sessionManager.getSessionId(), sessionFile) };
 }
 
+/** 桥接扩展的绝对路径：子 Agent 只加载它，从而能回传结果但拿不到委派工具。 */
+function bridgePath(): string {
+	return fileURLToPath(new URL("./bridge.ts", import.meta.url));
+}
+
 /**
  * 转译为 Pi 原生启动参数。子 Agent 与主 Agent 共用 cwd 与工作区、独立对话历史。
  * 当前只覆盖会话定位与提示词；model/thinking/tools/extensions 等字段由后续 ticket 转译。
  */
 function buildPiArgs(definition: AgentDefinition, sessionDir: string, childSessionId: string, name: string): string[] {
 	const args = [
-		// 不加载被发现的扩展：子 Agent 因此不会获得本扩展的委派工具，也不继承其他扩展行为。
+		// 不加载被发现的扩展，只显式加载桥接：子 Agent 不会获得本扩展的委派工具，也不继承其他扩展行为。
 		"-ne",
+		"-e",
+		bridgePath(),
 		"--session-dir",
 		sessionDir,
 		"--session-id",
@@ -96,9 +106,42 @@ function messageOf(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/** 把工作轮次结果包装成主 Agent 可见的 follow-up：头部是关联信息，正文是完整回复原文。 */
+function frameResult(message: SubagentResultMessage): string {
+	const header = [
+		`[subagent result] instance="${message.name}"`,
+		`type="${message.type}"`,
+		`round=${message.round}`,
+		`status=${message.status}`,
+		`session=${message.sessionId}`,
+		message.sessionFile ? `file="${message.sessionFile}"` : undefined,
+	]
+		.filter(Boolean)
+		.join(" ");
+	return `${header}\n\n${message.reply}`;
+}
+
 export default function (pi: ExtensionAPI) {
 	/** 尚无运行位置、但正在创建的实例；并行同名派发共享同一次创建，避免重复启动。 */
 	const pending = new Map<string, Promise<StartedInstance>>();
+
+	// IPC 端点可能由上一个扩展实例创建，但注入始终走当前 runtime，因此 /reload 后结果照常进入主会话。
+	runtimeStore().sink = (message) => {
+		const store = runtimeStore();
+		// 旧主会话的迟到结果不得注入当前主会话。
+		if (!store.ownerKey || message.ownerKey !== store.ownerKey) return;
+		const running = getRuntime(message.ownerKey, message.name);
+		if (!running || running.type !== message.type) return;
+		// 忙时排在当前工作之后，空闲时启动新一轮；绝不 steer 打断。
+		pi.sendUserMessage(frameResult(message), { deliverAs: "followUp" });
+	};
+
+	pi.on("session_start", (_event, ctx) => {
+		const owner = resolveOwner(ctx);
+		if (!owner.ok) return;
+		runtimeStore().ownerKey = owner.ownerKey;
+		closeOtherResultServers(owner.ownerKey);
+	});
 
 	pi.registerTool({
 		name: TOOL_NAME,
@@ -156,7 +199,7 @@ export default function (pi: ExtensionAPI) {
 					);
 				}
 				return text(
-					`Submitted the prompt to running subagent "${name}" (type "${type}") in its Herdr tab; its work round has not finished yet.`,
+					`Submitted the prompt to running subagent "${name}" (type "${type}") in its Herdr tab; its work round has not finished yet. Its result will arrive as a follow-up when the round settles.`,
 					{ action: "submitted", name, type, paneId: running.paneId, tabId: running.tabId },
 				);
 			}
@@ -168,11 +211,18 @@ export default function (pi: ExtensionAPI) {
 					const childSessionId = childSessionIdOf(owner.ownerKey, name);
 					const agentName = herdrAgentNameOf(owner.ownerKey, name);
 					mkdirSync(sessionDir, { recursive: true });
+					const pipe = (await ensureResultServer(owner.ownerKey)).path;
 					const tab = await herdr.createTabWithPi({
 						cwd: ctx.cwd,
 						label: name,
 						agentName,
 						piArgs: buildPiArgs(definition, sessionDir, childSessionId, name),
+						env: {
+							PI_SUBAGENT_OWNER_KEY: owner.ownerKey,
+							PI_SUBAGENT_NAME: name,
+							PI_SUBAGENT_TYPE: type,
+							PI_SUBAGENT_PIPE: pipe,
+						},
 					});
 					// 先登记运行位置再提交：提交失败时同名派发仍复用这个 pane，而不是再启动一个实例。
 					setRuntime({
@@ -213,6 +263,7 @@ export default function (pi: ExtensionAPI) {
 				[
 					`Started subagent "${name}" (type "${type}") in a new Herdr tab and submitted the prompt.`,
 					`It works in its own Pi session ${instance.childSessionId} with its own conversation history; its work round has not finished yet.`,
+					"Its result will arrive as a follow-up when the round settles.",
 				].join(" "),
 				{
 					action: "started",

@@ -24,7 +24,14 @@ export interface HerdrTab {
 }
 
 export interface Herdr {
-	createTabWithPi(options: { cwd: string; label: string; agentName: string; piArgs: string[] }): Promise<HerdrTab>;
+	createTabWithPi(options: {
+		cwd: string;
+		label: string;
+		agentName: string;
+		piArgs: string[];
+		/** 传给新标签页进程的环境变量；子 Agent 据此得到实例身份与结果回传端点 */
+		env?: Record<string, string>;
+	}): Promise<HerdrTab>;
 	prompt(target: string, text: string): Promise<void>;
 	closeTab(tabId: string): Promise<void>;
 }
@@ -76,10 +83,11 @@ export function createHerdr(exec: Exec, env: HerdrEnvironment): Herdr {
 	}
 
 	return {
-		async createTabWithPi({ cwd, label, agentName, piArgs }) {
+		async createTabWithPi({ cwd, label, agentName, piArgs, env: childEnv }) {
 			ensureAvailable();
 			const createArgs = ["tab", "create", "--cwd", cwd, "--label", label, "--no-focus"];
 			if (env.workspaceId) createArgs.push("--workspace", env.workspaceId);
+			for (const [key, value] of Object.entries(childEnv ?? {})) createArgs.push("--env", `${key}=${value}`);
 			const created = await run(createArgs);
 			const result = asRecord(asRecord(created)?.result) ?? asRecord(created);
 			const tabId = pickId(result?.tab, ["tab_id", "id"]);

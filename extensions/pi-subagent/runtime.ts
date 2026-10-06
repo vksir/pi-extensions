@@ -1,10 +1,13 @@
 /**
- * 运行态：主会话／实例名 → 本扩展拥有的 Herdr 运行位置。
+ * 运行态：主会话／实例名 → 本扩展拥有的 Herdr 运行位置，以及结果接收端。
  *
  * 这张表挂在固定的 globalThis Symbol 上，而不是扩展模块的局部变量：pi 在 `/reload` 时
  * 会重新导入扩展模块（jiti, moduleCache: false），模块级变量必然丢失（ADR-0001）。
  * 表中只登记运行资源；丢失它不等于丢失逻辑实例、名称绑定或对话历史。
  */
+import type { Server } from "node:net";
+import type { SubagentResultMessage } from "./protocol.ts";
+
 const STORE_KEY = Symbol.for("vkzha.pi-subagent.runtime");
 
 export interface SubagentRuntime {
@@ -19,15 +22,25 @@ export interface SubagentRuntime {
 	startedAt: number;
 }
 
-interface RuntimeStore {
-	instances: Map<string, SubagentRuntime>;
+export interface ResultServerHandle {
+	path: string;
+	server: Server;
 }
 
-function store(): RuntimeStore {
+export interface RuntimeStore {
+	instances: Map<string, SubagentRuntime>;
+	servers: Map<string, ResultServerHandle>;
+	/** 当前主会话的 ownerKey，由 session_start 刷新；旧主会话的迟到结果据此拒绝 */
+	ownerKey?: string;
+	/** 当前扩展实例的结果接收函数；/reload 后由新实例接管，不复用旧 runtime */
+	sink?: (message: SubagentResultMessage) => void;
+}
+
+export function runtimeStore(): RuntimeStore {
 	const holder = globalThis as unknown as Record<symbol, RuntimeStore | undefined>;
 	let value = holder[STORE_KEY];
 	if (!value) {
-		value = { instances: new Map() };
+		value = { instances: new Map(), servers: new Map() };
 		holder[STORE_KEY] = value;
 	}
 	return value;
@@ -38,9 +51,9 @@ export function runtimeKey(ownerKey: string, name: string): string {
 }
 
 export function getRuntime(ownerKey: string, name: string): SubagentRuntime | undefined {
-	return store().instances.get(runtimeKey(ownerKey, name));
+	return runtimeStore().instances.get(runtimeKey(ownerKey, name));
 }
 
 export function setRuntime(entry: SubagentRuntime): void {
-	store().instances.set(runtimeKey(entry.ownerKey, entry.name), entry);
+	runtimeStore().instances.set(runtimeKey(entry.ownerKey, entry.name), entry);
 }
