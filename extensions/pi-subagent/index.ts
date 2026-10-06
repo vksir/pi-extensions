@@ -20,8 +20,11 @@ import { loadAgentDefinitions, type AgentDefinition } from "./definitions.ts";
 import { createHerdr } from "./herdr.ts";
 import { childSessionIdOf, herdrAgentNameOf, ownerKeyOf } from "./identity.ts";
 import { closeOtherResultServers, ensureResultServer } from "./ipc.ts";
-import type { SubagentResultMessage } from "./protocol.ts";
-import { getRuntime, runtimeKey, runtimeStore, setRuntime } from "./runtime.ts";
+import type { BindingMessage, ResultMessage, SubagentBinding } from "./protocol.ts";
+import { getRuntime, removeRuntime, runtimeKey, runtimeStore, setRuntime } from "./runtime.ts";
+
+/** 子 Agent 启动后应立刻报告实例绑定；超过该时限视为启动异常。 */
+const BINDING_TIMEOUT_MS = 15_000;
 
 const TOOL_NAME = "agent";
 
@@ -106,8 +109,26 @@ function messageOf(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * 校验子进程报告的绑定：身份必须与本次派发一致，且已保存的实例不能换角色。
+ * 已保存实例的类型检查发生在提交 prompt 之前，不会悄悄改变现有实例。
+ */
+function assertBinding(binding: BindingMessage, expected: SubagentBinding): void {
+	if (binding.ownerKey !== expected.ownerKey || binding.name !== expected.name || binding.type !== expected.type) {
+		throw new Error(
+			`the subagent process reported instance "${binding.name}" (type "${binding.type}") instead of "${expected.name}" (type "${expected.type}")`,
+		);
+	}
+	const bound = binding.bound;
+	if (bound && (bound.ownerKey !== expected.ownerKey || bound.name !== expected.name || bound.type !== expected.type)) {
+		throw new Error(
+			`instance "${expected.name}" is bound to type "${bound.type}" in its saved session; it cannot be dispatched as "${expected.type}". Use a different instance name.`,
+		);
+	}
+}
+
 /** 把工作轮次结果包装成主 Agent 可见的 follow-up：头部是关联信息，正文是完整回复原文。 */
-function frameResult(message: SubagentResultMessage): string {
+function frameResult(message: ResultMessage): string {
 	const header = [
 		`[subagent result] instance="${message.name}"`,
 		`type="${message.type}"`,
@@ -124,12 +145,36 @@ function frameResult(message: SubagentResultMessage): string {
 export default function (pi: ExtensionAPI) {
 	/** 尚无运行位置、但正在创建的实例；并行同名派发共享同一次创建，避免重复启动。 */
 	const pending = new Map<string, Promise<StartedInstance>>();
+	/** 等待子进程启动握手的创建流程，按 (ownerKey, 实例名) 定位。 */
+	const bindingWaiters = new Map<string, (message: BindingMessage) => void>();
+
+	function waitForBinding(ownerKey: string, name: string): Promise<BindingMessage> {
+		const key = runtimeKey(ownerKey, name);
+		const promise = new Promise<BindingMessage>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				bindingWaiters.delete(key);
+				reject(new Error("the subagent process did not report its instance binding in time"));
+			}, BINDING_TIMEOUT_MS);
+			bindingWaiters.set(key, (message) => {
+				clearTimeout(timer);
+				bindingWaiters.delete(key);
+				resolve(message);
+			});
+		});
+		// 创建阶段就失败时没有人 await 这个 promise，这里吸收它的超时拒绝。
+		void promise.catch(() => {});
+		return promise;
+	}
 
 	// IPC 端点可能由上一个扩展实例创建，但注入始终走当前 runtime，因此 /reload 后结果照常进入主会话。
 	runtimeStore().sink = (message) => {
 		const store = runtimeStore();
 		// 旧主会话的迟到结果不得注入当前主会话。
 		if (!store.ownerKey || message.ownerKey !== store.ownerKey) return;
+		if (message.kind === "binding") {
+			bindingWaiters.get(runtimeKey(message.ownerKey, message.name))?.(message);
+			return;
+		}
 		const running = getRuntime(message.ownerKey, message.name);
 		if (!running || running.type !== message.type) return;
 		// 忙时排在当前工作之后，空闲时启动新一轮；绝不 steer 打断。
@@ -212,6 +257,8 @@ export default function (pi: ExtensionAPI) {
 					const agentName = herdrAgentNameOf(owner.ownerKey, name);
 					mkdirSync(sessionDir, { recursive: true });
 					const pipe = (await ensureResultServer(owner.ownerKey)).path;
+					// 先登记握手等待：子进程启动时就会报告绑定，可能早于 agent start 返回。
+					const handshake = waitForBinding(owner.ownerKey, name);
 					const tab = await herdr.createTabWithPi({
 						cwd: ctx.cwd,
 						label: name,
@@ -234,6 +281,14 @@ export default function (pi: ExtensionAPI) {
 						agentName,
 						startedAt: Date.now(),
 					});
+					try {
+						// 核对子 session 中已保存的绑定：同名不同类型必须报错，不能悄悄换角色。
+						assertBinding(await handshake, { ownerKey: owner.ownerKey, name, type });
+					} catch (error) {
+						removeRuntime(owner.ownerKey, name);
+						await herdr.closeTab(tab.tabId).catch(() => {});
+						throw error;
+					}
 					return { paneId: tab.paneId, tabId: tab.tabId, childSessionId, sessionDir };
 				})();
 				pending.set(key, creation);

@@ -5,11 +5,18 @@
  * 不会获得本扩展的委派工具，也不继承其他扩展行为。
  *
  * 工作轮次以 `agent_settled` 为边界（`agent_end` 可能早于自动恢复或后续工作）；
- * 轮次计数用 appendEntry 落在子 session 中，不进入 LLM 上下文。
+ * 轮次计数与实例绑定都用 appendEntry 落在子 session 中，不进入 LLM 上下文。
  */
 import { connect } from "node:net";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { encodeMessage, ROUND_ENTRY_TYPE, type ResultStatus, type SubagentResultMessage } from "./protocol.ts";
+import {
+	BINDING_ENTRY_TYPE,
+	encodeMessage,
+	ROUND_ENTRY_TYPE,
+	type ChildMessage,
+	type ResultStatus,
+	type SubagentBinding,
+} from "./protocol.ts";
 
 const OWNER_KEY_ENV = "PI_SUBAGENT_OWNER_KEY";
 const NAME_ENV = "PI_SUBAGENT_NAME";
@@ -40,20 +47,38 @@ function lastAssistantText(messages: readonly unknown[]): string {
 	return "";
 }
 
+function readEntries(ctx: ExtensionContext): readonly { type?: string; customType?: string; data?: unknown }[] {
+	return ctx.sessionManager.getEntries() as readonly { type?: string; customType?: string; data?: unknown }[];
+}
+
+/** 子 session 中已保存的实例绑定；后写优先。 */
+function readBinding(ctx: ExtensionContext): SubagentBinding | undefined {
+	let bound: SubagentBinding | undefined;
+	for (const entry of readEntries(ctx)) {
+		if (entry.type !== "custom" || entry.customType !== BINDING_ENTRY_TYPE) continue;
+		const data = entry.data;
+		if (data === null || typeof data !== "object") continue;
+		const record = data as Record<string, unknown>;
+		if (typeof record.ownerKey === "string" && typeof record.name === "string" && typeof record.type === "string") {
+			bound = { ownerKey: record.ownerKey, name: record.name, type: record.type };
+		}
+	}
+	return bound;
+}
+
 function countRounds(ctx: ExtensionContext): number {
-	const entries = ctx.sessionManager.getEntries();
 	let count = 0;
-	for (const entry of entries) {
+	for (const entry of readEntries(ctx)) {
 		if (entry.type === "custom" && entry.customType === ROUND_ENTRY_TYPE) count += 1;
 	}
 	return count;
 }
 
-function send(pipe: string, message: SubagentResultMessage, ctx: ExtensionContext): void {
+function send(pipe: string, message: ChildMessage, ctx: ExtensionContext): void {
 	const socket = connect(pipe);
 	socket.on("error", (error) => {
 		// 失败只报告，不重试、不降级、不写结果文件。
-		ctx.ui.notify(`[pi-subagent] could not deliver the work round result: ${error.message}`, "error");
+		ctx.ui.notify(`[pi-subagent] could not deliver the ${message.kind} message: ${error.message}`, "error");
 	});
 	socket.on("connect", () => {
 		socket.end(encodeMessage(message));
@@ -74,6 +99,10 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		round = countRounds(ctx);
+		const bound = readBinding(ctx);
+		// 首次启动即落盘绑定：回收后同名派发仍能核对该实例的角色。
+		if (!bound) pi.appendEntry(BINDING_ENTRY_TYPE, { ownerKey, name, type });
+		send(pipe, { kind: "binding", ownerKey, name, type, bound }, ctx);
 	});
 
 	pi.on("agent_end", (event) => {
@@ -91,6 +120,7 @@ export default function (pi: ExtensionAPI) {
 		send(
 			pipe,
 			{
+				kind: "result",
 				ownerKey,
 				name,
 				type,

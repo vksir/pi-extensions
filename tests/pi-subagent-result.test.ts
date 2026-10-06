@@ -175,8 +175,8 @@ test("轮次编号递增并落在子 session 中", async () => {
 	assert.match(String(app.sent[0]?.content), /round=1 /);
 	assert.match(String(app.sent[1]?.content), /round=2 /);
 	assert.deepEqual(
-		child.entries.map((entry) => entry.customType),
-		["pi-subagent-round", "pi-subagent-round"],
+		child.entries.filter((entry) => entry.customType === "pi-subagent-round").map((entry) => entry.data),
+		[{ round: 1 }, { round: 2 }],
 	);
 });
 
@@ -240,7 +240,10 @@ test("IPC 失败只在子进程报告错误，不重试、不抛出", async () =
 	await waitFor(() => child.notifications.length > 0);
 	assert.equal(child.notifications[0]?.level, "error");
 	assert.match(child.notifications[0]?.message ?? "", /could not deliver/);
-	assert.equal(child.entries.length, 1, "轮次仍记录在子 session 中");
+	assert.ok(
+		child.entries.some((entry) => entry.customType === "pi-subagent-round" && (entry.data as { round?: number })?.round === 1),
+		"轮次仍记录在子 session 中",
+	);
 });
 
 test("重复的 settled 不重复发送同一轮结果", async () => {

@@ -4,6 +4,7 @@
  */
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
+import { connect } from "node:net";
 import { join } from "node:path";
 import type { ExecResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -60,6 +61,10 @@ export interface FakeHerdr {
 	createFails?: string;
 	startFails?: string;
 	promptFails?: string;
+	/** 默认 true：模拟子进程启动时通过 IPC 报告实例绑定（真实桥接在 session_start 时发送）。 */
+	autoBind?: boolean;
+	/** 模拟子 session 中已保存的绑定类型；缺省表示这是一个全新的子 session。 */
+	savedType?: string;
 }
 
 export function fakeHerdr(): FakeHerdr {
@@ -81,6 +86,7 @@ async function respond(fake: FakeHerdr, command: string, args: string[]): Promis
 	}
 	if (args[0] === "agent" && args[1] === "start") {
 		if (fake.startFails) return bad(fake.startFails);
+		if (fake.autoBind !== false) await reportBinding(fake);
 		return ok(JSON.stringify({ result: {} }));
 	}
 	if (args[0] === "agent" && args[1] === "prompt") {
@@ -92,6 +98,34 @@ async function respond(fake: FakeHerdr, command: string, args: string[]): Promis
 		return ok(JSON.stringify({ result: {} }));
 	}
 	return bad(`unsupported command: ${args.join(" ")}`);
+}
+
+/** 模拟子进程启动握手：报告实例身份与子 session 中已保存的绑定。 */
+async function reportBinding(fake: FakeHerdr): Promise<void> {
+	const env = childEnv(fake);
+	const pipe = env.PI_SUBAGENT_PIPE;
+	if (!pipe) return;
+	const ownerKey = env.PI_SUBAGENT_OWNER_KEY ?? "";
+	const name = env.PI_SUBAGENT_NAME ?? "";
+	await sendRaw(
+		pipe,
+		JSON.stringify({
+			kind: "binding",
+			ownerKey,
+			name,
+			type: env.PI_SUBAGENT_TYPE ?? "",
+			bound: fake.savedType ? { ownerKey, name, type: fake.savedType } : undefined,
+		}) + "\n",
+	);
+}
+
+export function sendRaw(pipe: string, payload: string): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const socket = connect(pipe);
+		socket.on("error", reject);
+		socket.on("connect", () => socket.end(payload));
+		socket.on("close", () => resolve());
+	});
 }
 
 export interface CtxOptions {
@@ -116,6 +150,8 @@ export function makeCtx(fake: FakeHerdr, options: CtxOptions = {}): ExtensionCon
 }
 
 export async function dispatch(app: App, ctx: ExtensionContext, params: Record<string, unknown>) {
+	// 真实 pi 中 session_start 一定先于任何工具调用；测试在此补齐这一步，让主会话身份就位。
+	app.handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
 	const tool = app.tools.get("agent");
 	assert.ok(tool, "agent 工具必须已注册");
 	const result = await tool.execute("call-1", params, undefined, undefined, ctx);
@@ -141,7 +177,7 @@ export function piArgs(fake: FakeHerdr): string[] {
 
 /** 读取 `tab create --env` 实际传给子 Agent 的环境变量。 */
 export function childEnv(fake: FakeHerdr): Record<string, string> {
-	const create = calls(fake, "tab", "create")[0];
+	const create = calls(fake, "tab", "create").at(-1);
 	assert.ok(create, "必须创建过标签页");
 	const env: Record<string, string> = {};
 	for (let index = 0; index < create.args.length; index += 1) {
@@ -207,6 +243,15 @@ export function setupBridge(
 		ctx,
 		fire: (event: string, payload: unknown = { type: event }) => handlers.get(event)?.(payload, ctx),
 	};
+}
+
+/**
+ * 模拟运行资源丢失（pane 被关闭、父 pi 进程重启）：只丢运行态定位，
+ * 子 session 与其中的绑定不受影响。
+ */
+export function loseRuntime(): void {
+	const store = (globalThis as unknown as Record<symbol, { instances: Map<string, unknown> } | undefined>)[RUNTIME_KEY];
+	store?.instances.clear();
 }
 
 export async function waitFor(check: () => boolean, timeoutMs = 3000): Promise<void> {

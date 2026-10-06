@@ -6,7 +6,7 @@
  * 表中只登记运行资源；丢失它不等于丢失逻辑实例、名称绑定或对话历史。
  */
 import type { Server } from "node:net";
-import type { SubagentResultMessage } from "./protocol.ts";
+import type { BindingMessage, ResultMessage } from "./protocol.ts";
 
 const STORE_KEY = Symbol.for("vkzha.pi-subagent.runtime");
 
@@ -33,7 +33,7 @@ export interface RuntimeStore {
 	/** 当前主会话的 ownerKey，由 session_start 刷新；旧主会话的迟到结果据此拒绝 */
 	ownerKey?: string;
 	/** 当前扩展实例的结果接收函数；/reload 后由新实例接管，不复用旧 runtime */
-	sink?: (message: SubagentResultMessage) => void;
+	sink?: (message: BindingMessage | ResultMessage) => void;
 }
 
 export function runtimeStore(): RuntimeStore {
@@ -56,4 +56,8 @@ export function getRuntime(ownerKey: string, name: string): SubagentRuntime | un
 
 export function setRuntime(entry: SubagentRuntime): void {
 	runtimeStore().instances.set(runtimeKey(entry.ownerKey, entry.name), entry);
+}
+
+export function removeRuntime(ownerKey: string, name: string): void {
+	runtimeStore().instances.delete(runtimeKey(ownerKey, name));
 }
