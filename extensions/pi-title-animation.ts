@@ -81,6 +81,9 @@ function cleanup(ctx: ExtensionContext) {
 }
 
 export default function (pi: ExtensionAPI) {
+    // HERDR 环境下不注册事件，避免修改窗口标题。
+    if (process.env.HERDR_ENV === "1") return;
+
     pi.on("agent_start", async (_event, ctx) => {
         start(ctx);
     });
