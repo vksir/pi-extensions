@@ -12,8 +12,8 @@
     "package.json"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "^1.0.0",
+    "@earendil-works/pi-coding-agent": "^1.0.0",
     "typebox": "*"
   },
   "publishConfig": {
@@ -25,9 +25,9 @@
     ]
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.80.10",
-    "@earendil-works/pi-coding-agent": "^0.80.10",
-    "@earendil-works/pi-tui": "^0.80.10",
+    "@earendil-works/pi-ai": "^1.0.0",
+    "@earendil-works/pi-coding-agent": "^1.0.0",
+    "@earendil-works/pi-tui": "^1.0.0",
     "@types/node": "^26.1.1",
     "typebox": "^1.3.6",
     "typescript": "^7.0.2"
