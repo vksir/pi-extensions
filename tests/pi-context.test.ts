@@ -17,225 +17,246 @@ after(() => {
 	rmSync(agentDir, { recursive: true, force: true });
 });
 
-interface UIContext {
+const MODEL = { provider: "deepseek", id: "deepseek-flash", api: "openai-completions" };
+const SYSTEM_MESSAGE = {
+	role: "system",
+	content: "base prompt",
+	sections: { preamble: "PREAMBLE", tools: "TOOLS" },
+	timestamp: 0,
+};
+
+interface UiContext {
+	model: typeof MODEL;
+	isIdle: () => boolean;
 	ui: { notify: (message: string, level?: string) => void };
 }
 
-function setup(activeTools = ["cron", "codemode"]) {
+type Handler = (event: unknown, ctx: UiContext) => unknown;
+
+function setup() {
 	rmSync(outDir, { recursive: true, force: true });
-	let command: (args: string, ctx: UIContext) => Promise<void>;
-	const handlers = new Map<string, (event: { payload: unknown }, ctx: UIContext) => unknown>();
+	let command: ((args: string, ctx: UiContext) => Promise<void>) | undefined;
+	const handlers = new Map<string, Handler>();
 	const notifications: { message: string; level?: string }[] = [];
-	const ctx = {
-		getSystemPrompt: () => "命令时系统提示词",
-		ui: { notify: (message: string, level?: string) => { notifications.push({ message, level }); } },
+	let idle = true;
+	const sent: { message: Record<string, unknown>; options?: { triggerTurn?: boolean } }[] = [];
+	const ctx: UiContext = {
+		model: MODEL,
+		isIdle: () => idle,
+		ui: { notify: (message, level) => { notifications.push({ message, level }); } },
 	};
 	const pi = {
 		registerCommand: (_name: string, definition: { handler: typeof command }) => { command = definition.handler; },
-		on: (event: string, handler: (event: { payload: unknown }, ctx: UIContext) => unknown) => {
-			handlers.set(event, handler);
-		},
-		getActiveTools: () => activeTools,
-		getAllTools: () => { throw new Error("不应读取注册定义"); },
+		on: (event: string, handler: Handler) => { handlers.set(event, handler); },
+		sendMessage: (message: Record<string, unknown>, options?: { triggerTurn?: boolean }) => { sent.push({ message, options }); },
 	};
 	contextExtension(pi as unknown as ExtensionAPI);
+
 	return {
-		capture: () => command("", ctx),
-		request: (payload: unknown) => handlers.get("before_provider_request")!({ payload }, ctx),
+		/** /context 挂起一次捕获 */
+		arm: () => command!("", ctx),
+		/** 每个 LLM 调用前 Pi 送来的完整 transcript */
+		transcript: (messages: unknown[]) => handlers.get("context_with_system")!({ type: "context_with_system", messages }, ctx),
+		/** 每个 LLM 调用前的对话消息 */
+		conversation: (messages: unknown[]) => handlers.get("context")!({ type: "context", messages }, ctx),
+		/** provider 请求体成型后 Pi 送来的事件 */
+		request: (payload: unknown) => handlers.get("before_provider_request")!({ type: "before_provider_request", payload }, ctx),
 		read: (name = "tools.md") => readFileSync(join(outDir, name), "utf8"),
+		files: () => readdirSync(outDir).sort(),
 		notifications,
+		sent,
+		busy: () => { idle = false; },
 	};
 }
 
-function toolsBody(report: string): string {
-	const pattern = /^- 写入时间：\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\n\n/m;
-	assert.match(report, pattern, "工具定义必须记录实际写入时间（UTC）");
-	return report.replace(pattern, "");
+/** 挂起后送一次 transcript 与一次请求体。 */
+async function capture(app: ReturnType<typeof setup>, payload: unknown = { tools: [], instructions: "base prompt" }, messages: unknown[] = [SYSTEM_MESSAGE]) {
+	await app.arm();
+	app.transcript(messages);
+	app.request(payload);
 }
 
-function toolsMarkdown(tools: unknown[], activeTools = ["cron", "codemode"]): string {
-	return [
-		"# 工具",
-		"",
-		"## 激活工具",
-		"",
-		"激活不等于独立顶层可见；LLM 实际收到的定义见下方。",
-		"",
-		activeTools.map((name) => `- \`${name}\``).join("\n") || "（无工具）",
-		"",
-		"## 对 LLM 展示的工具定义",
-		"",
-		"~~~json",
-		JSON.stringify(tools, null, 2),
-		"~~~",
-		"",
-	].join("\n");
+/** 抬头字段值：键值对。 */
+function meta(report: string, key: string): string | undefined {
+	return report.match(new RegExp(`^${key}: (.*)$`, "m"))?.[1];
 }
 
-test("简要列出激活工具，保留实际定义与系统提示词，不生成请求体或注册定义", async () => {
+/** 正文：抬头之后的部分。 */
+function body(report: string): string {
+	const match = report.match(/^---\n[\s\S]*?\n---\n\n?/);
+	assert.ok(match, "文件必须以 --- 抬头开始");
+	return report.slice(match[0].length);
+}
+
+/** 定义 JSON：文件里最后一个 JSON 围栏。 */
+function declaration(report: string): unknown {
+	const blocks = [...report.matchAll(/~~~json\n([\s\S]*?)\n~~~/g)];
+	assert.ok(blocks.length > 0, "必须有定义 JSON 块");
+	return JSON.parse(blocks[blocks.length - 1][1]);
+}
+
+test("命令触发一次请求，自己不写文件", async () => {
 	const app = setup();
-	await app.capture();
-	const tools = [{
-		type: "custom",
-		name: "codemode",
-		description: "嵌套工具：cron；调用 tools.cron({ action: 'list' })",
-		format: { type: "grammar", syntax: "lark", definition: "start: SOURCE" },
-	}];
-	const payload = { instructions: "请求时系统提示词", tools, input: [{ role: "user", content: "不要导出用户消息" }] };
-	const before = structuredClone(payload);
-	assert.equal(app.request(payload), undefined, "捕获不能替换请求");
-	assert.deepEqual(payload, before, "捕获不能修改请求");
-	assert.equal(toolsBody(app.read()), toolsMarkdown(tools));
-	assert.equal(app.read("system-prompt.md"), "请求时系统提示词");
-	assert.deepEqual(readdirSync(outDir).sort(), ["system-prompt.md", "tools.md"]);
+	await app.arm();
+	assert.equal(existsSync(outDir), false);
+	assert.equal(app.sent.length, 1);
+	assert.equal(app.sent[0].options?.triggerTurn, true);
+	assert.equal(app.sent[0].message.customType, "pi-context");
+	assert.equal(app.sent[0].message.display, false);
+	assert.ok(app.notifications.some((item) => item.level === "info" && item.message.includes("快照将写入")));
 });
 
-test("命令立即写入系统提示词，工具定义仍等待实际请求", async () => {
+test("Agent 忙碌时不触发请求，快照等本轮下一请求", async () => {
 	const app = setup();
-	await app.capture();
-	assert.equal(app.read("system-prompt.md"), "命令时系统提示词");
-	assert.equal(existsSync(join(outDir, "tools.md")), false);
-	assert.ok(app.notifications.some((item) => item.message.includes("下次请求")));
+	app.busy();
+	await app.arm();
+	assert.equal(app.sent.length, 0);
+	assert.ok(app.notifications.some((item) => item.message.includes("运行中")));
 });
 
-test("工具写入时间随实际捕获更新，未挂起的请求不改时间", async (t) => {
-	t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-03T07:52:03.000Z") });
+test("捕获之后把触发消息从请求里滤掉，捕获那一次保留", async () => {
 	const app = setup();
-	await app.capture();
-	t.mock.timers.tick(1000);
-	app.request({ tools: [], instructions: "请求时系统提示词" });
-	assert.match(app.read(), /- 写入时间：2026-10-03T07:52:04\.000Z/);
-	t.mock.timers.tick(1000);
+	const trigger = { role: "custom", customType: "pi-context", content: "触发器", display: false, timestamp: 0 };
+	const user = { role: "user", content: "你好", timestamp: 1 };
+	await app.arm();
+	// 捕获那一次必须留着触发器，否则请求就不是模型实际收到的那份。
+	assert.equal(app.conversation([trigger, user]), undefined);
+	app.transcript([SYSTEM_MESSAGE]);
 	app.request({ tools: [] });
-	assert.match(app.read(), /- 写入时间：2026-10-03T07:52:04\.000Z/);
-	await app.capture();
-	assert.equal(app.read("system-prompt.md"), "命令时系统提示词");
-	app.request({ tools: [], instructions: "第二次实际提示词" });
-	assert.match(app.read(), /- 写入时间：2026-10-03T07:52:05\.000Z/);
-	assert.equal(app.read("system-prompt.md"), "第二次实际提示词");
+	// 之后的请求不再带上触发器。
+	assert.deepEqual(app.conversation([trigger, user]), { messages: [user] });
+	assert.equal(app.conversation([user]), undefined, "没有触发器时不改消息列表");
 });
 
-const formats: { name: string; payload: Record<string, unknown>; tools: unknown[]; prompt: string }[] = [
-	{
-		name: "OpenAI Responses",
-		payload: {
-			tools: [{ type: "function", name: "cron", description: "动态描述", parameters: {} }],
-			input: [
-				{ role: "system", content: [{ type: "input_text", text: "系统提示词" }] },
-				{ role: "developer", content: [{ type: "input_text", text: "后续系统指令" }] },
-				{ role: "user", content: "用户消息" },
-			],
-		},
-		tools: [{ type: "function", name: "cron", description: "动态描述", parameters: {} }],
-		prompt: "系统提示词\n\n后续系统指令",
-	},
-	{
-		name: "OpenAI Chat Completions",
-		payload: {
-			tools: [{ type: "function", function: { name: "cron", description: "动态描述", parameters: {} } }],
-			messages: [
-				{ role: "system", content: "系统提示词" },
-				{ role: "developer", content: [{ type: "text", text: "后续系统指令" }] },
-				{ role: "assistant", content: "助手消息" },
-			],
-		},
-		tools: [{ type: "function", function: { name: "cron", description: "动态描述", parameters: {} } }],
-		prompt: "系统提示词\n\n后续系统指令",
-	},
-	{
-		name: "Anthropic（含后续 system 消息）",
-		payload: {
-			system: [{ type: "text", text: "系统提示词", cache_control: { type: "ephemeral" } }],
-			tools: [{ name: "cron", description: "动态描述", input_schema: { type: "object" } }],
-			messages: [
-				{ role: "system", content: [{ type: "text", text: "后续系统指令" }] },
-				{ role: "user", content: "用户消息" },
-			],
-		},
-		tools: [{ name: "cron", description: "动态描述", input_schema: { type: "object" } }],
-		prompt: "系统提示词\n\n后续系统指令",
-	},
-	{
-		name: "Google SDK",
-		payload: {
-			config: {
-				systemInstruction: { parts: [{ text: "系统提示词" }] },
-				tools: [{ functionDeclarations: [{ name: "cron", description: "动态描述" }] }],
-			},
-			contents: [{ role: "user", parts: [{ text: "用户消息" }] }],
-		},
-		tools: [{ functionDeclarations: [{ name: "cron", description: "动态描述" }] }],
-		prompt: "系统提示词",
-	},
-	{
-		name: "Google REST",
-		payload: {
-			system_instruction: { parts: [{ text: "系统提示词" }] },
-			tools: [{ function_declarations: [{ name: "cron", description: "动态描述" }] }],
-			contents: [],
-		},
-		tools: [{ function_declarations: [{ name: "cron", description: "动态描述" }] }],
-		prompt: "系统提示词",
-	},
-];
-for (const fixture of formats) {
-	test(`只导出原生工具定义与系统文本：${fixture.name}`, async () => {
-		const app = setup();
-		await app.capture();
-		app.request(fixture.payload);
-		assert.equal(toolsBody(app.read()), toolsMarkdown(fixture.tools));
-		assert.equal(app.read("system-prompt.md"), fixture.prompt);
+test("抬头用 --- 包住键值，正文与抬头分开", async () => {
+	const app = setup();
+	await capture(app);
+	const report = app.read("system-prompt.md");
+	assert.match(report, /^---\n/);
+	assert.match(report, /\n---\n\n/);
+	assert.equal(meta(report, "模型"), "deepseek/deepseek-flash（openai-completions）");
+	assert.match(meta(report, "捕获时间") ?? "", /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+	assert.match(report, /^分段字符数:\n  preamble: 8\n  tools: 5$/m);
+	assert.equal(body(report), "base prompt\n\nPREAMBLE\n\nTOOLS\n");
+	// 两份文件来自同一次请求，共用一个捕获时间。
+	assert.equal(meta(report, "捕获时间"), meta(app.read("tools.md"), "捕获时间"));
+	assert.deepEqual(app.files(), ["system-prompt.md", "tools.md"]);
+});
+
+test("后续 system 消息按名覆盖分段，replay 出当前提示词", async () => {
+	const app = setup();
+	await capture(app, { tools: [] }, [
+		{ role: "system", content: "", sections: { preamble: "第一版", skills: "旧技能" }, timestamp: 0 },
+		{ role: "system", content: "补充指令", sections: { skills: null, cwd: "D:/project" }, timestamp: 1 },
+		{ role: "user", content: "用户消息不进快照" },
+	]);
+	const report = app.read("system-prompt.md");
+	assert.equal(body(report), "补充指令\n\n第一版\n\nD:/project\n");
+	assert.match(report, /^分段字符数:\n  preamble: 3\n  cwd: 10$/m);
+	assert.ok(!report.includes("用户消息"));
+});
+
+test("工具声明按工具名、描述、定义三段式", async () => {
+	const app = setup();
+	const description = ["Run JavaScript that calls other tools.", "```ts", "const value = 1;", "```", "说明".repeat(120)].join("\n");
+	const tools = [{ type: "custom", name: "codemode", description, format: { type: "grammar", definition: "start: SOURCE" } }];
+	await capture(app, { tools });
+	const report = app.read("tools.md");
+	assert.equal(meta(report, "数量"), "1");
+	assert.equal(meta(report, "JSON 字符数"), String(JSON.stringify(tools, null, 2).length));
+	assert.match(report, /^# codemode$/m);
+	// 描述按 Markdown 原样渲染：它自带标题与围栏，套上代码块就没法识别了。
+	assert.ok(report.includes(`## 描述\n\n${description}\n\n## 定义`), "描述必须完整保留且不被围栏包住");
+	assert.ok(!report.includes("~~~text"), "描述不能写在代码块里");
+	assert.deepEqual(declaration(report), { type: "custom", name: "codemode", description: "<见「描述」>", format: { type: "grammar", definition: "start: SOURCE" } });
+});
+
+test("描述里的标题、围栏、列表原样保留，不被转义或改写", async () => {
+	const app = setup();
+	const description = ["## Namespace", "", "```ts", "const value = 1;", "```", "", "- 列表项"].join("\n");
+	await capture(app, { tools: [{ name: "read", description }] });
+	const report = app.read("tools.md");
+	assert.ok(report.includes(`## 描述\n\n${description}\n\n## 定义`), "描述必须在定义之前逐字出现");
+	assert.ok(!report.includes("~~~text"), "描述不能写在代码块里");
+	assert.deepEqual(declaration(report), { name: "read", description: "<见「描述」>" }, "定义仍可解析");
+});
+
+test("工具描述始终单独成节，参数 schema 里的短描述留在定义里", async () => {
+	const app = setup();
+	const tools = [{ name: "read", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string", description: "Path to the file" } } } }];
+	await capture(app, { tools });
+	const report = app.read("tools.md");
+	assert.ok(report.includes("## 描述\n\nRead a file\n\n## 定义"), "描述必须单独成节");
+	assert.deepEqual(declaration(report), {
+		name: "read",
+		description: "<见「描述」>",
+		parameters: { type: "object", properties: { path: { type: "string", description: "Path to the file" } } },
 	});
-}
+});
 
-test("完整保存较长工具定义，不截断", async () => {
+test("描述以外的长文本按 JSON 路径成节", async () => {
 	const app = setup();
-	await app.capture();
-	const tools = [{ name: "codemode", description: "定义".repeat(110_000) }];
-	app.request({ tools, instructions: "" });
-	assert.equal(toolsBody(app.read()), toolsMarkdown(tools));
-	assert.equal(app.read("system-prompt.md"), "");
+	const definition = ["start: source", "source: token"].join("\n");
+	const tools = [{ name: "codemode", description: "短描述", format: { type: "grammar", definition } }];
+	await capture(app, { tools });
+	const report = app.read("tools.md");
+	assert.ok(report.includes(`## 描述\n\n短描述\n\n## format.definition\n\n${definition}\n\n## 定义`), "路径必须成为节标题");
+	assert.deepEqual(declaration(report), { name: "codemode", description: "<见「描述」>", format: { type: "grammar", definition: "<见「format.definition」>" } });
 });
 
-test("没有工具或系统提示词时，输出空定义与空文本", async () => {
-	const app = setup([]);
-	await app.capture();
-	app.request({ messages: [{ role: "user", content: "用户消息" }] });
-	assert.equal(toolsBody(app.read()), toolsMarkdown([], []));
-	assert.equal(app.read("system-prompt.md"), "");
-});
-
-test("激活列表使用请求时状态，不把 codemode 隐藏的工具混入实际声明", async () => {
-	const activeTools = ["cron", "codemode"];
-	const app = setup(activeTools);
-	await app.capture();
-	activeTools.push("late");
-	const tools = [{ name: "codemode", description: "实际动态描述" }];
-	app.request({ tools });
-	assert.equal(toolsBody(app.read()), toolsMarkdown(tools, activeTools));
-	const definition = app.read().match(/~~~json\n([\s\S]*?)\n~~~/);
-	assert.ok(definition);
-	assert.deepEqual(JSON.parse(definition[1]), tools);
-});
-
-test("未知请求格式不冒充已捕获，错误不影响请求", async () => {
+test("Google SDK 的 config.tools 按声明成节，工具名取自嵌套字段", async () => {
 	const app = setup();
-	await app.capture();
-	assert.equal(app.request({ customToolset: ["cron"] }), undefined);
-	assert.equal(app.read("system-prompt.md"), "命令时系统提示词");
-	assert.equal(existsSync(join(outDir, "tools.md")), false);
-	assert.ok(app.notifications.some((item) => item.level === "error"));
+	const tools = [{ functionDeclarations: [{ name: "cron", description: "动态描述" }] }];
+	await capture(app, { config: { tools, systemInstruction: { parts: [{ text: "提示词" }] } }, contents: [] });
+	const report = app.read("tools.md");
+	assert.match(report, /^# cron$/m);
+	assert.ok(report.includes("## 描述\n\n动态描述\n\n## 定义"), "嵌套描述同样单独成节");
+	assert.deepEqual(declaration(report), { functionDeclarations: [{ name: "cron", description: "<见「描述」>" }] });
 });
 
-test("只捕获一次，重复命令可以重新挂起", async () => {
+test("请求体没有工具字段时给出结论，不假装空声明", async () => {
 	const app = setup();
-	await app.capture();
-	app.request({ tools: [{ name: "first" }], instructions: "第一次" });
-	app.request({ tools: [{ name: "ignored" }], instructions: "忽略" });
-	assert.equal(toolsBody(app.read()), toolsMarkdown([{ name: "first" }]));
-	assert.equal(app.read("system-prompt.md"), "第一次");
-	await app.capture();
-	app.request({ tools: [{ name: "second" }], instructions: "第二次" });
-	assert.equal(toolsBody(app.read()), toolsMarkdown([{ name: "second" }]));
-	assert.equal(app.read("system-prompt.md"), "第二次");
+	await capture(app, { instructions: "base prompt" });
+	assert.equal(meta(app.read("tools.md"), "来源"), "本次请求没有工具声明");
+
+	const missing = setup();
+	await capture(missing, { instructions: "base prompt" }, [
+		{ role: "system", content: "", toolsAdded: [{ name: "read" }, { name: "write" }], timestamp: 0 },
+	]);
+	assert.equal(meta(missing.read("tools.md"), "来源"), "无法从该 API 的请求体读取工具声明（transcript 声明了 2 个）");
+});
+
+test("没有 transcript 时也落盘，并说明来源缺失", async () => {
+	const app = setup();
+	await app.arm();
+	app.request({ messages: [{ role: "user", content: "x" }] });
+	assert.equal(meta(app.read("system-prompt.md"), "来源"), "本次请求没有系统提示词");
+	assert.equal(meta(app.read("tools.md"), "来源"), "未捕获到 transcript，无法判断工具声明");
+});
+
+test("只在下一次请求捕获，且不修改请求体、不替换 payload", async () => {
+	const app = setup();
+	const payload = { tools: [{ name: "first" }], instructions: "第一次" };
+	app.transcript([{ role: "system", content: "第一次", timestamp: 0 }]);
+	assert.equal(app.request(payload), undefined, "捕获必须返回 undefined");
+	assert.equal(existsSync(outDir), false, "未挂起时不写文件");
+
+	await app.arm();
+	app.transcript([{ role: "system", content: "第二次", timestamp: 0 }]);
+	const before = structuredClone(payload);
+	assert.equal(app.request(payload), undefined);
+	assert.deepEqual(payload, before, "捕获不能修改请求体");
+	assert.equal(body(app.read("system-prompt.md")), "第二次\n");
+
+	const written = app.read("tools.md");
+	app.request({ tools: [{ name: "ignored" }] });
+	assert.equal(app.read("tools.md"), written, "一次挂起只捕获一次");
+});
+
+test("重复命令可以重新挂起", async () => {
+	const app = setup();
+	await capture(app, { tools: [{ name: "first" }] });
+	assert.equal(meta(app.read("tools.md"), "数量"), "1");
+	await capture(app, { tools: [{ name: "first" }, { name: "second" }] });
+	assert.equal(meta(app.read("tools.md"), "数量"), "2");
 });

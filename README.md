@@ -14,19 +14,19 @@
 | [pi-notify](extensions/pi-notify.ts) | 任务完成后发送桌面通知（支持 iTerm2、Kitty、Ghostty、WezTerm、Windows Terminal） |
 | [pi-title-animation](extensions/pi-title-animation.ts) | Agent 运行时在窗口标题显示旋转动画，结束后恢复原标题 |
 | [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 用量，支持 `/tokens` 命令和 footer 实时显示 |
-| [pi-context](extensions/pi-context.ts) | `/context` 立即写入系统提示词；下次请求刷新提示词并导出原生工具定义、激活工具列表及写入时间，支持 codemode 动态描述 |
+| [pi-context](extensions/pi-context.ts) | `/context` 触发一次空转请求，导出这次请求的系统提示词与工具声明（含 codemode 动态描述），两者同源 |
 | [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron <间隔> [once] <prompt>`、`/cron list`、`/cron delete [id]` |
 
 `/balance codex` 需要先通过 `/login openai-codex` 登录 ChatGPT Plus/Pro 订阅。
 
 ### 上下文快照
 
-执行 `/context` 立即写入系统提示词；再发送一条消息，捕获实际请求并更新两份文件：
+执行 `/context` 触发一次空转请求：向会话发一条 `pi-context` 自定义消息，并让 agent 走一轮，快照写的就是这次真实请求。Agent 忙碌时不再触发，直接等本轮的下一次请求。
 
-- `system-prompt.md`：先保存命令时的系统提示词，再用实际请求的 system/developer 指令文本刷新，不含用户和助手消息。
-- `tools.md`：记录本次实际捕获的写入时间（UTC），简要列出激活工具名称，下方展示原生工具定义 JSON，完整保留 codemode 动态描述、参数 schema 与 freeform grammar，不截断。激活不等于独立顶层可见，实际定义以下方 JSON 为准。
+两份文件来自同一次请求，都用 `---` 抬头的 YAML 键值记录捕获时间与模型：
 
-不导出注册定义、统计信息或完整请求体。内容来自 `before_provider_request` 捕获点，后续处理器仍可能修改请求。
+- `system-prompt.md`：抬头列出具名分段与各段字符数；正文就是模型实际收到的系统提示词。内容来自请求 transcript 的 system 消息，用的是 provider 读取提示词的同一组 replay 助手，与 provider 形状无关。
+- `tools.md`：每个声明一节——`# 工具名` → `## 描述` → `## 定义`。描述按 Markdown 原文渲染（不套代码块，逐字保留、不截断），定义是 JSON，长文本位置留 `<见「节名」>` 占位；描述以外的长文本（如 grammar 定义）按 JSON 路径单独成节。抬头记录数量与原始 JSON 字符数。工具声明只能取自 provider 请求体，这是唯一带 `prepareLoadout` 改写与 provider 原生格式的地方。触发消息只在捕获那一次请求里出现，之后由 `context` 事件从每次请求里滤掉，不会长期占用上下文。不导出用户或助手消息、注册定义、统计信息或完整请求体。请求体没有 `tools` 字段时，文件会写明是「本次请求没有工具声明」还是「无法从该 API 读取」。
 
 默认输出目录为 `~/.pi/agent/pi-context/`，可通过 `PI_CODING_AGENT_DIR` 改变 agent dir。
 
