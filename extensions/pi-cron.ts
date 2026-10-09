@@ -460,7 +460,8 @@ export function oneShotCron(ms: number, from: Date): { cron: string; at: Date } 
  * 触发时交给模型的最小包装：只补两件模型不可能自己知道的事——这条消息从哪来、
  * 以及这个 job 的 id（供它自行取消）。逐字措辞都是调过的，改动前先看测试断言：
  *   - 用第三人称陈述来源，不用否定句去否认消息自身的 role（那会与 role=user 矛盾）；
- *   - 明确写出「该执行下面的内容」，不让模型猜该不该动手；
+ *   - 取消条件锚到「prompt 里写明的完成条件」，而不是模型自评的 purpose——后者是早删的根因；
+ *   - 没有「Run the prompt below」（D43 曾加过，D49 用户拍定删除）；
  *   - 一次性不提「已被移除」——那会暗示无事可做，与要执行的任务直接冲突；
  *   - 头行不标 recurring/one-shot；不写「怎么调工具」；不提 catch-up；不写过期策略。
  * prompt 本体逐字不变，只在前面加一行；渲染时由 unframePrompt 剥掉。
@@ -468,7 +469,7 @@ export function oneShotCron(ms: number, from: Date): { cron: string; at: Date } 
 export function framePrompt(job: CronJob): string {
 	const head = `[cron-job ${job.id} · ${job.cron} · fire ${job.fireCount}]`;
 	const note = job.recurring
-		? "Delivered by a scheduled cron job. Run the prompt below, and cancel this job once its purpose is fulfilled."
+		? "Delivered by a scheduled cron job. Cancel this job only when the prompt's stated completion condition is met."
 		: "Delivered by a scheduled cron job. Run the prompt below.";
 	return `${head} ${note}\n\n${job.prompt}`;
 }
