@@ -5,7 +5,7 @@
  * Supports multiple terminal protocols:
  * - OSC 777: Ghostty, iTerm2, WezTerm, rxvt-unicode
  * - OSC 99: Kitty
- * - Windows toast: Windows Terminal (WSL)
+ * - Windows toast: 系统通知（按 process.platform 判断，任意终端都生效）
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -37,7 +37,7 @@ function notifyWindows(title: string, body: string): void {
 }
 
 function notify(title: string, body: string): void {
-	if (process.env.WT_SESSION) {
+	if (process.platform === "win32") {
 		notifyWindows(title, body);
 	} else if (process.env.KITTY_WINDOW_ID) {
 		notifyOSC99(title, body);
