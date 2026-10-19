@@ -6,13 +6,13 @@
  *
  * HERDR 环境：不改窗口标题，改为在 `/name` 更名会话时，
  * 通过 herdr CLI 同步重命名当前标签。
+ *
+ * 子会话：进程内子 agent（如 @tintinweb/pi-subagents）会在同一进程里为子会话
+ * 重新加载本扩展，并触发各自的 agent 与更名事件；其 ctx.mode 不是 "tui"。
+ * 全部 handler 据此忽略子会话，标题与标签只由主 TUI 会话管理。
  */
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-
-const execFileAsync = promisify(execFile);
 
 const FRAMES = ["⠂", "⠐"];
 const INTERVAL_MS = 960;
@@ -89,6 +89,9 @@ function cleanup(ctx: ExtensionContext) {
 
 // ---- HERDR 标签更名 ----
 
+/** 与 pi.exec 兼容的执行入口；测试用假实现替换。 */
+export type Exec = (command: string, args: string[]) => Promise<{ code: number }>;
+
 // Windows 下 spawn 不解析 PATH 与可执行扩展名，优先用 herdr 注入的绝对路径。
 function herdrCommand(): string {
     return process.env.HERDR_BIN_PATH || "herdr";
@@ -97,33 +100,39 @@ function herdrCommand(): string {
 // /name 可能连续执行，串行排队，保证最后一次重命名最终胜出。
 let renameQueue: Promise<void> = Promise.resolve();
 
-function renameHerdrTab(name: string | undefined): void {
+function renameHerdrTab(exec: Exec, name: string | undefined): void {
     const tabId = process.env.HERDR_TAB_ID;
     if (!tabId) return;
     const label = name?.trim() ?? ""; // /name 清除会话名时同步清空标签
     renameQueue = renameQueue
-        .then(() => execFileAsync(herdrCommand(), ["tab", "rename", tabId, label], { windowsHide: true }))
+        .then(() => exec(herdrCommand(), ["tab", "rename", tabId, label]))
         .then(() => undefined, () => undefined); // herdr 未运行等失败场景静默放弃
 }
 
 export default function (pi: ExtensionAPI) {
     // HERDR 环境下不注册动画事件，避免修改窗口标题。
     if (process.env.HERDR_ENV === "1") {
-        pi.on("session_info_changed", (event) => {
-            renameHerdrTab(event.name);
+        pi.on("session_info_changed", (event, ctx) => {
+            // 子会话更名（子 agent 派生时的 setSessionName）不得触碰主 tab：
+            // HERDR_TAB_ID 是进程级 env，指向主 pi 的标签。
+            if (ctx.mode !== "tui") return;
+            renameHerdrTab((command, args) => pi.exec(command, args), event.name);
         });
         return;
     }
 
     pi.on("agent_start", async (_event, ctx) => {
+        if (ctx.mode !== "tui") return;
         start(ctx);
     });
 
     pi.on("agent_settled", async (_event, ctx) => {
+        if (ctx.mode !== "tui") return;
         stop(ctx, getTitle(ctx));
     });
 
     pi.on("session_shutdown", async (_event, ctx) => {
+        if (ctx.mode !== "tui") return;
         cleanup(ctx);
     });
 }
