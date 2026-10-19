@@ -19,8 +19,8 @@ interface PiNotifySettings {
 	disableInHerdr?: boolean;
 }
 
-/** disableInHerdr 默认值：herdr 环境默认禁用通知 */
-const DEFAULT_DISABLE_IN_HERDR = true;
+/** disableInHerdr 默认值：herdr 环境默认启用通知 */
+const DEFAULT_DISABLE_IN_HERDR = false;
 
 function readSettings(pi: ExtensionAPI): Required<PiNotifySettings> {
 	const raw = (pi.getSettings() as Record<string, unknown>)["pi-notify"];
@@ -76,7 +76,7 @@ export default function (pi: ExtensionAPI) {
 		// 扩展也会在 RPC/JSON/print 模式下加载，
 		// 直接写 process.stdout 会污染非交互输出，仅在 TUI 模式通知
 		if (event.aborted || ctx.mode !== "tui") return;
-		// herdr 环境默认禁用，settings.json 中 { "pi-notify": { "disableInHerdr": false } } 可开启
+		// herdr 环境默认启用，settings.json 中 { "pi-notify": { "disableInHerdr": true } } 可禁用
 		if (inHerdr) {
 			disableInHerdr ??= readSettings(pi).disableInHerdr;
 			if (disableInHerdr) return;

@@ -40,12 +40,12 @@ node --test 'tests/pi-context.test.ts'
 
 pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式下静默。
 
-在 [herdr](https://herdr.dev) 终端环境中（`HERDR_ENV=1`）默认禁用；在 settings.json 中配置后可在 herdr 中继续通知：
+在 [herdr](https://herdr.dev) 终端环境中（`HERDR_ENV=1`）默认启用；如需在 herdr 中禁用，在 settings.json 中配置：
 
 ```json
 {
 	"pi-notify": {
-		"disableInHerdr": false
+		"disableInHerdr": true
 	}
 }
 ```
