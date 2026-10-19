@@ -7,6 +7,7 @@
  *   - Moonshot
  *   - OpenRouter
  *   - OpenAI Codex（ChatGPT Plus/Pro 额度）
+ *   - Zhipu GLM（智谱 Coding Plan 积分额度）
  *
  * 命令：
  *   /balance            — 查询所有已配置 Provider 的余额/额度
@@ -40,6 +41,10 @@ interface CodexUsageWindow {
 	limitWindowSeconds?: number;
 	resetAfterSeconds?: number;
 	resetAt?: number;
+	/** 已用额度（GLM 积分窗口使用，与 total 成对出现） */
+	used?: number;
+	/** 窗口内总额度 */
+	total?: number;
 }
 
 interface CodexQuota {
@@ -91,6 +96,36 @@ interface CodexUsageWindowPayload {
 	limit_window_seconds?: number | string;
 	reset_after_seconds?: number | string;
 	reset_at?: number | string;
+}
+
+/** 智谱 Coding Plan 额度接口的单个限额窗口 */
+interface GlmLimitPayload {
+	/** 固定为 CREDIT_LIMIT 的才有效 */
+	type: string;
+	/** 窗口单位：3 = 小时，6 = 周 */
+	unit: number;
+	/** 窗口大小（配合 unit，如 5h / 1w） */
+	number: number;
+	/** 窗口内总积分 */
+	usage: number;
+	/** 已用积分 */
+	currentValue: number;
+	remaining: number;
+	/** 已用百分比（0-100 整数） */
+	percentage: number;
+	/** 重置时间（毫秒时间戳） */
+	nextResetTime: number;
+}
+
+interface GlmQuotaPayload {
+	code?: number;
+	msg?: string;
+	success?: boolean;
+	data?: {
+		limits?: GlmLimitPayload[];
+		/** 套餐档位，如 lite / pro / max */
+		level?: string;
+	};
 }
 
 interface FreeModel {
@@ -290,6 +325,40 @@ const checkers: ProviderChecker[] = [
 			return { balances: [], quota };
 		},
 	},
+	{
+		name: "GLM",
+		authId: "zai-coding-cn",
+		aliases: ["glm", "zai", "zhipu"],
+		apiUrl: "https://bigmodel.cn/api/monitor/usage/quota/limit?type=1",
+		async check(key: string) {
+			// 注意：智谱要求 Authorization 为原始 key，不带 Bearer 前缀
+			// type=1 个人套餐；团队套餐为 type=2 且需携带
+			// bigmodel-organization / bigmodel-project 请求头（控制台 DevTools 抓取）
+			const res = await fetch(this.apiUrl, {
+				headers: {
+					Accept: "application/json",
+					Authorization: key,
+				},
+			});
+
+			if (!res.ok) {
+				const body = await res.text().catch(() => "");
+				return { balances: [], error: `HTTP ${res.status}${body ? `: ${body}` : ""}` };
+			}
+
+			const data = (await res.json()) as GlmQuotaPayload;
+			if (!data.success || !data.data) {
+				return { balances: [], error: `API 返回异常 code=${data.code}${data.msg ? `: ${data.msg}` : ""}` };
+			}
+
+			const quota = normalizeGlmQuota(data.data);
+			if (!quota) {
+				return { balances: [], error: "未返回 GLM 额度数据（当前账号可能无 Coding Plan，或团队套餐需改用 type=2 并携带组织/项目头）" };
+			}
+
+			return { balances: [], quota };
+		},
+	},
 ];
 
 // ─── 格式化 ───
@@ -361,6 +430,33 @@ function normalizeCodexQuota(data: CodexUsagePayload): CodexQuota | undefined {
 					balance: data.credits?.balance,
 				}
 			: undefined,
+	};
+}
+
+/**
+ * 把智谱 Coding Plan 的限额窗口归一化为与 Codex 相同的 quota 结构：
+ * 小时窗口（unit=3，如 5h）→ primary，周窗口（unit=6，如 1w）→ secondary。
+ */
+function normalizeGlmQuota(data: NonNullable<GlmQuotaPayload["data"]>): CodexQuota | undefined {
+	const limits = (data.limits ?? []).filter((l) => l.type === "CREDIT_LIMIT");
+	if (limits.length === 0) return undefined;
+
+	const toWindow = (l: GlmLimitPayload): CodexUsageWindow => ({
+		usedPercent: l.percentage,
+		limitWindowSeconds: l.unit === 3 ? l.number * 3_600 : l.unit === 6 ? l.number * 7 * 86_400 : undefined,
+		// 智谱 nextResetTime 为毫秒时间戳，Codex 侧统一为秒
+		resetAt: l.nextResetTime / 1000,
+		used: l.currentValue,
+		total: l.usage,
+	});
+
+	const primary = limits.find((l) => l.unit === 3) ?? limits[0];
+	const secondary = limits.find((l) => l.unit === 6);
+
+	return {
+		planType: data.level,
+		primary: toWindow(primary),
+		secondary: secondary ? toWindow(secondary) : undefined,
 	};
 }
 
@@ -439,8 +535,13 @@ function renderBalance(results: BalanceResult[]): string[] {
 			const remaining = Math.max(0, Math.min(100, 100 - window.usedPercent));
 			const percentage = `${formatPercent(remaining)}% 剩余`;
 			const windowLabel = formatWindowLabel(window, label);
+			// 已用/总额度（如 GLM 积分窗口），Codex 无此信息时留空
+			const credits =
+				window.used !== undefined && window.total !== undefined
+					? `  ${Math.round(window.used)}/${Math.round(window.total)} 积分`
+					: "";
 			const reset = formatQuotaReset(window);
-			lines.push(`  ${windowLabel.padEnd(10)} ${percentage.padStart(10)}${reset ? `  ${reset}` : ""}`);
+			lines.push(`  ${windowLabel.padEnd(10)} ${percentage.padStart(10)}${credits}${reset ? `  ${reset}` : ""}`);
 		}
 
 		if (windows.length === 0) {
@@ -712,7 +813,7 @@ export default function (pi: ExtensionAPI) {
 	// ─── 命令 ───
 
 	pi.registerCommand("balance", {
-		description: "查询 Provider 余额/Codex 额度，或列出 OpenRouter 免费模型。用法: /balance，/balance codex，/balance free",
+		description: "查询 Provider 余额/Codex 与 GLM 额度，或列出 OpenRouter 免费模型。用法: /balance，/balance codex，/balance glm，/balance free",
 		getArgumentCompletions: (prefix) => {
 			// 只补第一个参数；已输入空格后交由用户自由输入
 			if (prefix.trim().includes(" ")) return null;
