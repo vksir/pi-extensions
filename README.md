@@ -12,7 +12,7 @@
 |------|------|
 | [pi-balance](extensions/pi-balance.ts) | 查询 AI 模型提供商余额/额度（支持 DeepSeek、Moonshot、OpenRouter、OpenAI Codex） |
 | [pi-notify](extensions/pi-notify.ts) | 任务完成后发送桌面通知（支持 iTerm2、Kitty、Ghostty、WezTerm、Windows Terminal）；需 Pi ≥ 1.3.0 |
-| [pi-title-animation](extensions/pi-title-animation.ts) | Agent 运行时在窗口标题显示旋转动画，结束后恢复原标题 |
+| [pi-title](extensions/pi-title.ts) | Agent 运行时在窗口标题显示旋转动画，结束后恢复原标题；HERDR 环境下 `/name` 更名时同步重命名 herdr 标签 |
 | [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 用量，支持 `/tokens` 命令和 footer 实时显示 |
 | [pi-context](extensions/pi-context.ts) | `/context` 触发一次空转请求，导出这次请求的系统提示词与工具声明（含 codemode 动态描述），两者同源 |
 | [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron <间隔> [once] <prompt>`、`/cron list`、`/cron delete [id]` |
