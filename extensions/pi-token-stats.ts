@@ -5,10 +5,10 @@
  * 增量写入 Pi agent dir 下的 token-stats.json。不做任何 session 文件扫描。
  *
  * 命令：
- *   /tokens             — 近 7 天统计 + Input 柱状图（默认）
- *   /tokens all         — 全部历史统计（/tokens 0d 亦可）
- *   /tokens 3d          — 近 3 天（Nd 任意天数）
- *   /tokens out    — 显示 Output 柱状图（可与天数组合，如 /tokens 7d Out）
+ *   /token             — 近 7 天统计 + Input 柱状图（默认）
+ *   /token all         — 全部历史统计（/token 0d 亦可）
+ *   /token 3d          — 近 3 天（Nd 任意天数）
+ *   /token out    — 显示 Output 柱状图（可与天数组合，如 /token 7d Out）
  */
 
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -217,9 +217,10 @@ function renderStats(cache: GlobalCache, days: number, showOutput = false): stri
 	const total = sumUsage(byModel);
 	const totalInput = total.input + total.cacheRead + total.cacheWrite;
 
+	// 汇总按模型名称排序，便于在多次查看间定位同一模型
 	const modelList = [...byModel.entries()]
 		.map(([key, u]) => ({ key, input: u.input + u.cacheRead + u.cacheWrite, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite, output: u.output, cost: u.cost }))
-		.sort((a, b) => b.input - a.input);
+		.sort((a, b) => a.key.localeCompare(b.key));
 
 	for (const m of modelList) {
 		const pct = totalInput > 0 ? ((m.input / totalInput) * 100).toFixed(1) : "0.0";
@@ -235,7 +236,7 @@ function renderStats(cache: GlobalCache, days: number, showOutput = false): stri
 	return lines;
 }
 
-/** /tokens 的参数候选。可多写（如 `/tokens 7d Out`），补全时排除已写过的 */
+/** /token 的参数候选。可多写（如 `/token 7d Out`），补全时排除已写过的 */
 const TOKEN_ARGS: AutocompleteItem[] = [
 	{ value: "7d", label: "7d", description: "近 7 天（默认）" },
 	{ value: "1d", label: "1d", description: "近 1 天" },
@@ -279,7 +280,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ─── 命令 ───
 
-	pi.registerCommand("tokens", {
+	pi.registerCommand("token", {
 		description: "Token 用量统计。默认近7天。参数: all/Nd(天数) / Output / Out",
 		getArgumentCompletions: (prefix) => {
 			// 多参数命令：只补正在输入的最后一个 token，并排除已写过的
