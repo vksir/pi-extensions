@@ -421,7 +421,7 @@ export interface CronConversion {
 
 /**
  * 间隔 → 循环 cron 表达式。cron 最小粒度是分钟，秒级向上取整；
- * 无法精确表达时取最近的干净粒度并在 note 里回报（对应 CONTEXT.md 的「规范化」）。
+ * 无法精确表达时取最近的干净粒度并在 note 里回报（对应 GLOSSARY.md 的「规范化」）。
  */
 export function intervalToCron(ms: number): CronConversion {
 	const minutes = Math.max(1, Math.ceil(ms / MINUTE_MS));
@@ -590,10 +590,17 @@ export default function (pi: ExtensionAPI) {
 		inject(job, catchUp);
 	}
 
-	/** 创建后的首次执行（D6：创建即执行，仅循环任务） */
+	/**
+	 * 创建后的首次执行（D6：创建即执行，仅循环任务）。
+	 * 与定期触发同一通道：空闲才注入；忙碌（含 ctx 未知）时记欠跑，agent_settled 后补跑，
+	 * 绝不 steer 打断进行中的会话。idle 分支复用 deliver，保证两条路径行为逐字一致。
+	 */
 	function runImmediately(job: CronJob): void {
-		job.fireCount += 1;
-		inject(job, false);
+		if (currentCtx && currentCtx.isIdle()) {
+			deliver(job);
+			return;
+		}
+		job.backlog += 1;
 	}
 
 	function tick(): void {
