@@ -10,4 +10,4 @@ issue、spec 与 triage 状态以 markdown 文件存放在 `.scratch/<feature>/`
 
 ### Domain docs
 
-单上下文：仓库根的 `CONTEXT.md` + `docs/adr/`。详见 `docs/agents/domain.md`。
+单上下文：仓库根的 `GLOSSARY.md` + `docs/adr/`。详见 `docs/agents/domain.md`。

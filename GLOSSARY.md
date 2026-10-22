@@ -27,8 +27,8 @@ _Avoid_: 归一化、取整、rounding
 _Avoid_: 运行、执行、回调、tick
 
 **立即执行 (Immediate Fire)**：
-循环 cron job 创建后立刻发生的那一次触发，先于第一次排期到期。
-_Avoid_: 预热、首次运行、kickoff
+循环 cron job 创建后立刻发生的那一次触发，先于第一次排期到期；agent 忙碌时不打断进行中的会话，转欠跑，空闲后补。
+_Avoid_: 预热、首次运行、kickoff、steer
 
 **循环 cron job (Recurring)**：
 按 cron 表达式反复触发的 cron job；创建后立即执行一次。
