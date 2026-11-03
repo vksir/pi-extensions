@@ -12,7 +12,7 @@
 |------|------|
 | [pi-balance](extensions/pi-balance.ts) | 查询 AI 模型提供商余额/额度（支持 DeepSeek、Moonshot、OpenRouter、OpenAI Codex） |
 | [pi-notify](extensions/pi-notify.ts) | 任务完成后发送桌面通知（支持 iTerm2、Kitty、Ghostty、WezTerm、Windows Terminal）；需 Pi ≥ 1.3.0 |
-| [pi-title](extensions/pi-title.ts) | Agent 运行时在窗口标题显示旋转动画，结束后恢复原标题；herdr 环境（旧 herdr / herdr app）下 `/name` 更名时同步重命名所在标签；进程内子 agent 会话（ctx.mode 非 "tui"）不参与标题与标签管理 |
+| [pi-title](extensions/pi-title.ts) | Agent 运行时在窗口标题显示旋转动画，结束后恢复原标题；herdr 环境（两代）不修改窗口标题，旧 herdr 下 `/name` 更名时同步重命名所在标签；进程内子 agent 会话（ctx.mode 非 "tui"）不参与标题与标签管理 |
 | [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 用量，支持 `/token` 命令和 footer 实时显示 |
 | [pi-context](extensions/pi-context.ts) | `/context` 触发一次空转请求，导出这次请求的系统提示词与工具声明（含 codemode 动态描述），两者同源 |
 | [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron <间隔> [once] <prompt>`、`/cron list`、`/cron delete [id]` |
@@ -40,12 +40,10 @@ node --test 'tests/pi-context.test.ts'
 
 进程内子 agent（如 `@tintinweb/pi-subagents`）会在同一进程里为子会话重新加载扩展，并触发各自的 `agent_start` / `session_info_changed` 事件。pi-title 只认 `ctx.mode === "tui"` 的主会话：子会话不参与标题动画，子会话的更名也不会改写 herdr 标签。
 
-支持两代 herdr，`/name` 更名会话时同步重命名 pi 所在标签：
+两代 herdr 环境下都不修改窗口标题；`/name` 更名会话时同步重命名 pi 所在标签的只有旧 herdr：
 
 - **旧 herdr**（`HERDR_ENV=1`）：`HERDR_TAB_ID` 直接给出标签 id，经 `herdr` CLI（或注入的 `HERDR_BIN_PATH`）`tab rename` 更名。
-- **herdr app**：`HC_TERMINAL_ID` 给出终端地址，先 `herdr-app ls` 解析出所在标签 id（实例内缓存，失败下次重试），再 `herdr-app do tab.rename` 更名。
-
-两套 env 同时存在时优先旧 herdr（标签 id 直接可得，免去解析）；窗口未开等失败场景静默放弃。
+- **herdr app**（`HC_TERMINAL_ID`）：只声明环境，不做标签更名，`/name` 更名静默空转。
 
 回归测试：
 

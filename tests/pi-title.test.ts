@@ -13,10 +13,8 @@ interface FakeCtx {
 interface Setup {
 	/** 触发已注册事件 */
 	fire: (event: string, event_: unknown, ctx?: FakeCtx) => unknown;
-	/** renameHerdrTab 发出的 herdr / herdr-app CLI 调用（先等待串行队列消化完） */
+	/** renameHerdrTab 发出的 herdr CLI 调用（先等待串行队列消化完） */
 	execCalls: () => Promise<{ command: string; args: string[] }[]>;
-	/** 让下一次 herdr-app ls 以失败退出，验证重试解析 */
-	failNextLs: () => void;
 	/** 恢复 setup 改动的进程环境变量 */
 	restoreEnv: () => void;
 	ctx: FakeCtx;
@@ -24,10 +22,9 @@ interface Setup {
 }
 
 /**
- * 假 herdr / herdr-app CLI：herdr app 变体下 `herdr-app ls` 返回包含当前
- * HC_TERMINAL_ID 的标签树（可用 failNextLs 让其失败），其余命令返回成功。
+ * 假 herdr CLI：所有命令记录调用并返回成功。
  *
- * 扩展是带模块级状态（动画定时器、更名队列、标签 id 缓存）的单例；
+ * 扩展是带模块级状态（动画定时器、更名队列）的单例；
  * 查询串导入让每个 setup 拿到全新实例，测试互不污染。
  */
 let moduleSeq = 0;
@@ -49,25 +46,10 @@ async function setup(options: { variant?: "legacy" | "app" } = {}): Promise<Setu
 
 	const handlers = new Map<string, Handler>();
 	const execs: { command: string; args: string[] }[] = [];
-	let lsFailures = 0;
 	const pi = {
 		on: (event: string, handler: Handler) => { handlers.set(event, handler); },
 		exec: async (command: string, args: string[]) => {
 			execs.push({ command, args });
-			if (args[0] === "ls") {
-				if (lsFailures > 0) {
-					lsFailures--;
-					return { code: 1, stdout: "", stderr: "" };
-				}
-				const terminal = process.env.HC_TERMINAL_ID;
-				const tree = {
-					spaces: [{
-						id: "sp-1",
-						tabs: [{ id: "tab-1", terminals: terminal ? [{ terminal }] : [] }],
-					}],
-				};
-				return { code: 0, stdout: JSON.stringify(tree), stderr: "" };
-			}
 			return { code: 0, stdout: "", stderr: "" };
 		},
 	};
@@ -89,8 +71,6 @@ async function setup(options: { variant?: "legacy" | "app" } = {}): Promise<Setu
 		},
 		ctx,
 		titles,
-		/** 让下一次 herdr-app ls 以失败退出（模拟窗口未开），验证重试解析 */
-		failNextLs: () => { lsFailures++; },
 		restoreEnv: () => {
 			for (const [key, value] of previous) {
 				if (value === undefined) delete process.env[key];
@@ -108,7 +88,7 @@ function shutdown(setup_: Setup) {
 	setup_.restoreEnv();
 }
 
-test("旧 herdr：HERDR_TAB_ID 直接更名，无需 ls 解析", async () => {
+test("旧 herdr：HERDR_TAB_ID 直接更名", async () => {
 	const s = await setup({ variant: "legacy" });
 	try {
 		s.fire("session_info_changed", { type: "session_info_changed", name: "重构认证模块" });
@@ -126,10 +106,10 @@ test("旧 herdr：HERDR_TAB_ID 直接更名，无需 ls 解析", async () => {
 	}
 });
 
-test("旧 herdr 与 herdr app env 同时存在时优先旧 herdr", async () => {
+test("HC_TERMINAL_ID 同时存在时不影响旧 herdr 更名", async () => {
 	const s = await setup({ variant: "legacy" });
 	try {
-		process.env.HC_TERMINAL_ID = "t1"; // 混合环境：旧 herdr 优先，不走 herdr-app ls
+		process.env.HC_TERMINAL_ID = "t1"; // 混合环境：更名分支只认 HERDR_TAB_ID
 		s.fire("session_info_changed", { type: "session_info_changed", name: "重构认证模块" });
 		assert.deepEqual(await s.execCalls(), [
 			{ command: "herdr-stub", args: ["tab", "rename", "tab-1", "重构认证模块"] },
@@ -139,45 +119,21 @@ test("旧 herdr 与 herdr app env 同时存在时优先旧 herdr", async () => {
 	}
 });
 
-test("herdr app：主会话 /name 解析终端所在标签并更名，标签 id 只解析一次", async () => {
+test("herdr app：不做标签更名，/name 不发出任何 CLI 调用", async () => {
 	const s = await setup({ variant: "app" });
 	try {
 		s.fire("session_info_changed", { type: "session_info_changed", name: "重构认证模块" });
-		assert.deepEqual(await s.execCalls(), [
-			{ command: "herdr-app", args: ["ls"] },
-			{ command: "herdr-app", args: ["do", "tab.rename", "--id", "tab-1", "--name", "重构认证模块"] },
-		]);
+		assert.deepEqual(await s.execCalls(), []);
 
-		// 标签 id 已缓存：/name 清除会话名时同步清空标签，不再 ls
 		s.fire("session_info_changed", { type: "session_info_changed", name: undefined });
-		assert.deepEqual(await s.execCalls(), [
-			{ command: "herdr-app", args: ["do", "tab.rename", "--id", "tab-1", "--name", ""] },
-		]);
+		assert.deepEqual(await s.execCalls(), []);
 	} finally {
 		shutdown(s);
 	}
 });
 
-test("herdr app：ls 解析失败静默放弃，下次 /name 重试解析", async () => {
-	const s = await setup({ variant: "app" });
-	try {
-		s.failNextLs(); // 模拟窗口未开
-		s.fire("session_info_changed", { type: "session_info_changed", name: "重构认证模块" });
-		assert.deepEqual(await s.execCalls(), [{ command: "herdr-app", args: ["ls"] }]);
-
-		// 失败未缓存标签 id：窗口回来后重试成功
-		s.fire("session_info_changed", { type: "session_info_changed", name: "重构认证模块" });
-		assert.deepEqual(await s.execCalls(), [
-			{ command: "herdr-app", args: ["ls"] },
-			{ command: "herdr-app", args: ["do", "tab.rename", "--id", "tab-1", "--name", "重构认证模块"] },
-		]);
-	} finally {
-		shutdown(s);
-	}
-});
-
-test("herdr app：子 agent 会话更名不得触碰主标签", async () => {
-	const s = await setup({ variant: "app" });
+test("旧 herdr：子 agent 会话更名不得触碰主标签", async () => {
+	const s = await setup({ variant: "legacy" });
 	try {
 		// pi-subagents 在 bindExtensions 前派生更名，此时 ctx.mode 还是 undefined；
 		// bindExtensions 未传 mode 时则是 "print"。两者都必须被忽略。
@@ -186,6 +142,12 @@ test("herdr app：子 agent 会话更名不得触碰主标签", async () => {
 
 		s.fire("session_info_changed", { type: "session_info_changed", name: "explore#a1b2c3d4" }, { ...s.ctx, mode: "print" });
 		assert.deepEqual(await s.execCalls(), []);
+
+		// 主会话自身照常更名，证明上面两条确实是被子会话过滤掉的
+		s.fire("session_info_changed", { type: "session_info_changed", name: "重构认证模块" });
+		assert.deepEqual(await s.execCalls(), [
+			{ command: "herdr-stub", args: ["tab", "rename", "tab-1", "重构认证模块"] },
+		]);
 	} finally {
 		shutdown(s);
 	}
