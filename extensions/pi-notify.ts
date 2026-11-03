@@ -12,6 +12,7 @@
 
 import { execFile } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { inHerdrEnv } from "./lib/herdr.ts";
 
 /** settings.json 中 "pi-notify" 键下的扩展配置 */
 interface PiNotifySettings {
@@ -73,9 +74,8 @@ function notify(title: string, body: string): void {
 }
 
 export default function (pi: ExtensionAPI) {
-	// 两代 herdr 都算：旧 herdr 注入 HERDR_ENV=1；
-	// herdr-core（herdr-app 的终端后端）向其运行的终端注入 HC_TERMINAL_ID
-	const inHerdr = process.env.HERDR_ENV === "1" || process.env.HC_TERMINAL_ID !== undefined;
+	// 两代 herdr 都算，判定规则统一在 lib/herdr
+	const inHerdr = inHerdrEnv();
 	// getSettings 是 action 方法，工厂加载阶段不可用；首次通知时读取一次并缓存，
 	// pi 重启或 /reload 重新加载扩展后缓存自动重建
 	let settings: Required<PiNotifySettings> | undefined;
