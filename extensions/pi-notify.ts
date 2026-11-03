@@ -15,17 +15,24 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /** settings.json 中 "pi-notify" 键下的扩展配置 */
 interface PiNotifySettings {
+	/** 禁用整个扩展：任何环境下都不发通知 */
+	disable?: boolean;
 	/** 在 herdr 终端环境中禁用通知 */
 	disableInHerdr?: boolean;
 }
 
+/** disable 默认值：默认启用通知 */
+const DEFAULT_DISABLE = false;
 /** disableInHerdr 默认值：herdr 环境默认启用通知 */
 const DEFAULT_DISABLE_IN_HERDR = false;
 
 function readSettings(pi: ExtensionAPI): Required<PiNotifySettings> {
 	const raw = (pi.getSettings() as Record<string, unknown>)["pi-notify"];
 	const s = typeof raw === "object" && raw !== null ? (raw as PiNotifySettings) : {};
-	return { disableInHerdr: s.disableInHerdr ?? DEFAULT_DISABLE_IN_HERDR };
+	return {
+		disable: s.disable ?? DEFAULT_DISABLE,
+		disableInHerdr: s.disableInHerdr ?? DEFAULT_DISABLE_IN_HERDR,
+	};
 }
 
 function basename(p: string): string {
@@ -66,21 +73,23 @@ function notify(title: string, body: string): void {
 }
 
 export default function (pi: ExtensionAPI) {
-	const inHerdr = process.env.HERDR_ENV === "1";
+	// 两代 herdr 都算：旧 herdr 注入 HERDR_ENV=1；
+	// herdr-core（herdr-app 的终端后端）向其运行的终端注入 HC_TERMINAL_ID
+	const inHerdr = process.env.HERDR_ENV === "1" || process.env.HC_TERMINAL_ID !== undefined;
 	// getSettings 是 action 方法，工厂加载阶段不可用；首次通知时读取一次并缓存，
 	// pi 重启或 /reload 重新加载扩展后缓存自动重建
-	let disableInHerdr: boolean | undefined;
+	let settings: Required<PiNotifySettings> | undefined;
 
 	// pi >= 1.3.0：agent_settled 事件自带 aborted 字段，无需再通过 agent_end + ctx.signal 跟踪
 	pi.on("agent_settled", async (event, ctx) => {
 		// 扩展也会在 RPC/JSON/print 模式下加载，
 		// 直接写 process.stdout 会污染非交互输出，仅在 TUI 模式通知
 		if (event.aborted || ctx.mode !== "tui") return;
-		// herdr 环境默认启用，settings.json 中 { "pi-notify": { "disableInHerdr": true } } 可禁用
-		if (inHerdr) {
-			disableInHerdr ??= readSettings(pi).disableInHerdr;
-			if (disableInHerdr) return;
-		}
+		settings ??= readSettings(pi);
+		// { "pi-notify": { "disable": true } } 整体禁用；
+		// { "pi-notify": { "disableInHerdr": true } } 仅禁用 herdr 环境（herdr 环境默认启用）
+		if (settings.disable) return;
+		if (inHerdr && settings.disableInHerdr) return;
 		notify(getTitle(), "Task Completed");
 	});
 }
