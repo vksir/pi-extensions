@@ -103,7 +103,7 @@ test("命令触发一次请求，自己不写文件", async () => {
 	assert.equal(app.sent[0].options?.triggerTurn, true);
 	assert.equal(app.sent[0].message.customType, "pi-context");
 	assert.equal(app.sent[0].message.display, false);
-	assert.ok(app.notifications.some((item) => item.level === "info" && item.message.includes("快照将写入")));
+	assert.ok(app.notifications.some((item) => item.level === "info" && item.message.includes("will be written")));
 });
 
 test("Agent 忙碌时不触发请求，快照等本轮下一请求", async () => {
@@ -111,7 +111,7 @@ test("Agent 忙碌时不触发请求，快照等本轮下一请求", async () =>
 	app.busy();
 	await app.arm();
 	assert.equal(app.sent.length, 0);
-	assert.ok(app.notifications.some((item) => item.message.includes("运行中")));
+	assert.ok(app.notifications.some((item) => item.message.includes("Agent is running")));
 });
 
 test("捕获之后把触发消息从请求里滤掉，捕获那一次保留", async () => {
@@ -259,4 +259,33 @@ test("重复命令可以重新挂起", async () => {
 	assert.equal(meta(app.read("tools.md"), "数量"), "1");
 	await capture(app, { tools: [{ name: "first" }, { name: "second" }] });
 	assert.equal(meta(app.read("tools.md"), "数量"), "2");
+});
+
+test("抬头与落盘通知列出上下文中的技能与工具名", async () => {
+	const app = setup();
+	const skills = ["<available_skills>", "  <skill>", "    <name>code-review</name>", "    <description>review</description>", "    <name>tdd &amp; debugging</name>", "  </skill>", "</available_skills>"].join("\n");
+	await capture(
+		app,
+		{ tools: [{ name: "read" }, { name: "bash" }] },
+		[{ role: "system", content: "", sections: { skills }, timestamp: 0 }],
+	);
+	// 名录里的实体反转义回原文；分段本身不入正文，名单只进抬头与通知。
+	const prompt = app.read("system-prompt.md");
+	assert.match(prompt, /^技能: code-review, tdd & debugging$/m);
+	assert.equal(meta(app.read("tools.md"), "工具"), "read, bash");
+	const notice = app.notifications.find((item) => item.level === "info" && item.message.includes("Context snapshot written"));
+	assert.ok(notice, "必须有落盘通知");
+	assert.ok(notice.message.includes("Skills (2): code-review, tdd & debugging"));
+	assert.ok(notice.message.includes("Tools (2): read, bash"));
+});
+
+test("没有技能名录或没有工具声明时不列对应名单", async () => {
+	const app = setup();
+	await capture(app, { tools: [] });
+	assert.ok(!app.read("system-prompt.md").includes("技能:"), "无技能名录时不加技能行");
+	assert.ok(!app.read("tools.md").includes("工具:"), "空声明时不加工具行");
+	const notice = app.notifications.find((item) => item.message.includes("Context snapshot written"));
+	assert.ok(notice, "必须有落盘通知");
+	assert.ok(!notice.message.includes("Skills ("), "通知里同样不列空名单");
+	assert.ok(!notice.message.includes("Tools ("), "通知里同样不列空名单");
 });

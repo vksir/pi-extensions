@@ -49,3 +49,31 @@ _Avoid_: 会话级、session-only、durable、持久化
 **cron job 清单 (Job List)**：
 当前进程中全部 cron job 的集合，是 `cron` 工具与 `/cron` 命令共同的真相来源。
 _Avoid_: 任务清单、调度表、registry
+
+### 顺带分派（pi-btw）
+
+**顺带请求 (btw request)**：
+用户经 `/btw` 递交的一段消息，作为新 pi 的首条消息随启动 argv 递交（经 `--` 停止选项解析，见 ADR-0004）。与当前会话互不干扰。
+_Avoid_: 旁支任务、side task、转交
+
+**btw 标签 (btw tab)**：
+承载 fork 出去的新 pi 的新开标签；不命名，沿用 herdr 的默认编号命名。
+_Avoid_: 分身标签、影子会话、shadow session
+
+**fork 会话 (Forked Session)**：
+btw 标签里新 pi 的会话起点——以 `pi --fork <当前会话文件>` 从当前会话分叉，带全量上下文，fork 进当前工作目录。
+_Avoid_: 新会话、克隆、clone、resume
+
+### 标题与标签（pi-title）
+
+**旧 herdr (legacy herdr)**：
+第一代 herdr 终端复用器，以 `HERDR_ENV=1` + `HERDR_TAB_ID` + `HERDR_BIN_PATH` 声明环境；标签 id 由 env 直接给出，操作走 `herdr` CLI。
+_Avoid_: herdr CLI 环境、herdr v1
+
+**herdr app**：
+第二代 herdr（herdr-app 窗口 + herdr-core 终端后端），以 `HC_TERMINAL_ID` 声明环境；标签 id 不在 env 里，寻址要经 `herdr-app ls` 查询（见 ADR-0005）。
+_Avoid_: herdr-core 环境、HC 环境
+
+**标签更名 (tab rename)**：
+`/name` 更名会话时把 pi 所在的窗口标签同步改名；两代 herdr 命令不同（`herdr tab rename` / `herdr-app do tab.rename`），失败一律静默放弃。
+_Avoid_: 重命名窗口、title rename

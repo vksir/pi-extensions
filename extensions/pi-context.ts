@@ -8,6 +8,11 @@
  *   渲染，不套代码块），\`## 定义\` 放 JSON，长文本位置留占位。
  *
  * 两份文件都用 YAML 抬头（`---` 包住键值）与正文分开。
+ *
+ * 落盘通知与两份抬头上各有一行名单，列出上下文中的 skill 与 tool 名称：
+ * - skill 名来自回放后提示词的 skills 分段，即模型实际看到的名录
+ *   （pi-skill-visibility 隐藏后的形态），用于核对隐藏是否生效。
+ * - tool 名来自请求体 tools 字段，与 tools.md 的节标题同源。
  */
 
 import { getCurrentSystemMessage, getCurrentTools, getSystemMessageText } from "@earendil-works/pi-ai";
@@ -73,6 +78,32 @@ function yamlKey(name: string): string {
 	return /^[A-Za-z0-9_.-]+$/.test(name) ? name : JSON.stringify(name);
 }
 
+/** XML 实体反转义：skills 名录的 <name> 文本可能被 escapeXml 转过；&amp; 必须最后还原。 */
+function unescapeXml(text: string): string {
+	return text
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&quot;/g, "\"")
+		.replace(/&apos;/g, "'")
+		.replace(/&amp;/g, "&");
+}
+
+/**
+ * 上下文中的 skill 名：回放后提示词 skills 分段里 <skill> 名录的 <name>，按出现顺序。
+ * 分段缺失或名录为空返回空数组。
+ */
+function skillNames(messages: TranscriptMessages | undefined): string[] {
+	const system = messages ? getCurrentSystemMessage(messages) : undefined;
+	const section = system?.sections?.skills;
+	if (typeof section !== "string") return [];
+	return [...section.matchAll(/<name>([^<]*)<\/name>/g)].map((match) => unescapeXml(match[1]));
+}
+
+/** 请求体声明的工具名，与 tools.md 的节标题同源；取不到名字时用同款兜底。 */
+function toolNames(payload: unknown): string[] {
+	return (requestTools(payload) ?? []).map((tool, index) => findName(tool) ?? `工具 ${index + 1}`);
+}
+
 /** JSON 块；文本里出现同款围栏时自动加长，避免被截断。 */
 function fence(language: string, text: string): string[] {
 	let marker = "~~~";
@@ -84,6 +115,8 @@ function promptMarkdown(messages: TranscriptMessages | undefined, ctx: Extension
 	const system = messages ? getCurrentSystemMessage(messages) : undefined;
 	if (!system) return frontmatter(metaLines(ctx, capturedAt, "本次请求没有系统提示词"));
 	const lines = metaLines(ctx, capturedAt, "本次请求 transcript 的 system 消息（provider 读取提示词的同一路径）");
+	const skills = skillNames(messages);
+	if (skills.length > 0) lines.push(`技能: ${skills.join(", ")}`);
 	const sections = Object.entries(system.sections ?? {}).flatMap(([name, text]) => (text === null ? [] : [[name, text] as const]));
 	if (sections.length > 0) {
 		lines.push("分段字符数:");
@@ -152,6 +185,19 @@ function toolSections(tools: unknown[]): string[] {
 	});
 }
 
+/** 通知里的两份文件路径，缩进两格。 */
+const FILE_LINES = `  ${PROMPT_FILE}\n  ${TOOLS_FILE}`;
+
+/** 落盘通知：写入位置，附上下文中的 skill 与 tool 名单。 */
+function capturedNotice(transcript: TranscriptMessages | undefined, payload: unknown): string {
+	const lines = [`Context snapshot written\n${FILE_LINES}`];
+	const skills = skillNames(transcript);
+	if (skills.length > 0) lines.push(`Skills (${skills.length}): ${skills.join(", ")}`);
+	const tools = toolNames(payload);
+	if (tools.length > 0) lines.push(`Tools (${tools.length}): ${tools.join(", ")}`);
+	return lines.join("\n");
+}
+
 function toolsMarkdown(payload: unknown, messages: TranscriptMessages | undefined, ctx: ExtensionContext, capturedAt: string): string {
 	const tools = requestTools(payload);
 	if (!tools) {
@@ -162,9 +208,11 @@ function toolsMarkdown(payload: unknown, messages: TranscriptMessages | undefine
 		return frontmatter(metaLines(ctx, capturedAt, source));
 	}
 	const json = JSON.stringify(tools, null, 2);
+	const names = toolNames(payload);
 	const lines = [
 		...metaLines(ctx, capturedAt, "provider 请求体的 tools 字段；描述与长文本移出 JSON，见各工具小节"),
 		`数量: ${tools.length}`,
+		...(names.length > 0 ? [`工具: ${names.join(", ")}`] : []),
 		`JSON 字符数: ${json.length}`,
 	];
 	return `${frontmatter(lines)}\n${toolSections(tools).join("\n")}`;
@@ -181,12 +229,12 @@ export default function (pi: ExtensionAPI) {
 			pending = true;
 			if (!ctx.isIdle()) {
 				// 正在跑的一轮里，下一次请求就会写出快照，不用再触发。
-				ctx.ui.notify(`Agent 运行中：快照将在本轮下一请求时写出\n${PROMPT_FILE}\n${TOOLS_FILE}`, "info");
+				ctx.ui.notify(`Agent is running — snapshot will be written with the next request of this turn\n${FILE_LINES}`, "info");
 				return;
 			}
 			// 空转一轮，让 pi 真的发一次请求：要写的就是这次请求。
 			pi.sendMessage({ customType: TRIGGER_TYPE, content: TRIGGER_TEXT, display: false }, { triggerTurn: true });
-			ctx.ui.notify(`已触发一次请求：快照将写入\n${PROMPT_FILE}\n${TOOLS_FILE}`, "info");
+			ctx.ui.notify(`Request triggered — snapshot will be written when it completes\n${FILE_LINES}`, "info");
 		},
 	});
 
@@ -216,7 +264,7 @@ export default function (pi: ExtensionAPI) {
 			mkdirSync(OUT_DIR, { recursive: true });
 			writeFileSync(PROMPT_FILE, promptMarkdown(transcript, ctx, capturedAt), "utf-8");
 			writeFileSync(TOOLS_FILE, toolsMarkdown(event.payload, transcript, ctx, capturedAt), "utf-8");
-			ctx.ui.notify(`上下文快照已写入\n${PROMPT_FILE}\n${TOOLS_FILE}`, "info");
+			ctx.ui.notify(capturedNotice(transcript, event.payload), "info");
 		} catch (error) {
 			// 导出失败只通知，不修改或阻断模型请求。
 			ctx.ui.notify(`[context] ${error instanceof Error ? error.message : String(error)}`, "error");

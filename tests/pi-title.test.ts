@@ -50,7 +50,12 @@ async function setup(options: { variant?: "legacy" | "app" } = {}): Promise<Setu
 		on: (event: string, handler: Handler) => { handlers.set(event, handler); },
 		exec: async (command: string, args: string[]) => {
 			execs.push({ command, args });
-			return { code: 0, stdout: "", stderr: "" };
+			// herdr app 的更名先 ls 寻址：返回一份装着 t1（variant "app" 所用终端）的清单
+			const stdout =
+				command === "herdr-app" && args[0] === "ls"
+					? JSON.stringify({ spaces: [{ tabs: [{ id: "tb-1", terminals: [{ terminal: "t1" }] }] }] })
+					: "";
+			return { code: 0, stdout, stderr: "" };
 		},
 	};
 	titleExtension(pi as unknown as ExtensionAPI);
@@ -119,13 +124,33 @@ test("HC_TERMINAL_ID 同时存在时不影响旧 herdr 更名", async () => {
 	}
 });
 
-test("herdr app：不做标签更名，/name 不发出任何 CLI 调用", async () => {
+test("herdr app：/name 先 ls 寻址再 tab.rename，清名传空恢复序号命名", async () => {
 	const s = await setup({ variant: "app" });
 	try {
 		s.fire("session_info_changed", { type: "session_info_changed", name: "重构认证模块" });
+		assert.deepEqual(await s.execCalls(), [
+			{ command: "herdr-app", args: ["ls"] },
+			{ command: "herdr-app", args: ["do", "tab.rename", "--id", "tb-1", "--name", "重构认证模块"] },
+		]);
+
+		// /name 清除会话名时同步清空标签（空名 → tab 恢复按序号命名）
+		s.fire("session_info_changed", { type: "session_info_changed", name: undefined });
+		assert.deepEqual(await s.execCalls(), [
+			{ command: "herdr-app", args: ["ls"] },
+			{ command: "herdr-app", args: ["do", "tab.rename", "--id", "tb-1", "--name", ""] },
+		]);
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("herdr app：子 agent 会话更名不得触碰主 tab", async () => {
+	const s = await setup({ variant: "app" });
+	try {
+		s.fire("session_info_changed", { type: "session_info_changed", name: "explore#a1b2c3d4" }, { ...s.ctx, mode: undefined });
 		assert.deepEqual(await s.execCalls(), []);
 
-		s.fire("session_info_changed", { type: "session_info_changed", name: undefined });
+		s.fire("session_info_changed", { type: "session_info_changed", name: "explore#a1b2c3d4" }, { ...s.ctx, mode: "print" });
 		assert.deepEqual(await s.execCalls(), []);
 	} finally {
 		shutdown(s);
