@@ -92,3 +92,21 @@ pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式�
 	}
 }
 ```
+
+## 代码结构
+
+`extensions/` 顶层每个 `.ts` 是一个独立扩展；跨扩展的公共实现放在 `extensions/lib/`。该目录没有 `index.ts` 与 `package.json`，pi 的扩展发现不会把它当扩展加载。
+
+| 模块 | 职责 |
+|------|------|
+| `lib/herdr.ts` | 两代 herdr 环境探测、标签更名、新标签启动 |
+| `lib/cron/schedule.ts` | cron 表达式解析、下次触发、间隔换算（纯函数） |
+| `lib/cron/presentation.ts` | 排期的人类可读化与触发 prompt 包装 |
+| `lib/balance/providers.ts` | Provider 凭据、请求与响应归一化 |
+| `lib/balance/render.ts` | `/balance` 结果排版 |
+| `lib/json.ts` | Agent 数据目录 JSON 的容错读取与原子写入 |
+| `lib/settings.ts` | settings.json 中的扩展配置读取 |
+| `lib/render.ts` | entry 结果块的统一渲染 |
+| `lib/text.ts` | basename、truncate 等文本工具 |
+| `lib/http.ts` | HTTP 错误摘要 |
+| `lib/errors.ts` | 任意异常值的可读消息 |

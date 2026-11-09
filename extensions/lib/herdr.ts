@@ -26,6 +26,8 @@
  * pi 的扩展发现不会把它当扩展加载，仅供扩展以相对路径导入。
  */
 
+// ─── 公共类型 ───
+
 /** 与 pi.exec 兼容的执行入口；调用方注入，测试可用假实现替换。 */
 export type Exec = (command: string, args: string[]) => Promise<{
 	code: number;
@@ -39,6 +41,8 @@ export interface TabRenamer {
 	/** 把 pi 所在标签更名为 label；失败原样抛给调用方处置。 */
 	rename(label: string): Promise<void>;
 }
+
+// ─── 环境探测 ───
 
 /** 读取并 trim 一个环境变量；未设置或纯空白时视同不存在。 */
 function envValue(name: string): string | undefined {
@@ -71,6 +75,8 @@ function failureDetail(result: { stdout: string; stderr?: string }): string {
 	const detail = (result.stderr?.trim() || result.stdout.trim()).slice(0, 200);
 	return detail ? `：${detail}` : "";
 }
+
+// ─── 新标签启动 ───
 
 /**
  * 新标签启动参数。message 是交给新 pi 的首条消息，随启动 argv 递交（经
@@ -242,6 +248,8 @@ export function createTabLauncher(exec: Exec, options?: LauncherOptions): TabLau
 	if (inLegacyHerdr()) return createLegacyTabLauncher(exec, options);
 	return undefined;
 }
+
+// ─── 标签更名 ───
 
 /** herdr-app ls 输出里本模块需要的最小形状：spaces > tabs > terminals。 */
 interface AppLsTerminal {

@@ -13,6 +13,8 @@
 import { execFile } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { inHerdrEnv } from "./lib/herdr.ts";
+import { readExtensionSettings } from "./lib/settings.ts";
+import { basename } from "./lib/text.ts";
 
 /** settings.json 中 "pi-notify" 键下的扩展配置 */
 interface PiNotifySettings {
@@ -22,29 +24,25 @@ interface PiNotifySettings {
 	disableInHerdr?: boolean;
 }
 
+const SETTINGS_KEY = "pi-notify";
 /** disable 默认值：默认启用通知 */
 const DEFAULT_DISABLE = false;
 /** disableInHerdr 默认值：herdr 环境默认启用通知 */
 const DEFAULT_DISABLE_IN_HERDR = false;
 
 function readSettings(pi: ExtensionAPI): Required<PiNotifySettings> {
-	const raw = (pi.getSettings() as Record<string, unknown>)["pi-notify"];
-	const s = typeof raw === "object" && raw !== null ? (raw as PiNotifySettings) : {};
+	const settings = readExtensionSettings<PiNotifySettings>(pi, SETTINGS_KEY);
 	return {
-		disable: s.disable ?? DEFAULT_DISABLE,
-		disableInHerdr: s.disableInHerdr ?? DEFAULT_DISABLE_IN_HERDR,
+		disable: settings.disable ?? DEFAULT_DISABLE,
+		disableInHerdr: settings.disableInHerdr ?? DEFAULT_DISABLE_IN_HERDR,
 	};
 }
 
-function basename(p: string): string {
-    const idx = Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/"));
-    return idx >= 0 ? p.slice(idx + 1) : p;
+function getTitle(): string {
+	return `π - ${basename(process.cwd())}`;
 }
 
-function getTitle(): string {
-    const cwdName = basename(process.cwd());
-    return `π - ${cwdName}`;
-}
+// ─── 终端通知协议 ───
 
 function notifyOSC777(title: string, body: string): void {
 	process.stdout.write(`\x1b]777;notify;${title};${body}\x07`);
@@ -59,8 +57,12 @@ function notifyOSC99(title: string, body: string): void {
 function notifyWindows(title: string, body: string): void {
 	// Install-Module -Name BurntToast
 	// 单引号成对转义，防止目录名等文本破坏 PowerShell 命令
-	const esc = (s: string) => s.replace(/'/g, "''");
-	execFile("powershell.exe", ["-NoProfile", "-Command", `New-BurntToastNotification -Text '${esc(title)}', '${esc(body)}'`], { windowsHide: true });
+	const esc = (text: string) => text.replace(/'/g, "''");
+	execFile(
+		"powershell.exe",
+		["-NoProfile", "-Command", `New-BurntToastNotification -Text '${esc(title)}', '${esc(body)}'`],
+		{ windowsHide: true },
+	);
 }
 
 function notify(title: string, body: string): void {
@@ -72,6 +74,8 @@ function notify(title: string, body: string): void {
 		notifyOSC777(title, body);
 	}
 }
+
+// ─── 扩展入口 ───
 
 export default function (pi: ExtensionAPI) {
 	// 两代 herdr 都算，判定规则统一在 lib/herdr

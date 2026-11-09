@@ -20,6 +20,40 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import {
+	cronToHuman,
+	cronToHumanZh,
+	formatWhen,
+	framePrompt,
+	relative,
+	relativeZh,
+	unframePrompt,
+} from "./lib/cron/presentation.ts";
+import {
+	expandField,
+	intervalToCron,
+	nextCronRun,
+	oneShotCron,
+	parseCron,
+	parseInterval,
+} from "./lib/cron/schedule.ts";
+import { renderLineBox, type EntryLine } from "./lib/render.ts";
+import { truncate } from "./lib/text.ts";
+
+// 纯逻辑拆到 lib/，仍从本模块转出，保持既有导入路径可用。
+export {
+	cronToHuman,
+	cronToHumanZh,
+	expandField,
+	framePrompt,
+	intervalToCron,
+	nextCronRun,
+	oneShotCron,
+	parseCron,
+	parseInterval,
+	unframePrompt,
+};
+export type { CronConversion, CronFields } from "./lib/cron/schedule.ts";
 
 // ─── 常量 ───
 
@@ -71,12 +105,8 @@ interface CronToolDetails {
 	error?: string;
 }
 
-type CronInfoTone = "success" | "error" | "warning" | "text" | "muted" | "dim";
-
-interface CronInfoLine {
-	text: string;
-	tone?: CronInfoTone;
-}
+/** 命令结果行：tone 由 registerEntryRenderer 映射到 theme 颜色。 */
+type CronInfoLine = EntryLine;
 
 interface CronInfoEntry {
 	lines: CronInfoLine[];
@@ -99,391 +129,35 @@ function store(): CronStore {
 	return s;
 }
 
-// ─── cron 表达式 ───
+// ─── /cron 命令文案 ───
 
-/** 各字段的取值范围：分、时、日、月、周（0=周日，7 亦接受为周日） */
-const FIELD_RANGES: ReadonlyArray<readonly [number, number]> = [
-	[0, 59],
-	[0, 23],
-	[1, 31],
-	[1, 12],
-	[0, 6],
+const USAGE_LINES: CronInfoLine[] = [
+	{ text: "用法：", tone: "text" },
+	{ text: "/cron <间隔> [once] <prompt>   创建定时任务", tone: "dim" },
+	{ text: "/cron list                     列出当前任务", tone: "dim" },
+	{ text: "/cron delete [id]              删除任务（省略 id 则弹出选择）", tone: "dim" },
+	{ text: "", tone: "dim" },
+	{ text: "间隔：Ns / Nm / Nh / Nd，可复合（如 1h30m）；cron 最小粒度 1 分钟，秒级向上取整", tone: "dim" },
+	{ text: "once：只触发一次（从现在算起 <间隔> 之后），触发后自动删除", tone: "dim" },
+	{ text: "不加 once：循环触发，且创建后立即执行一次", tone: "dim" },
 ];
 
-export interface CronFields {
-	minute: number[];
-	hour: number[];
-	dayOfMonth: number[];
-	month: number[];
-	dayOfWeek: number[];
-}
-
-/** 展开单个字段：支持 `*`、`*​/N`、`N`、`N-M`、`N-M/S`、逗号列表。非法返回 null */
-export function expandField(field: string, min: number, max: number): number[] | null {
-	const isDow = min === 0 && max === 6;
-	const limit = isDow ? 7 : max;
-	const out = new Set<number>();
-
-	for (const part of field.split(",")) {
-		if (part === "") return null;
-
-		const star = part.match(/^\*(?:\/(\d+))?$/);
-		if (star) {
-			const step = star[1] ? Number(star[1]) : 1;
-			if (step < 1) return null;
-			for (let i = min; i <= max; i += step) out.add(i);
-			continue;
-		}
-
-		const range = part.match(/^(\d+)-(\d+)(?:\/(\d+))?$/);
-		if (range) {
-			const lo = Number(range[1]);
-			const hi = Number(range[2]);
-			const step = range[3] ? Number(range[3]) : 1;
-			if (step < 1 || lo > hi || lo < min || hi > limit) return null;
-			for (let i = lo; i <= hi; i += step) out.add(isDow && i === 7 ? 0 : i);
-			continue;
-		}
-
-		const single = part.match(/^\d+$/);
-		if (single) {
-			let n = Number(part);
-			if (isDow && n === 7) n = 0;
-			if (n < min || n > max) return null;
-			out.add(n);
-			continue;
-		}
-
-		return null;
-	}
-
-	return out.size === 0 ? null : [...out].sort((a, b) => a - b);
-}
-
-export function parseCron(expr: string): CronFields | null {
-	const parts = expr.trim().split(/\s+/);
-	if (parts.length !== 5) return null;
-
-	const expanded: number[][] = [];
-	for (let i = 0; i < 5; i++) {
-		const [min, max] = FIELD_RANGES[i]!;
-		const values = expandField(parts[i]!, min, max);
-		if (!values) return null;
-		expanded.push(values);
-	}
-
-	return {
-		minute: expanded[0]!,
-		hour: expanded[1]!,
-		dayOfMonth: expanded[2]!,
-		month: expanded[3]!,
-		dayOfWeek: expanded[4]!,
-	};
-}
-
-/**
- * 求严格晚于 `from` 的下一个匹配时刻，按本地时区解释。
- * 标准 cron 语义：日与周同时受限（都不为全范围）时取 OR。
- * 逐分钟前进，靠「跳月/跳日/跳时」剪枝；366 天内无匹配返回 null。
- */
-export function nextCronRun(fields: CronFields, from: Date): Date | null {
-	const minutes = new Set(fields.minute);
-	const hours = new Set(fields.hour);
-	const days = new Set(fields.dayOfMonth);
-	const months = new Set(fields.month);
-	const dows = new Set(fields.dayOfWeek);
-
-	const domWild = fields.dayOfMonth.length === 31;
-	const dowWild = fields.dayOfWeek.length === 7;
-
-	const t = new Date(from.getTime());
-	t.setSeconds(0, 0);
-	t.setMinutes(t.getMinutes() + 1);
-
-	const maxIter = 366 * 24 * 60;
-	for (let i = 0; i < maxIter; i++) {
-		if (!months.has(t.getMonth() + 1)) {
-			t.setMonth(t.getMonth() + 1, 1);
-			t.setHours(0, 0, 0, 0);
-			continue;
-		}
-
-		const dayMatches = domWild
-			? dowWild || dows.has(t.getDay())
-			: dowWild
-				? days.has(t.getDate())
-				: days.has(t.getDate()) || dows.has(t.getDay());
-		if (!dayMatches) {
-			t.setDate(t.getDate() + 1);
-			t.setHours(0, 0, 0, 0);
-			continue;
-		}
-
-		if (!hours.has(t.getHours())) {
-			t.setHours(t.getHours() + 1, 0, 0, 0);
-			continue;
-		}
-
-		if (!minutes.has(t.getMinutes())) {
-			t.setMinutes(t.getMinutes() + 1);
-			continue;
-		}
-
-		return t;
-	}
-
-	return null;
-}
-
-// ─── 人类可读排期 ───
-
-const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-
-function formatClock(minute: number, hour: number): string {
-	// 固定用 1 月 1 日，避开夏令时跳变日
-	return new Date(2000, 0, 1, hour, minute).toLocaleTimeString("en-US", {
-		hour: "numeric",
-		minute: "2-digit",
-	});
-}
-
-/** 只覆盖常见形态；认不出来就原样返回表达式（与工具返回文本共用，故用英文） */
-export function cronToHuman(expr: string): string {
-	const parts = expr.trim().split(/\s+/);
-	if (parts.length !== 5) return expr;
-	const [minute, hour, dom, month, dow] = parts as [string, string, string, string, string];
-
-	const everyMin = minute.match(/^\*\/(\d+)$/);
-	if (minute === "*" && hour === "*" && dom === "*" && month === "*" && dow === "*") return "Every minute";
-	if (everyMin && hour === "*" && dom === "*" && month === "*" && dow === "*") {
-		const n = Number(everyMin[1]);
-		return n === 1 ? "Every minute" : `Every ${n} minutes`;
-	}
-
-	if (/^\d+$/.test(minute) && hour === "*" && dom === "*" && month === "*" && dow === "*") {
-		const m = Number(minute);
-		return m === 0 ? "Every hour" : `Every hour at :${String(m).padStart(2, "0")}`;
-	}
-
-	const everyHour = hour.match(/^\*\/(\d+)$/);
-	if (/^\d+$/.test(minute) && everyHour && dom === "*" && month === "*" && dow === "*") {
-		const n = Number(everyHour[1]);
-		const m = Number(minute);
-		const suffix = m === 0 ? "" : ` at :${String(m).padStart(2, "0")}`;
-		return n === 1 ? `Every hour${suffix}` : `Every ${n} hours${suffix}`;
-	}
-
-	// 每 N 天（dom 步进；与下面的「具体日期」互斥）
-	const everyDayEn = dom.match(/^\*\/(\d+)$/);
-	if (/^\d+$/.test(minute) && /^\d+$/.test(hour) && everyDayEn && month === "*" && dow === "*") {
-		const n = Number(everyDayEn[1]);
-		const time = formatClock(Number(minute), Number(hour));
-		return n === 1 ? `Every day at ${time}` : `Every ${n} days at ${time}`;
-	}
-
-	if (/^\d+$/.test(minute) && /^\d+$/.test(hour) && /^\d+$/.test(dom) && /^\d+$/.test(month) && dow === "*") {
-		const date = new Date(2000, Number(month) - 1, Number(dom));
-		const label = date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-		return `On ${label} at ${formatClock(Number(minute), Number(hour))}`;
-	}
-
-	if (/^\d+$/.test(minute) && /^\d+$/.test(hour) && dom === "*" && month === "*") {
-		const m = Number(minute);
-		const h = Number(hour);
-		if (dow === "*") return `Every day at ${formatClock(m, h)}`;
-		if (dow === "1-5") return `Weekdays at ${formatClock(m, h)}`;
-		if (/^\d$/.test(dow)) {
-			const name = DAY_NAMES[Number(dow) % 7];
-			if (name) return `Every ${name} at ${formatClock(m, h)}`;
-		}
-	}
-
-	return expr;
-}
-
-// ─── 小工具 ───
-
-function relative(ms: number): string {
-	if (ms <= 0) return "0s";
-	const s = Math.round(ms / 1000);
-	if (s < 60) return `${s}s`;
-	const m = Math.round(s / 60);
-	if (m < 60) return `${m}m`;
-	const h = Math.floor(m / 60);
-	const rm = m % 60;
-	if (h < 24) return rm ? `${h}h${rm}m` : `${h}h`;
-	const d = Math.floor(h / 24);
-	const rh = h % 24;
-	return rh ? `${d}d${rh}h` : `${d}d`;
-}
-
-function formatClockZh(minute: number, hour: number): string {
-	return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-}
-
-const DAY_NAMES_ZH = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
-
-/** 人类可读排期的中文版。命令面向用户（英文版 cronToHuman 服务工具返回文本） */
-export function cronToHumanZh(expr: string): string {
-	const parts = expr.trim().split(/\s+/);
-	if (parts.length !== 5) return expr;
-	const [minute, hour, dom, month, dow] = parts as [string, string, string, string, string];
-
-	if (minute === "*" && hour === "*" && dom === "*" && month === "*" && dow === "*") return "每分钟";
-
-	const everyMin = minute.match(/^\*\/(\d+)$/);
-	if (everyMin && hour === "*" && dom === "*" && month === "*" && dow === "*") {
-		const n = Number(everyMin[1]);
-		return n === 1 ? "每分钟" : `每 ${n} 分钟`;
-	}
-
-	if (/^\d+$/.test(minute) && hour === "*" && dom === "*" && month === "*" && dow === "*") {
-		const m = Number(minute);
-		return m === 0 ? "每小时" : `每小时的第 ${m} 分`;
-	}
-
-	const everyHour = hour.match(/^\*\/(\d+)$/);
-	if (/^\d+$/.test(minute) && everyHour && dom === "*" && month === "*" && dow === "*") {
-		const h = Number(everyHour[1]);
-		const m = Number(minute);
-		const base = h === 1 ? "每小时" : `每 ${h} 小时`;
-		return m === 0 ? base : `${base}的第 ${m} 分`;
-	}
-
-	// 每 N 天（dom 步进；与下面的「具体日期」互斥）
-	const everyDayZh = dom.match(/^\*\/(\d+)$/);
-	if (/^\d+$/.test(minute) && /^\d+$/.test(hour) && everyDayZh && month === "*" && dow === "*") {
-		const n = Number(everyDayZh[1]);
-		const time = formatClockZh(Number(minute), Number(hour));
-		return n === 1 ? `每天 ${time}` : `每 ${n} 天 ${time}`;
-	}
-
-	// 具体日期：一次性任务的典型形态
-	if (/^\d+$/.test(minute) && /^\d+$/.test(hour) && /^\d+$/.test(dom) && /^\d+$/.test(month) && dow === "*") {
-		return `${Number(month)} 月 ${Number(dom)} 日 ${formatClockZh(Number(minute), Number(hour))}`;
-	}
-
-	if (/^\d+$/.test(minute) && /^\d+$/.test(hour) && dom === "*" && month === "*") {
-		const time = formatClockZh(Number(minute), Number(hour));
-		if (dow === "*") return `每天 ${time}`;
-		if (dow === "1-5") return `工作日 ${time}`;
-		if (/^\d$/.test(dow)) return `${DAY_NAMES_ZH[Number(dow) % 7]} ${time}`;
-	}
-
-	return expr;
-}
-
-/** 相对时长的中文单值近似（命令回执用）。只给一个量级，不堆「X 小时 Y 分」这种碎数字 */
-function relativeZh(ms: number): string {
-	if (ms < 60_000) return "不到 1 分钟";
-	const m = Math.round(ms / 60_000);
-	if (m < 60) return `${m} 分钟`;
-	const h = Math.round(m / 60);
-	if (h < 24) return `${h} 小时`;
-	return `${Math.round(h / 24)} 天`;
-}
-
-/** 触发时刻：当天只显示 HH:MM，跨天补上月/日，括号里给相对时间 */
-function formatWhen(at: number, now: number): string {
-	const d = new Date(at);
-	const clock = formatClockZh(d.getMinutes(), d.getHours());
-	const sameDay = new Date(now).toDateString() === d.toDateString();
-	const stamp = sameDay ? clock : `${d.getMonth() + 1}/${d.getDate()} ${clock}`;
-	return `${stamp}（${relativeZh(at - now)}后）`;
-}
-
-function truncate(text: string, max: number): string {
-	const oneLine = text.replace(/\s+/g, " ").trim();
-	return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 1)}…`;
-}
-
-// ─── 间隔 → cron（/cron 命令用代码解析；模型路径自行构造表达式，两条路互不依赖） ───
-
-const MINUTE_MS = 60_000;
-const UNIT_MS: Record<string, number> = { s: 1_000, m: MINUTE_MS, h: 3_600_000, d: 86_400_000 };
-
-/** 解析 `5m` / `2h` / `1d` / `30s` / 复合 `1h30m`，返回毫秒；非法返回 null */
-export function parseInterval(text: string): number | null {
-	const flat = text.trim().toLowerCase();
-	if (!/^(?:\d+[smhd])+$/.test(flat)) return null;
-	let ms = 0;
-	for (const part of flat.matchAll(/(\d+)([smhd])/g)) {
-		ms += Number(part[1]) * UNIT_MS[part[2]!]!;
-	}
-	return ms > 0 ? ms : null;
-}
-
-export interface CronConversion {
-	cron: string;
-	/** 间隔无法被 cron 精确表达时的取整说明 */
-	note?: string;
-}
-
-/**
- * 间隔 → 循环 cron 表达式。cron 最小粒度是分钟，秒级向上取整；
- * 无法精确表达时取最近的干净粒度并在 note 里回报（对应 GLOSSARY.md 的「规范化」）。
- */
-export function intervalToCron(ms: number): CronConversion {
-	const minutes = Math.max(1, Math.ceil(ms / MINUTE_MS));
-	if (minutes <= 59) {
-		return {
-			cron: `*/${minutes} * * * *`,
-			note: minutes * MINUTE_MS !== ms ? "不足 1 分钟，已按每分钟计" : undefined,
-		};
-	}
-
-	const hours = minutes / 60;
-	if (hours < 24) {
-		const h = Math.max(1, Math.round(hours));
-		return { cron: `0 */${h} * * *`, note: h * 60 !== minutes ? `已取整为 ${h} 小时` : undefined };
-	}
-
-	const days = hours / 24;
-	if (days <= 31) {
-		const d = Math.max(1, Math.round(days));
-		return { cron: `0 0 */${d} * *`, note: d * 24 !== hours ? `已取整为 ${d} 天` : undefined };
-	}
-
-	const months = Math.max(1, Math.round(days / 30));
-	return { cron: `0 0 1 */${months} *`, note: `已取整为每 ${months} 个月` };
-}
-
-/** `once`：把「从现在起 <间隔> 之后」换算成一次性 cron 表达式（本地时区） */
-export function oneShotCron(ms: number, from: Date): { cron: string; at: Date } {
-	const at = new Date(from.getTime() + ms);
-	at.setSeconds(0, 0);
-	if (at.getTime() <= from.getTime()) at.setMinutes(at.getMinutes() + 1);
-	return { cron: `${at.getMinutes()} ${at.getHours()} ${at.getDate()} ${at.getMonth() + 1} *`, at };
-}
-
-/**
- * 触发时交给模型的最小包装：只补两件模型不可能自己知道的事——这条消息从哪来、
- * 以及这个 job 的 id（供它自行取消）。逐字措辞都是调过的，改动前先看测试断言：
- *   - 用第三人称陈述来源，不用否定句去否认消息自身的 role（那会与 role=user 矛盾）；
- *   - 取消条件锚到「prompt 里写明的完成条件」，而不是模型自评的 purpose——后者是早删的根因；
- *   - 没有「Run the prompt below」（D43 曾加过，D49 用户拍定删除）；
- *   - 一次性不提「已被移除」——那会暗示无事可做，与要执行的任务直接冲突；
- *   - 头行不标 recurring/one-shot；不写「怎么调工具」；不提 catch-up；不写过期策略。
- * prompt 本体逐字不变，只在前面加一行；渲染时由 unframePrompt 剥掉。
- */
-export function framePrompt(job: CronJob): string {
-	const head = `[cron-job ${job.id} · ${job.cron} · fire ${job.fireCount}]`;
-	const note = job.recurring
-		? "Delivered by a scheduled cron job. Cancel this job only when the prompt's stated completion condition is met."
-		: "Delivered by a scheduled cron job. Run the prompt below.";
-	return `${head} ${note}\n\n${job.prompt}`;
-}
-
-/** 渲染时剥掉上面的包装（与 pi 处理 <skill> 块的做法一致），TUI 只显示 prompt 原貌 */
-export function unframePrompt(text: string): string {
-	if (!text.startsWith("[cron-job ")) return text;
-	const sep = text.indexOf("\n\n");
-	return sep < 0 ? text : text.slice(sep + 2);
+function jobLines(job: CronJob, now: number): CronInfoLine[] {
+	const when = Number.isFinite(job.nextFireAt) ? `${relativeZh(job.nextFireAt - now)}后` : "等待空闲";
+	const fired = job.fireCount > 0 ? ` · 已触发 ${job.fireCount} 次` : "";
+	const missed = job.backlog > 0 ? ` · 漏跑 ${job.backlog} 次` : "";
+	const kind = job.recurring ? "" : " · 一次性";
+	return [
+		{ text: `${job.id} · ${cronToHumanZh(job.cron)} (${job.cron}) · ${when}${fired}${missed}${kind}`, tone: "text" },
+		{ text: `↳ ${truncate(job.prompt, PROMPT_PREVIEW)}`, tone: "dim" },
+	];
 }
 
 // ─── 扩展 ───
 
 export default function (pi: ExtensionAPI) {
+	// ─── 调度器 ───
+
 	let timer: ReturnType<typeof setTimeout> | null = null;
 	/** 最近一次的 ctx，用于查询 agent 是否空闲；session_start 时刷新 */
 	let currentCtx: ExtensionContext | undefined;
@@ -633,6 +307,8 @@ export default function (pi: ExtensionAPI) {
 		arm();
 	}
 
+	// ─── 事件绑定 ───
+
 	pi.on("session_start", (_event, ctx) => {
 		currentCtx = ctx;
 		arm();
@@ -655,6 +331,8 @@ export default function (pi: ExtensionAPI) {
 		}
 		arm();
 	});
+
+	// ─── 触发消息渲染器 ───
 
 	// 触发时注入的消息。头行让 TUI 一眼认出是 cron job（带 id，便于对应 /cron list）；
 	// 正文用 unframePrompt 剥掉给模型看的包装，只显示 prompt 原貌。
@@ -687,37 +365,11 @@ export default function (pi: ExtensionAPI) {
 
 	// ─── /cron 命令（人工入口，间隔由代码解析，不经过 LLM） ───
 
-	const USAGE_LINES: CronInfoLine[] = [
-		{ text: "用法：", tone: "text" },
-		{ text: "/cron <间隔> [once] <prompt>   创建定时任务", tone: "dim" },
-		{ text: "/cron list                     列出当前任务", tone: "dim" },
-		{ text: "/cron delete [id]              删除任务（省略 id 则弹出选择）", tone: "dim" },
-		{ text: "", tone: "dim" },
-		{ text: "间隔：Ns / Nm / Nh / Nd，可复合（如 1h30m）；cron 最小粒度 1 分钟，秒级向上取整", tone: "dim" },
-		{ text: "once：只触发一次（从现在算起 <间隔> 之后），触发后自动删除", tone: "dim" },
-		{ text: "不加 once：循环触发，且创建后立即执行一次", tone: "dim" },
-	];
-
 	const info = (lines: CronInfoLine[]): void => pi.appendEntry<CronInfoEntry>(INFO_TYPE, { lines });
 
-	function jobLines(job: CronJob, now: number): CronInfoLine[] {
-		const when = Number.isFinite(job.nextFireAt) ? `${relativeZh(job.nextFireAt - now)}后` : "等待空闲";
-		const fired = job.fireCount > 0 ? ` · 已触发 ${job.fireCount} 次` : "";
-		const missed = job.backlog > 0 ? ` · 漏跑 ${job.backlog} 次` : "";
-		const kind = job.recurring ? "" : " · 一次性";
-		return [
-			{ text: `${job.id} · ${cronToHumanZh(job.cron)} (${job.cron}) · ${when}${fired}${missed}${kind}`, tone: "text" },
-			{ text: `↳ ${truncate(job.prompt, PROMPT_PREVIEW)}`, tone: "dim" },
-		];
-	}
-
-	pi.registerEntryRenderer<CronInfoEntry>(INFO_TYPE, (entry, _options, theme) => {
-		const box = new Box(1, 1);
-		for (const line of entry.data?.lines ?? []) {
-			box.addChild(new Text(line.tone ? theme.fg(line.tone, line.text) : line.text, 0, 0));
-		}
-		return box;
-	});
+	pi.registerEntryRenderer<CronInfoEntry>(INFO_TYPE, (entry, _options, theme) =>
+		renderLineBox(theme, entry.data?.lines ?? []),
+	);
 
 	pi.registerCommand("cron", {
 		description: "定时任务：/cron <间隔> [once] <prompt> | /cron list | /cron delete [id]",

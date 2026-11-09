@@ -17,6 +17,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { errorMessage } from "./lib/errors.ts";
 import { createTabLauncher, inHerdrEnv } from "./lib/herdr.ts";
 
 export default function (pi: ExtensionAPI) {
@@ -40,7 +41,7 @@ export default function (pi: ExtensionAPI) {
 				await launcher.launch({ message, forkSession, cwd: process.cwd() });
 				ctx.ui.notify("✓ 已在新标签 fork 当前会话启动 pi", "info");
 			} catch (error) {
-				ctx.ui.notify(`✗ /btw 失败：${error instanceof Error ? error.message : String(error)}`, "error");
+				ctx.ui.notify(`✗ /btw 失败：${errorMessage(error)}`, "error");
 			}
 		},
 	});

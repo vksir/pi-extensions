@@ -38,12 +38,19 @@
 import { dirname, relative } from "node:path";
 import { minimatch } from "minimatch";
 import type { ExtensionAPI, Skill } from "@earendil-works/pi-coding-agent";
+import { readExtensionSettings, readStringArray } from "./lib/settings.ts";
+
+// ─── 配置 ───
+
+const SETTINGS_KEY = "pi-skill-visibility";
 
 /** settings.json 中 "pi-skill-visibility" 键下的扩展配置 */
 interface PiSkillVisibilitySettings {
 	/** 不进入系统提示词的 skill 条目:精确名称或 glob 模式 */
 	hidden?: string[];
 }
+
+// ─── 匹配 ───
 
 /** 含任一 glob 元字符的条目按模式处理,其余按精确名称处理 */
 const GLOB_META = /[*?[{]/;
@@ -56,10 +63,8 @@ interface HiddenRules {
 }
 
 function readHiddenRules(pi: ExtensionAPI): HiddenRules {
-	const raw = (pi.getSettings() as Record<string, unknown>)["pi-skill-visibility"];
-	const settings = typeof raw === "object" && raw !== null ? (raw as PiSkillVisibilitySettings) : {};
-	const entries = Array.isArray(settings.hidden) ? settings.hidden : [];
-	const strings = entries.filter((entry): entry is string => typeof entry === "string");
+	const settings = readExtensionSettings<PiSkillVisibilitySettings>(pi, SETTINGS_KEY);
+	const strings = readStringArray(settings.hidden);
 	return {
 		exact: new Set(strings.filter((entry) => !GLOB_META.test(entry)).map((entry) => entry.toLowerCase())),
 		patterns: strings.filter((entry) => GLOB_META.test(entry)),
@@ -107,6 +112,8 @@ function applyVisibility(skills: Skill[], rules: HiddenRules): void {
 		}
 	}
 }
+
+// ─── 扩展入口 ───
 
 export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", (event) => {

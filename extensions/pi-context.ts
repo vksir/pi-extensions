@@ -15,10 +15,11 @@
  * - tool 名来自请求体 tools 字段，与 tools.md 的节标题同源。
  */
 
-import { getCurrentSystemMessage, getCurrentTools, getSystemMessageText } from "@earendil-works/pi-ai";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { getCurrentSystemMessage, getCurrentTools, getSystemMessageText } from "@earendil-works/pi-ai";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { errorMessage } from "./lib/errors.ts";
 
 const OUT_DIR = join(getAgentDir(), "pi-context");
 const PROMPT_FILE = join(OUT_DIR, "system-prompt.md");
@@ -39,6 +40,8 @@ interface TextBlock {
 
 /** 只读 transcript；replay 助手只读 role === "system" 的消息。 */
 type TranscriptMessages = readonly { role: string }[];
+
+// ─── 通用读取 ───
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -111,13 +114,24 @@ function fence(language: string, text: string): string[] {
 	return [`${marker}${language}`, text, marker];
 }
 
+/** 请求体缺少 tools 字段时，说明是「确实没有」还是「这个 API 读不到」。 */
+function missingToolsSource(declared: number | undefined): string {
+	if (declared === undefined) return "未捕获到 transcript，无法判断工具声明";
+	if (declared === 0) return "本次请求没有工具声明";
+	return `无法从该 API 的请求体读取工具声明（transcript 声明了 ${declared} 个）`;
+}
+
+// ─── Markdown 生成 ───
+
 function promptMarkdown(messages: TranscriptMessages | undefined, ctx: ExtensionContext, capturedAt: string): string {
 	const system = messages ? getCurrentSystemMessage(messages) : undefined;
 	if (!system) return frontmatter(metaLines(ctx, capturedAt, "本次请求没有系统提示词"));
 	const lines = metaLines(ctx, capturedAt, "本次请求 transcript 的 system 消息（provider 读取提示词的同一路径）");
 	const skills = skillNames(messages);
 	if (skills.length > 0) lines.push(`技能: ${skills.join(", ")}`);
-	const sections = Object.entries(system.sections ?? {}).flatMap(([name, text]) => (text === null ? [] : [[name, text] as const]));
+	const sections = Object.entries(system.sections ?? {}).flatMap(([name, text]) =>
+		text === null ? [] : [[name, text] as const],
+	);
 	if (sections.length > 0) {
 		lines.push("分段字符数:");
 		for (const [name, text] of sections) lines.push(`  ${yamlKey(name)}: ${text.length}`);
@@ -148,7 +162,12 @@ function pullTextBlocks(value: unknown, blocks: TextBlock[], path = ""): unknown
 	if (Array.isArray(value)) return value.map((item, index) => pullTextBlocks(item, blocks, `${path}[${index}]`));
 	const record = asRecord(value);
 	if (!record) return value;
-	return Object.fromEntries(Object.entries(record).map(([key, child]) => [key, pullTextBlocks(child, blocks, path === "" ? key : `${path}.${key}`)]));
+	return Object.fromEntries(
+		Object.entries(record).map(([key, child]) => [
+			key,
+			pullTextBlocks(child, blocks, path === "" ? key : `${path}.${key}`),
+		]),
+	);
 }
 
 /** 工具名：任意深度第一个字符串型 `name`，同样不按 API 形状分支。 */
@@ -202,10 +221,7 @@ function toolsMarkdown(payload: unknown, messages: TranscriptMessages | undefine
 	const tools = requestTools(payload);
 	if (!tools) {
 		const declared = messages ? getCurrentTools(messages).length : undefined;
-		const source = declared === undefined ? "未捕获到 transcript，无法判断工具声明"
-			: declared === 0 ? "本次请求没有工具声明"
-			: `无法从该 API 的请求体读取工具声明（transcript 声明了 ${declared} 个）`;
-		return frontmatter(metaLines(ctx, capturedAt, source));
+		return frontmatter(metaLines(ctx, capturedAt, missingToolsSource(declared)));
 	}
 	const json = JSON.stringify(tools, null, 2);
 	const names = toolNames(payload);
@@ -217,6 +233,8 @@ function toolsMarkdown(payload: unknown, messages: TranscriptMessages | undefine
 	];
 	return `${frontmatter(lines)}\n${toolSections(tools).join("\n")}`;
 }
+
+// ─── 扩展入口 ───
 
 export default function (pi: ExtensionAPI) {
 	let pending = false;
@@ -267,7 +285,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(capturedNotice(transcript, event.payload), "info");
 		} catch (error) {
 			// 导出失败只通知，不修改或阻断模型请求。
-			ctx.ui.notify(`[context] ${error instanceof Error ? error.message : String(error)}`, "error");
+			ctx.ui.notify(`[context] ${errorMessage(error)}`, "error");
 		}
 	});
 }
