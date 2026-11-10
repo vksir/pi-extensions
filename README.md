@@ -73,6 +73,8 @@ node --test 'tests/herdr.test.ts' 'tests/pi-btw.test.ts'
 
 pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式下静默。
 
+主 agent 因 [@tintinweb/pi-subagents](https://www.npmjs.com/package/@tintinweb/pi-subagents) 的进程内子 agent 仍在运行或排队而停下等待时（同样触发 `agent_settled`），不发通知——只有真正完成才通知。探测实现在 `lib/subagents.ts`：注册表取不到时（未安装、被过滤、形状变化）一律按没有子 agent 处理，照常通知。
+
 在两代 [herdr](https://herdr.dev) 终端环境中（旧 herdr 注入 `HERDR_ENV=1`，或 herdr-core 注入 `HC_TERMINAL_ID`）默认启用；如需在 herdr 中禁用，在 settings.json 中配置：
 
 ```json
@@ -100,6 +102,7 @@ pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式�
 | 模块 | 职责 |
 |------|------|
 | `lib/herdr.ts` | 两代 herdr 环境探测、标签更名、新标签启动 |
+| `lib/subagents.ts` | pi-subagents 注册表的子 agent 存活探测 |
 | `lib/cron/schedule.ts` | cron 表达式解析、下次触发、间隔换算（纯函数） |
 | `lib/cron/presentation.ts` | 排期的人类可读化与触发 prompt 包装 |
 | `lib/balance/providers.ts` | Provider 凭据、请求与响应归一化 |

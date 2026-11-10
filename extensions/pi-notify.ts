@@ -8,12 +8,16 @@
  * - Windows toast: 系统通知（按 process.platform 判断，任意终端都生效）
  *
  * Requires pi >= 1.3.0 (agent_settled 事件携带 aborted 字段)。
+ *
+ * 主 agent 因 @tintinweb/pi-subagents 的进程内子 agent 仍在运行或排队而停下
+ * 等待时，同样会触发 agent_settled，此时不算完成，不发通知（见 lib/subagents.ts）。
  */
 
 import { execFile } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { inHerdrEnv } from "./lib/herdr.ts";
 import { readExtensionSettings } from "./lib/settings.ts";
+import { hasRunningSubagents } from "./lib/subagents.ts";
 import { basename } from "./lib/text.ts";
 
 /** settings.json 中 "pi-notify" 键下的扩展配置 */
@@ -89,6 +93,9 @@ export default function (pi: ExtensionAPI) {
 		// 扩展也会在 RPC/JSON/print 模式下加载，
 		// 直接写 process.stdout 会污染非交互输出，仅在 TUI 模式通知
 		if (event.aborted || ctx.mode !== "tui") return;
+		// 主 agent 停下来等进程内子 agent（运行或排队）也会 settle，这不是完成，
+		// 不通知；注册表取不到时按没有子 agent 处理，照常通知
+		if (hasRunningSubagents()) return;
 		settings ??= readSettings(pi);
 		// { "pi-notify": { "disable": true } } 整体禁用；
 		// { "pi-notify": { "disableInHerdr": true } } 仅禁用 herdr 环境（herdr 环境默认启用）

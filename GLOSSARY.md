@@ -50,6 +50,16 @@ _Avoid_: 会话级、session-only、durable、持久化
 当前进程中全部 cron job 的集合，是 `cron` 工具与 `/cron` 命令共同的真相来源。
 _Avoid_: 任务清单、调度表、registry
 
+### 完成通知（pi-notify）
+
+**进程内子 agent (in-process subagent)**：
+@tintinweb/pi-subagents 在主 pi 进程内拉起并托管的 agent；存活状态经 `globalThis` 上 `pi-subagents:manager` 注册表查询，覆盖 running 与 queued 两种状态。
+_Avoid_: 分身、内部 agent、内嵌 agent
+
+**完成通知 (completion notification)**：
+主 agent settle 且没有进程内子 agent 在跑时发出的桌面通知；等子 agent 的 settle、中止与非交互模式一律静默。
+_Avoid_: 结束提醒、done 提示
+
 ### 顺带分派（pi-btw）
 
 **顺带请求 (btw request)**：
