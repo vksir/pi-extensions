@@ -4,6 +4,16 @@
 
 ## Language
 
+### Token 用量（pi-token-stats）
+
+**输出速率 (Output Rate)**：
+最近一次完成的 assistant 响应的输出 token 数除以该次耗时（`AssistantMessage.durationMs`），单位 token/秒，显示在 footer 状态行的缓存读取与缓存命中率之间。耗时含思考与首字等待，不单算生成窗口。
+_Avoid_: 速度、生成速度、tokens per second、TPS
+
+**会话视图替身 (footer session stand-in)**：
+扩展上下文里能取到的那部分会话数据，用来驱动内置 `FooterComponent` 渲染——因为 `setFooter` 只能整体替换 footer。
+_Avoid_: 假 session、mock session
+
 ### 定时调度（pi-cron）
 
 **cron job**：
