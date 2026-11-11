@@ -7,11 +7,13 @@
  *   - Moonshot
  *   - OpenRouter
  *   - OpenAI Codex（ChatGPT Plus/Pro 额度）
+ *   - OpenCode Go（Go/Go Plus/Go Teams 的 5h/周/月额度）
  *   - Zhipu GLM（智谱 Coding Plan 积分额度）
  *
  * 命令：
- *   /balance            — 查询所有已配置 Provider 的余额/额度
- *   /balance deepseek   — 只查某个 Provider
+ *   /balance            — 列出支持的 Provider（不查询额度）
+ *   /balance all        — 查询所有已配置 Provider 的余额/额度
+ *   /balance <provider> — 只查某个 Provider（如 /balance opencode）
  *   /balance free       — 列出 OpenRouter 免费模型 Top 20（按 coding_index 排序，含 Latency/Throughput）
  *
  * 查询与渲染分别在 lib/balance/providers.ts 与 lib/balance/render.ts；
@@ -21,20 +23,21 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { checkers, queryBalances, queryFreeModels } from "./lib/balance/providers.ts";
-import { renderBalance, renderFreeModels } from "./lib/balance/render.ts";
+import { renderBalance, renderFreeModels, renderProviders, providerCommand } from "./lib/balance/render.ts";
 import { renderDimLines } from "./lib/render.ts";
 
 interface BalanceEntry {
 	lines: string[];
 }
 
-/** /balance 的参数候选：free + 各 provider。value 用别名优先，与 matchesProvider 的匹配口径一致 */
+/** /balance 的参数候选：all + free + 各 provider。value 用别名优先，与 matchesProvider 的匹配口径一致 */
 function balanceTargets(): AutocompleteItem[] {
 	const items: AutocompleteItem[] = [
+		{ value: "all", label: "all", description: "查询所有已配置 Provider" },
 		{ value: "free", label: "free", description: "列出 OpenRouter 免费模型" },
 	];
 	for (const c of checkers) {
-		const value = (c.aliases?.[0] ?? c.name).toLowerCase();
+		const value = providerCommand(c);
 		items.push({ value, label: value, description: c.name });
 	}
 	return items;
@@ -47,7 +50,7 @@ export default function (pi: ExtensionAPI) {
 	);
 
 	pi.registerCommand("balance", {
-		description: "查询 Provider 余额/Codex 与 GLM 额度，或列出 OpenRouter 免费模型。用法: /balance，/balance codex，/balance glm，/balance free",
+		description: "查询 Provider 余额/额度。用法: /balance（列支持的 Provider），/balance all，/balance opencode，/balance free",
 		getArgumentCompletions: (prefix) => {
 			// 只补第一个参数；已输入空格后交由用户自由输入
 			if (prefix.trim().includes(" ")) return null;
@@ -60,6 +63,12 @@ export default function (pi: ExtensionAPI) {
 				const tokens = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
 				const arg = tokens[0] ?? "";
 
+				// /balance — 只列支持的 Provider，不查询额度
+				if (!arg) {
+					pi.appendEntry<BalanceEntry>("balance", { lines: renderProviders(checkers) });
+					return;
+				}
+
 				// /balance free — 列出 OpenRouter 免费模型
 				if (arg === "free") {
 					const { models, error } = await queryFreeModels();
@@ -67,7 +76,8 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
-				const target = arg || undefined;
+				// /balance all — 查全部；/balance <provider> — 查单个
+				const target = arg === "all" ? undefined : arg;
 				const results = await queryBalances(target, ctx);
 
 				if (target && results.length === 0) {
@@ -75,7 +85,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
-				// 如果没有配置任何凭据且未指定目标，提示用户
+				// 如果没有配置任何凭据且指定了 all，提示用户
 				if (results.length === 0) {
 					ctx.ui.notify("auth.json 中未找到任何已配置的 API Key 或 OAuth 凭据", "info");
 					return;

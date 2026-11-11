@@ -67,9 +67,12 @@ export function renderBalance(results: BalanceResult[]): string[] {
 		lines.push(`  ${result.provider} 额度${plan}`);
 		lines.push(`  ─────────────────────────────`);
 
-		const windows: Array<{ label: string; window: CodexUsageWindow }> = [];
-		if (quota.primary) windows.push({ label: "Primary", window: quota.primary });
-		if (quota.secondary) windows.push({ label: "Secondary", window: quota.secondary });
+		const windows: Array<{ label: string; window: CodexUsageWindow }> =
+			quota.windows ??
+			[
+				...(quota.primary ? [{ label: "Primary", window: quota.primary }] : []),
+				...(quota.secondary ? [{ label: "Secondary", window: quota.secondary }] : []),
+			];
 
 		for (const { label, window } of windows) {
 			const remaining = Math.max(0, Math.min(100, 100 - window.usedPercent));
@@ -139,6 +142,31 @@ function formatQuotaReset(window: CodexUsageWindow): string {
 	if (hours > 0) parts.push(`${hours}h`);
 	if (minutes > 0 && days === 0) parts.push(`${minutes}m`);
 	return `重置 ${parts.join(" ")}后`;
+}
+
+// ─── Provider 列表 ───
+
+/** 一个 Provider 在 /balance 参数里的命令词：优先用首个别名，否则用名称。 */
+export function providerCommand(checker: { name: string; aliases?: string[] }): string {
+	return (checker.aliases?.[0] ?? checker.name).toLowerCase();
+}
+
+/** /balance 不带参数时展示的 Provider 清单（不发请求）。 */
+export function renderProviders(checkers: ReadonlyArray<{ name: string; aliases?: string[] }>): string[] {
+	const lines: string[] = [];
+	lines.push(`  支持的 Provider（${checkers.length}）`);
+	lines.push(`  ─────────────────────────────`);
+
+	for (const checker of checkers) {
+		lines.push(`  ${checker.name.padEnd(14)} ${providerCommand(checker)}`);
+	}
+
+	lines.push(`  ─────────────────────────────`);
+	lines.push(`  ${"all".padEnd(14)} 查询全部已配置 Provider`);
+	lines.push(`  ${"free".padEnd(14)} OpenRouter 免费模型`);
+	lines.push("");
+	lines.push("  /balance <命令> 查单个；/balance all 查全部");
+	return lines;
 }
 
 // ─── 免费模型 ───

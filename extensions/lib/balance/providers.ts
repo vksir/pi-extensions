@@ -43,6 +43,8 @@ interface CodexQuota {
 	limitReached?: boolean;
 	primary?: CodexUsageWindow;
 	secondary?: CodexUsageWindow;
+	/** 多窗口额度（如 OpenCode Go 的 5h/周/月），存在时优先于 primary/secondary */
+	windows?: Array<{ label: string; window: CodexUsageWindow }>;
 	credits?: {
 		hasCredits?: boolean;
 		unlimited?: boolean;
@@ -103,6 +105,27 @@ interface GlmLimitPayload {
 	nextResetTime: number;
 }
 
+/** OpenCode Go 额度接口里的单个用量窗口 */
+interface OpenCodeGoMeterPayload {
+	/** ok = 正常，rate-limited = 该窗口已用尽 */
+	status?: string;
+	/** 已用百分比（0-100） */
+	percent?: number | string;
+	/** 重置时间（ISO 8601 字符串） */
+	resetsAt?: string;
+}
+
+interface OpenCodeGoUsagePayload {
+	usage?: {
+		/** 5 小时滚动窗口 */
+		rolling?: OpenCodeGoMeterPayload;
+		/** 周窗口 */
+		weekly?: OpenCodeGoMeterPayload;
+		/** 月度窗口 */
+		monthly?: OpenCodeGoMeterPayload;
+	};
+}
+
 interface GlmQuotaPayload {
 	code?: number;
 	msg?: string;
@@ -152,7 +175,7 @@ interface ProviderChecker {
 	check(key: string, accountId?: string): Promise<Omit<BalanceResult, "provider">>;
 }
 
-/** 余额查询的 Provider 清单；/balance 的参数补全与筛选也以此为准。 */
+/** 余额查询的 Provider 清单；/balance 的参数补全、Provider 列表与筛选也以此为准。 */
 export const checkers: ProviderChecker[] = [
 	{
 		name: "DeepSeek",
@@ -295,6 +318,31 @@ export const checkers: ProviderChecker[] = [
 		},
 	},
 	{
+		name: "OpenCode Go",
+		authId: "opencode-go",
+		aliases: ["opencode", "go"],
+		// 与 Console 同源的推理 API：Bearer API Key 即可，带 x-opencode-org-id 时按 workspace 计
+		apiUrl: "https://opencode.ai/zen/go/v1/usage",
+		async check(key: string) {
+			const res = await fetch(this.apiUrl, {
+				headers: {
+					Accept: "application/json",
+					Authorization: `Bearer ${key}`,
+				},
+			});
+
+			if (!res.ok) return { balances: [], error: await responseError(res) };
+
+			const data = (await res.json()) as OpenCodeGoUsagePayload;
+			const quota = normalizeOpenCodeGoQuota(data);
+			if (!quota) {
+				return { balances: [], error: "未返回 OpenCode Go 额度数据（当前账号可能未订阅 Go）" };
+			}
+
+			return { balances: [], quota };
+		},
+	},
+	{
 		name: "GLM",
 		authId: "zai-coding-cn",
 		aliases: ["glm", "zai", "zhipu"],
@@ -427,6 +475,42 @@ function normalizeGlmQuota(data: NonNullable<GlmQuotaPayload["data"]>): CodexQuo
 		primary: toWindow(primary),
 		secondary: secondary ? toWindow(secondary) : undefined,
 	};
+}
+
+/**
+ * 把 OpenCode Go 的三个用量窗口归一化为 quota.windows：
+ * rolling → 5h、weekly → 周、monthly → 月。
+ */
+function normalizeOpenCodeGoQuota(data: OpenCodeGoUsagePayload): CodexQuota | undefined {
+	const usage = data.usage;
+	if (!usage) return undefined;
+
+	const meters: Array<{ label: string; meter?: OpenCodeGoMeterPayload }> = [
+		{ label: "5h", meter: usage.rolling },
+		{ label: "Week", meter: usage.weekly },
+		{ label: "Month", meter: usage.monthly },
+	];
+	const windows: NonNullable<CodexQuota["windows"]> = [];
+	let limitReached = false;
+
+	for (const { label, meter } of meters) {
+		const usedPercent = toNumber(meter?.percent);
+		if (!meter || usedPercent === undefined) continue;
+
+		const resetAt = meter.resetsAt ? Date.parse(meter.resetsAt) / 1000 : undefined;
+		windows.push({
+			label,
+			window: {
+				usedPercent,
+				// 接口给的是毫秒级 ISO 时间，Codex 侧统一为秒
+				resetAt: resetAt !== undefined && Number.isFinite(resetAt) ? resetAt : undefined,
+			},
+		});
+		if (meter.status === "rate-limited") limitReached = true;
+	}
+
+	if (windows.length === 0) return undefined;
+	return { windows, limitReached };
 }
 
 // ─── 免费模型 ───
