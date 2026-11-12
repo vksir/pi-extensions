@@ -125,11 +125,12 @@ test("状态行带上退出码与耗时", () => {
 	assert.equal(statusText(job({ kind: "codemode", status: "done", durationMs: 2_100 })), "done · 2.1s");
 });
 
-test("启动返回告知 id、回传方式与进程级存续域", () => {
+test("启动返回告知 id、回传方式、bg wait 与会话绑定的存续域", () => {
 	const text = startText(job());
 	assert.match(text, /Started background job b3f1a2c4 \(npm test\)/);
+	assert.match(text, /bg wait b3f1a2c4/);
 	assert.match(text, /bg kill/);
-	assert.match(text, /process-scoped/);
+	assert.match(text, /end with the session/);
 });
 
 test("完成消息是头行 + 原样输出，空输出退回占位", () => {
@@ -173,7 +174,17 @@ interface FakePi {
 	captured: any[];
 }
 
-function fakePi(): FakePi {
+/** 内置工具的假 schema：测试只需证明「直接复用引用」，形状不重要。 */
+const SCHEMAS: Record<string, any> = {
+	bash: {
+		type: "object",
+		properties: { command: { type: "string" }, timeout: { type: "number" } },
+		required: ["command"],
+	},
+	codemode: { type: "object", properties: { code: { type: "string" } }, required: ["code"] },
+};
+
+function fakePi(active: string[] = ["bash", "codemode"]): FakePi {
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
 	const sent: Array<{ message: any; options: any }> = [];
@@ -192,10 +203,24 @@ function fakePi(): FakePi {
 		sendMessage: (message: any, options: any) => sent.push({ message, options }),
 		appendEntry: (type: string, data: unknown) => entries.push({ type, data }),
 		getSettings: () => ({}),
-		getAllTools: () => [],
-		getActiveTools: () => [],
+		getAllTools: () =>
+			active.map((name) => ({
+				name,
+				description: "",
+				parameters: SCHEMAS[name] ?? { type: "object", properties: {} },
+				promptGuidelines: [],
+			})),
+		getActiveTools: () => [...active],
 	} as unknown as ExtensionAPI;
 	return { pi, tools, commands, sent, handlers, entries, captured };
+}
+
+/** 注册扩展并跑一次 `session_start`：工具是在那里注册的。 */
+function setup(options: { active?: string[]; codemode?: ToolDefinition | null } = {}): FakePi {
+	const fake = fakePi(options.active);
+	registerPiBg(fake.pi, options.codemode === undefined ? stubCodemode([]) : options.codemode);
+	fake.handlers.get("session_start")!({ type: "session_start" }, {});
+	return fake;
 }
 
 /** 假的 codemode 定义：只记录调用，不跑沙箱。 */
@@ -237,8 +262,7 @@ test("captureCodemodeTool 接住真实的 codemode 工具定义", () => {
 });
 
 test("bash-bg 委托内置 bash，结束后以 steer + triggerTurn 回传", async () => {
-	const { pi, tools, sent } = fakePi();
-	registerPiBg(pi, stubCodemode([]));
+	const { tools, sent } = setup();
 	const calls: Array<{ name: string; args: any }> = [];
 	const ctx = {
 		executeTool: async (name: string, args: any) => {
@@ -269,10 +293,25 @@ test("bash-bg 委托内置 bash，结束后以 steer + triggerTurn 回传", asyn
 	assert.match(sent[0]!.message.content, /hello\nCommand exited with code 0$/);
 });
 
+test("bash-bg 把入参原样透传给内置 bash", async () => {
+	const { tools, sent } = setup();
+	const calls: Array<{ name: string; args: any }> = [];
+	const ctx = {
+		executeTool: async (name: string, args: any) => {
+			calls.push({ name, args });
+			return outcome(name, "hello", { exit_code: 0 });
+		},
+	};
+
+	await tools.get("bash-bg").execute("call-1", { command: "echo hello", timeout: 5 }, undefined, undefined, ctx);
+	await until(() => sent.length === 1);
+	// timeout 也一并透传：schema 来自内置 bash，pi 加参数时这里无需改
+	assert.deepEqual(calls, [{ name: "bash", args: { command: "echo hello", timeout: 5 } }]);
+});
+
 test("codemode-bg 调用接住的定义，而不是 executeTool", async () => {
-	const { pi, tools, sent } = fakePi();
 	const calls: Array<{ code: unknown }> = [];
-	registerPiBg(pi, stubCodemode(calls));
+	const { tools, sent } = setup({ codemode: stubCodemode(calls) });
 	const ctx = {
 		executeTool: async () => {
 			throw new Error("codemode-bg 不该走 executeTool");
@@ -287,17 +326,50 @@ test("codemode-bg 调用接住的定义，而不是 executeTool", async () => {
 	assert.match(sent[0]!.message.content, /Script completed\n42$/);
 });
 
-test("codemode 后端接不到时给出明确错误而不是静默失败", async () => {
-	const { pi, tools } = fakePi();
-	registerPiBg(pi, null);
-	const result = await tools.get("codemode-bg").execute("call-1", { code: "return 1" }, undefined, undefined, {});
-	assert.match(result.details.error!, /codemode backend unavailable/);
-	assert.match(result.content[0].text, /^Error: codemode backend unavailable/);
+test("codemode 后端接不到时不注册 codemode-bg", () => {
+	const { tools } = setup({ codemode: null });
+	assert.equal(tools.has("codemode-bg"), false);
+	assert.equal(tools.has("bash-bg"), true);
+});
+
+test("未启用 bash 时不注册 bash-bg", () => {
+	const { tools } = setup({ active: ["codemode"] });
+	assert.equal(tools.has("bash-bg"), false);
+	assert.equal(tools.has("codemode-bg"), true);
+	assert.equal(tools.has("bg"), true);
+});
+
+test("未启用 codemode 时不注册 codemode-bg", () => {
+	const { tools } = setup({ active: ["bash"] });
+	assert.equal(tools.has("codemode-bg"), false);
+	assert.equal(tools.has("bash-bg"), true);
+});
+
+test("两个后端都未启用时 bg 也不注册", () => {
+	const { tools } = setup({ active: [] });
+	assert.equal(tools.size, 0);
+});
+
+test("schema 直接复用内置工具的那一份", () => {
+	const { tools } = setup({ codemode: stubCodemode([]) });
+	assert.equal(tools.get("bash-bg").parameters, SCHEMAS.bash);
+});
+
+test("prepareLoadout：后端离开 declared 时隐藏自己", () => {
+	const { tools } = setup();
+	const hideBash = tools.get("bash-bg").prepareLoadout;
+	assert.equal(hideBash({ declared: [{ name: "bash" }] }), undefined);
+	assert.deepEqual(hideBash({ declared: [{ name: "read" }] }), { hiddenDeclarations: ["bash-bg"] });
+
+	// bg 只要还有一个后端在就保留
+	const hideBg = tools.get("bg").prepareLoadout;
+	assert.equal(hideBg({ declared: [{ name: "bash" }] }), undefined);
+	assert.equal(hideBg({ declared: [{ name: "codemode" }] }), undefined);
+	assert.deepEqual(hideBg({ declared: [] }), { hiddenDeclarations: ["bg"] });
 });
 
 test("父轮 signal 不传给后台任务：已中止的入参不阻止任务完成", async () => {
-	const { pi, tools, sent } = fakePi();
-	registerPiBg(pi, stubCodemode([]));
+	const { tools, sent } = setup();
 	let seenSignal: AbortSignal | undefined;
 	const ctx = {
 		executeTool: async (_name: string, _args: unknown, options: { signal?: AbortSignal }) => {
@@ -316,8 +388,7 @@ test("父轮 signal 不传给后台任务：已中止的入参不阻止任务完
 });
 
 test("bg kill 中止任务且不回传", async () => {
-	const { pi, tools, sent } = fakePi();
-	registerPiBg(pi, stubCodemode([]));
+	const { tools, sent } = setup();
 	let aborted = false;
 	const ctx = {
 		executeTool: (_name: string, _args: unknown, options: { signal?: AbortSignal }) =>
@@ -340,8 +411,7 @@ test("bg kill 中止任务且不回传", async () => {
 });
 
 test("并发上限 64：超出直接拒绝", async () => {
-	const { pi, tools } = fakePi();
-	registerPiBg(pi, stubCodemode([]));
+	const { tools } = setup();
 	const ctx = { executeTool: () => new Promise(() => {}) };
 	for (let index = 0; index < 64; index += 1) {
 		const result = await tools.get("bash-bg").execute(`call-${index}`, { command: `cmd-${index}` }, undefined, undefined, ctx);
@@ -352,8 +422,7 @@ test("并发上限 64：超出直接拒绝", async () => {
 });
 
 test("/bg 列出任务，/bg kill <id> 终止", async () => {
-	const { pi, commands, entries } = fakePi();
-	registerPiBg(pi, stubCodemode([]));
+	const { commands, entries } = setup();
 	await commands.get("bg").handler("", { mode: "tui" });
 	assert.match(entries[0]!.data.lines[0].text, /没有后台任务/);
 
@@ -362,8 +431,7 @@ test("/bg 列出任务，/bg kill <id> 终止", async () => {
 });
 
 test("session_shutdown 中止在跑任务且不再回传", async () => {
-	const { pi, tools, handlers, sent } = fakePi();
-	registerPiBg(pi, stubCodemode([]));
+	const { tools, handlers, sent } = setup();
 	let aborted = false;
 	const ctx = {
 		executeTool: (_name: string, _args: unknown, options: { signal?: AbortSignal }) =>
@@ -384,14 +452,102 @@ test("session_shutdown 中止在跑任务且不再回传", async () => {
 	assert.match((await tools.get("bg").execute("call-2", { action: "list" })).content[0].text, new RegExp(id));
 });
 
-test("session_start 清掉上个会话遗留的已完成记录", async () => {
-	const { pi, tools, handlers } = fakePi();
-	registerPiBg(pi, stubCodemode([]));
+test("session_start 重入：清掉已完成记录且不重复注册", async () => {
+	const { tools, handlers, captured } = setup();
+	const registeredCount = captured.length;
 	const ctx = { executeTool: async (name: string) => outcome(name, "ok", { exit_code: 0 }) };
 	await tools.get("bash-bg").execute("call-1", { command: "true" }, undefined, undefined, ctx);
 	await new Promise((resolve) => setTimeout(resolve, 20));
 	assert.match((await tools.get("bg").execute("call-2", { action: "list" })).content[0].text, /共 0 个在跑 \/ 1 条已完成/);
 
+	// rebindCurrentSession 会在同一 runner 上二次触发 session_start
 	await handlers.get("session_start")!({ type: "session_start" }, {});
+	assert.equal(captured.length, registeredCount, "重入不该重复注册工具");
 	assert.match((await tools.get("bg").execute("call-3", { action: "list" })).content[0].text, /没有后台任务/);
+});
+
+// ─── bg wait ───
+
+test("bg wait 等到结果，且不再回传", async () => {
+	const { tools, sent } = setup();
+	let resolveRun!: (value: unknown) => void;
+	const ctx = {
+		executeTool: () =>
+			new Promise<any>((resolve) => {
+				resolveRun = resolve;
+			}),
+	};
+	const started = await tools.get("bash-bg").execute("call-1", { command: "sleep 1" }, undefined, undefined, ctx);
+	const id = started.details.jobs[0].id;
+
+	const waiting = tools.get("bg").execute("call-2", { action: "wait", id }, undefined);
+	// 给 waitFor 一个机会先把 waiter 挂上
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	resolveRun(outcome("bash", "waited!", { exit_code: 0 }));
+
+	const result = await waiting;
+	assert.match(result.content[0].text, /waited!/);
+	assert.match(result.content[0].text, new RegExp(`\\[bash-bg ${id}\\]`));
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(sent.length, 0, "wait 接过结果后不该再回传");
+});
+
+test("bg wait 对已回传的任务只给状态，不重复输出", async () => {
+	const { tools, sent } = setup();
+	const ctx = { executeTool: async (name: string) => outcome(name, "already-sent", { exit_code: 0 }) };
+	const started = await tools.get("bash-bg").execute("call-1", { command: "true" }, undefined, undefined, ctx);
+	const id = started.details.jobs[0].id;
+	await until(() => sent.length === 1);
+
+	const result = await tools.get("bg").execute("call-2", { action: "wait", id }, undefined);
+	assert.match(result.content[0].text, /delivered as a separate message; read it there instead of repeating it here/);
+	assert.doesNotMatch(result.content[0].text, /already-sent/);
+	assert.equal(sent.length, 1, "不该再回传一次");
+});
+
+test("bg wait 省略 id 时等全部在跑任务", async () => {
+	const { tools } = setup();
+	const resolvers: Array<(value: unknown) => void> = [];
+	const ctx = {
+		executeTool: () =>
+			new Promise<any>((resolve) => {
+				resolvers.push(resolve);
+			}),
+	};
+	await tools.get("bash-bg").execute("call-1", { command: "a" }, undefined, undefined, ctx);
+	await tools.get("bash-bg").execute("call-2", { command: "b" }, undefined, undefined, ctx);
+
+	const waiting = tools.get("bg").execute("call-3", { action: "wait" }, undefined);
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	for (const resolve of resolvers) resolve(outcome("bash", "ok", { exit_code: 0 }));
+
+	const result = await waiting;
+	assert.equal(result.details.jobs.length, 2);
+	assert.match(result.content[0].text, /ok/);
+});
+
+test("bg wait 被中止时任务继续跑，结果仍回传", async () => {
+	const { tools, sent } = setup();
+	let resolveRun!: (value: unknown) => void;
+	const ctx = {
+		executeTool: () =>
+			new Promise<any>((resolve) => {
+				resolveRun = resolve;
+			}),
+	};
+	const started = await tools.get("bash-bg").execute("call-1", { command: "sleep 1" }, undefined, undefined, ctx);
+	const id = started.details.jobs[0].id;
+
+	const parent = new AbortController();
+	const waiting = tools.get("bg").execute("call-2", { action: "wait", id }, parent.signal);
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	parent.abort();
+
+	const result = await waiting;
+	assert.match(result.details.error!, /wait aborted/);
+
+	// 取消的只是「等」，任务照跑，结果仍会作为消息到达
+	resolveRun(outcome("bash", "finally!", { exit_code: 0 }));
+	await until(() => sent.length === 1);
+	assert.match(sent[0]!.message.content, /finally!/);
 });

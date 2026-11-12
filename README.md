@@ -17,7 +17,7 @@
 | [pi-context](extensions/pi-context.ts) | `/context` 触发一次空转请求，导出这次请求的系统提示词与工具声明（含 codemode 动态描述），两者同源 |
 | [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron <间隔> [once] <prompt>`、`/cron list`、`/cron delete [id]` |
 | [pi-btw](extensions/pi-btw.ts) | 顺带分派：仅在 herdr / herdr app 环境注册 `/btw <消息>`，新开一个标签，fork 当前会话启动 pi 并把消息作为首条消息递交 |
-| [pi-bg](extensions/pi-bg.ts) | 后台运行：`bash-bg` / `codemode-bg` 立即返回，结束后把结果作为消息发回会话；`bg` 工具与 `/bg` 命令查看/终止 |
+| [pi-bg](extensions/pi-bg.ts) | 后台运行：`bash-bg` / `codemode-bg` 立即返回，结束后把结果作为消息发回会话；`bg` 工具与 `/bg` 命令查看/终止/等候，并与内置工具的启用状态联动 |
 
 `/balance codex` 需要先通过 `/login openai-codex` 登录 ChatGPT Plus/Pro 订阅。`/balance opencode` 查 OpenCode Go 的 5 小时/周/月额度，需要先配置 `opencode-go` 的 API Key。
 
@@ -91,9 +91,12 @@ node --test 'tests/herdr.test.ts' 'tests/pi-btw.test.ts'
 - 启动立刻返回，结果**不**出现在 tool result 里，而是任务结束时以自定义消息 `pi-bg` 回传：头行 `[bash-bg b3f1a2c4] npm test — done · exit 0 · 12s`，空行后是内置工具的原样输出（空输出为 `(no output)`）。
 - 回传走 `pi.sendMessage(..., { deliverAs: "steer", triggerTurn: true })`：不打断当前 LLM 调用，当前 turn 的工具跑完、下次调用前投递；agent 空闲时立刻起一轮。与 [@tintinweb/pi-subagents](https://www.npmjs.com/package/@tintinweb/pi-subagents) 的后台 Agent 同一通道。
 - 后台任务受**自己的** `AbortController` 约束。发起它的 tool call 被 Esc 中断不会连坐杀掉后台任务。
-- `bg` 工具与 `/bg` 命令：列出在跑任务与最近 20 条已完成记录；`bg kill <id>`（或 `/bg kill`）中止任务，连带杀掉它的进程树。同时最多 64 个任务，超出直接拒绝。
-- 存续域是**进程级**：`session_shutdown`（含 `/reload`）中止全部在跑任务，`/new` 之后任务表只保留在跑条目。已完成但未回传的结果随会话一起消失，与 pi-cron 同一取舍（[ADR-0001](docs/adr/0001-cron-tasks-are-process-scoped.md)）。
-- **Windows + Git Bash 的已知边界**：pi 的 `killProcessTree` 在 Windows 上用 `taskkill /F /T <pid>`，而 MSYS 子进程（`sleep`、`grep` 这类）在 Windows 记录的父进程并不是 bash，所以中止后可能残留孤儿进程。对前台 `bash` 调用按 Esc 是**完全一样**的行为，不是 pi-bg 引入的；`bg kill` 的"已终止"保证的是本次会话不再回传、内置工具已收到 abort。
+- `bg` 工具与 `/bg` 命令：列出在跑任务与最近 20 条已完成记录；`bg kill <id>`（或 `/bg kill`）中止任务，连带杀掉它的进程树；`bg wait [id]` 阻塞到任务结束并**直接返回输出**（省略 id 则等全部在跑任务）。同时最多 64 个任务，超出直接拒绝。
+- `bg wait` 在任务**完成前**发起时，结果直接进 tool result，不再作为消息回传；任务**已经回传过**时，`wait` 只给状态，不重复输出（模型必须先拿到 id 才能 wait，两次调用必然跨轮，所以后者是常态）。父轮 Esc 取消的只是「等」这个动作，任务照跑，结果仍会作为消息到达。
+- **与内置工具的启用状态联动**：三个工具都在 `session_start` 里注册，注册前读 `getActiveTools()`。`bash` 未启用就根本不注册 `bash-bg`，`codemode` 未启用就不注册 `codemode-bg`，两个都未启用就连 `bg` 也不注册。schema 直接复用 `getAllTools()` 里内置工具的那一份，所以 pi 给内置工具加参数时这里不用跟。`prepareLoadout` 只兜「会话中途被 `setActiveTools` 关掉」这条快照覆盖不到的路径。
+- **存续域与会话绑定**：`/new`、`/reload`、`/resume`、`/fork`、退出都会触发 `session_shutdown`，一律中止全部在跑任务；`/new` 与 `/reload` 还会重建扩展实例，任务表随之清空。已完成但未回传的结果随会话一起消失，与 pi-cron 同一取舍（[ADR-0001](docs/adr/0001-cron-tasks-are-process-scoped.md)）。
+- **缓存稳定性**：三个工具在首次 `session_start` 注册一次（幂等守卫挡住 `rebindCurrentSession` 的二次触发），`description` / `promptSnippet` / `parameters` 全部确定，`prepareLoadout` 是纯函数，所以一局会话内系统提示词、工具列表与顺序都不变。`session_shutdown` 不区分 reason，五种理由都是「离开这个会话」。
+- **Windows + Git Bash 的不保证项**：pi 的 `killProcessTree` 在 Windows 上用 `taskkill /F /T <pid>`，而 MSYS 子进程（`sleep`、`grep` 这类）在 Windows 记录的父进程并不是 bash，所以中止后可能残留孤儿进程。对前台 `bash` 调用按 Esc 是**完全一样**的行为，不是 pi-bg 引入的。所以 `/new` 与 `bg kill` 保证的是「本次会话不再回传、内置执行已收到 abort」，**不是**「进程一定被杀死」——这个保证在 Windows + MSYS 上是弱的。
 
 回归测试（Node.js 24+）：
 

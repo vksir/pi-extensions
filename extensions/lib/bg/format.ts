@@ -31,10 +31,10 @@ export function statusText(job: BgJob): string {
 	return parts.join(" · ");
 }
 
-/** 启动成功的工具返回：告知 id、结果回传方式与进程级存续域。 */
+/** 启动成功的工具返回：告知 id、结果回传方式与会话绑定的存续域。 */
 export function startText(job: BgJob): string {
 	const what = job.label ? ` (${job.label})` : "";
-	return `Started background job ${job.id}${what}. Its output arrives as a message when it finishes; use bg list to inspect it or bg kill to stop it. Background jobs are process-scoped and are cleared when pi exits.`;
+	return `Started background job ${job.id}${what}. Its output arrives as a message when it finishes; use \`bg wait ${job.id}\` to block for it, \`bg list\` to inspect, or \`bg kill\` to stop it. Background jobs end with the session: /new, /reload, and exit stop them.`;
 }
 
 /** 完成消息的正文：头行 + 内置工具的原样输出。 */

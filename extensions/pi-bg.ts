@@ -1,11 +1,11 @@
 /**
  * pi-bg —— 后台运行的 bash 与 codemode
  *
- * 三个工具 + 一个人工入口：
- *   bash-bg {command, timeout?}      bash 的后台版本
- *   codemode-bg {code}               codemode 的后台版本
- *   bg {action: list | kill, id?}    查看 / 终止
- *   /bg [kill <id>]                  人工入口，0 常驻
+ * 三个工具 + 一个人工入口，全部与内置工具的启用状态联动：
+ *   bash-bg {command, timeout?}           bash 的后台版本
+ *   codemode-bg {code}                    codemode 的后台版本
+ *   bg {action: list | kill | wait, id?}  查看 / 终止 / 等候
+ *   /bg [kill <id>]                       人工入口，0 常驻
  *
  * 两个后台工具都是**薄壳**，执行一律委托内置实现（ADR-0006）：
  *   - bash-bg 走 `ctx.executeTool("bash", ...)`；
@@ -13,16 +13,33 @@
  *     `model-only`，`ctx.executeTool` 根本调不到它（只认 direct / codemode / deferred），
  *     而 pi 只导出工厂、不导出沙箱，所以用一个吞掉 `registerTool` 的 shim 把真定义接住。
  *
- * 完成回传走 `pi.sendMessage(..., { deliverAs: "steer", triggerTurn: true })`，
- * 与 Agent 后台模式同一通道：当前 turn 的工具跑完、下次 LLM 调用前投递；
- * agent 空闲时立刻起一轮。绝不把工具入参的 signal 传给后台任务——父轮 Esc 会连坐。
+ * 启用联动：三个工具都在 `session_start` 里注册，注册前读 `getActiveTools()`——bash /
+ * codemode 未启用就根本不注册；schema 直接复用 `getAllTools()` 里内置工具的那一份，所以
+ * pi 给内置工具加参数时这里不用跟。`prepareLoadout` 只兜「会话中途被 setActiveTools 关掉」
+ * 这条 `session_start` 快照覆盖不到的路径。
  *
- * 存续域是进程级：`session_shutdown`（含 `/reload`）kill 全部在跑任务，
- * 所以任务表是模块级变量，不需要 globalThis 那个跨 reload 载体。
+ * 完成回传走 `pi.sendMessage(..., { deliverAs: "steer", triggerTurn: true })`，
+ * 与 Agent 后台模式同一通道：当前 turn 的工具跑完、下次 LLM 调用前投递；agent 空闲时立刻起一轮。
+ * 绝不把工具入参的 signal 传给后台任务——父轮 Esc 会连坐。`bg wait` 接过结果时不再回传，
+ * 避免同一份输出出现两次。
+ *
+ * 存续域与会话绑定：`/new`、`/reload`、`/resume`、`/fork`、退出都会触发 `session_shutdown`，
+ * 一律 abort 在跑任务；`/new` 与 `/reload` 还会重建扩展实例，任务表随之清空。唯一不伴随
+ * shutdown 的 `session_start` 来自 `rebindCurrentSession`（同一会话内重绑定），那里保留在跑
+ * 任务才是对的。
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
-import { createCodemodeExtension, type ExtensionAPI, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+	createCodemodeExtension,
+	type AgentToolResult,
+	type ExtensionAPI,
+	type ExtensionToolContext,
+	type Theme,
+	type ToolDefinition,
+	type ToolLoadout,
+	type ToolRenderResultOptions,
+} from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
@@ -36,7 +53,13 @@ import {
 	runningJobs,
 	summarizeLabel,
 } from "./lib/bg/jobs.ts";
-import { deliveryContent, formatListLines, splitDelivery, startText, statusText } from "./lib/bg/format.ts";
+import {
+	deliveryContent,
+	formatListLines,
+	splitDelivery,
+	startText,
+	statusText,
+} from "./lib/bg/format.ts";
 import { renderLineBox, type EntryLine } from "./lib/render.ts";
 import { truncate } from "./lib/text.ts";
 
@@ -51,9 +74,13 @@ interface JobOutcome {
 	isError: boolean;
 }
 
-/** 在跑任务额外握着中止句柄；`bg kill` 与退出清理都走它。 */
+/** 在跑任务额外握着中止句柄与等待者；`bg kill`、`session_shutdown`、`bg wait` 都走它们。 */
 interface LiveJob extends BgJob {
 	controller: AbortController;
+	/** 等这个任务结束的回调；非空时不回传，由等待方直接取结果。 */
+	waiters: Array<() => void>;
+	/** 结果是否已经交给模型（作为自定义消息回传，或被 `bg wait` 接过）；避免同一份输出出现两次。 */
+	delivered: boolean;
 }
 
 interface BgMessageDetails {
@@ -64,10 +91,12 @@ interface BgMessageDetails {
 	text: string;
 }
 
+type BgJobSnapshot = { id: string; kind: BgKind; label: string; status: BgJob["status"]; text: string };
+
 interface BgToolDetails {
-	action: "list" | "kill";
+	action: "list" | "kill" | "wait";
 	error?: string;
-	jobs?: Array<{ id: string; kind: BgKind; label: string; status: BgJob["status"]; text: string }>;
+	jobs?: BgJobSnapshot[];
 }
 
 interface BgInfoEntry {
@@ -108,17 +137,23 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 	const jobs: LiveJob[] = [];
 	/** 会话已关闭：此后不再回传（任务本身在此期间被 kill） */
 	let closed = false;
+	/** 工具是否已经注册过；`bindExtensions()` 可在同一 runner 上二次触发 session_start。 */
+	let registered = false;
 
 	pi.on("session_start", () => {
 		closed = false;
-		// 新会话从干净的任务表开始：上一个会话遗留的已完成 / 已终止记录不再有意义
+		// 只在「不伴随 session_shutdown 的重绑定」路径上有意义（rebindCurrentSession）：
+		// 真正的会话切换会重建扩展实例，任务表本来就是空的。
 		for (let index = jobs.length - 1; index >= 0; index -= 1) {
 			if (jobs[index]!.status !== "running") jobs.splice(index, 1);
 		}
+		if (registered) return;
+		registered = true;
+		registerTools();
 	});
 
-	// 进程退出与 /reload 都走这里：尽力中止在跑任务（Windows 上 MSYS 子里程可能残留，
-	// 与前台 bash 按 Esc 同一行为，见 README 与 ADR-0006）。
+	// 五种 reason 都是「离开这个会话」：/new、/reload、/resume、/fork、quit。
+	// 一律尽力中止在跑任务（Windows 上 MSYS 子里程可能残留，与前台 bash 按 Esc 同一行为）。
 	pi.on("session_shutdown", () => {
 		closed = true;
 		for (const job of jobs) {
@@ -136,6 +171,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 
 	function deliver(job: LiveJob): void {
 		if (closed) return;
+		job.delivered = true;
 		pi.sendMessage<BgMessageDetails>(
 			{
 				customType: CUSTOM_TYPE,
@@ -152,6 +188,36 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 			// 与 Agent 后台模式一致：不打断当前 LLM 调用，工具跑完、下次调用前投递；空闲则立刻起一轮
 			{ deliverAs: "steer", triggerTurn: true },
 		);
+	}
+
+	/**
+	 * 等一个任务结束。只受传入的 signal 约束，**不会**中止任务本身：
+	 * 父轮 Esc 取消的是「等」这个动作，后台任务照跑，结果仍会回传。
+	 */
+	function waitFor(job: LiveJob, signal: AbortSignal | undefined): Promise<void> {
+		if (job.status !== "running") return Promise.resolve();
+		return new Promise<void>((resolve, reject) => {
+			let settled = false;
+			const onFinished = (): void => {
+				if (settled) return;
+				settled = true;
+				signal?.removeEventListener("abort", onAbort);
+				const index = job.waiters.indexOf(onFinished);
+				if (index >= 0) job.waiters.splice(index, 1);
+				resolve();
+			};
+			const onAbort = (): void => {
+				if (settled) return;
+				settled = true;
+				signal?.removeEventListener("abort", onAbort);
+				const index = job.waiters.indexOf(onFinished);
+				if (index >= 0) job.waiters.splice(index, 1);
+				reject(new Error("wait aborted"));
+			};
+			job.waiters.push(onFinished);
+			if (signal?.aborted) onAbort();
+			else signal?.addEventListener("abort", onAbort, { once: true });
+		});
 	}
 
 	/**
@@ -173,6 +239,8 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 			startedAt: Date.now(),
 			status: "running",
 			controller,
+			waiters: [],
+			delivered: false,
 		};
 		jobs.push(job);
 		pruneFinished(jobs, KEEP_FINISHED);
@@ -191,12 +259,232 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 				job.output = errorText(error);
 			} finally {
 				job.durationMs = Date.now() - startedAt;
-				// 被 kill 的任务不回传：动手的人已经拿到 bg kill 的结果
-				if (job.status === "done" || job.status === "failed") deliver(job);
+				const waiters = job.waiters.splice(0);
+				if (waiters.length > 0) {
+					// `bg wait` 正在等：结果由它的 tool result 交付，不再回传一遍
+					for (const resolve of waiters) resolve();
+				} else if (job.status === "done" || job.status === "failed") {
+					// 被 kill 的任务不回传：动手的人已经拿到 bg kill 的结果
+					deliver(job);
+				}
 			}
 		})();
 
 		return job;
+	}
+
+	const fail = (action: BgToolDetails["action"], message: string) => ({
+		content: [{ type: "text" as const, text: `Error: ${message}` }],
+		details: { action, error: message } as BgToolDetails,
+	});
+
+	const limited = () =>
+		fail(
+			"list",
+			`too many background jobs (max ${MAX_RUNNING}). Wait for one to finish or stop one with bg kill.`,
+		);
+
+	const startedReply = (job: LiveJob) => ({
+		content: [{ type: "text" as const, text: startText(job) }],
+		details: { action: "list" as const, jobs: [snapshot(job)] },
+	});
+
+	// ─── 工具注册（session_start，跟着启用状态走） ───
+
+	function registerTools(): void {
+		const all = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
+		const active = new Set(pi.getActiveTools());
+
+		// bash 的 schema 与执行都来自注册表；codemode 的 execute 只有 shim 有，所以 schema
+		// 也用 shim 那份，保证同源（`ctx.executeTool` 调不到 model-only 的 codemode）。
+		const bash = active.has("bash") ? all.get("bash") : undefined;
+		const codemodeBackend = active.has("codemode") ? codemode : undefined;
+
+		if (bash) {
+			pi.registerTool({
+				name: "bash-bg",
+				label: "Bash (background)",
+				description:
+					"Run a bash command in the background. Returns immediately; the command's output arrives as a message when it finishes.",
+				promptSnippet: "Run a bash command in the background",
+				// 直接复用内置工具的 schema：pi 给 bash 加参数时这里自动跟上
+				parameters: bash.parameters,
+				prepareLoadout: hideWhenUnavailable("bash", "bash-bg"),
+
+				async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+					const input = params as { command: string; timeout?: number };
+					const job = start("bash", summarizeLabel(input.command), async (signal) => {
+						const outcome = await ctx.executeTool("bash", input, { signal });
+						return { result: outcome.result, isError: outcome.isError };
+					});
+					if (!job) return limited();
+					return startedReply(job);
+				},
+
+				renderCall(args, theme) {
+					const input = args as { command?: string };
+					return new Text(
+						theme.fg("toolTitle", theme.bold("bash-bg ")) + theme.fg("muted", truncate(input.command ?? "", 60)),
+						0,
+						0,
+					);
+				},
+
+				renderResult: renderStarted,
+			});
+		}
+
+		if (codemodeBackend) {
+			pi.registerTool({
+				name: "codemode-bg",
+				label: "Codemode (background)",
+				description:
+					"Run a codemode script in the background. Returns immediately; the script's result arrives as a message when it finishes.",
+				promptSnippet: "Run a codemode script in the background",
+				parameters: codemodeBackend.parameters,
+				prepareLoadout: hideWhenUnavailable("codemode", "codemode-bg"),
+
+				async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+					const input = params as { code: string };
+					const job = start("codemode", summarizeLabel(input.code), async (signal) => {
+						const result = await codemodeBackend.execute(toolCallId, input, signal, undefined, ctx);
+						return { result, isError: result.isError === true };
+					});
+					if (!job) return limited();
+					return startedReply(job);
+				},
+
+				renderCall(args, theme) {
+					const input = args as { code?: string };
+					return new Text(
+						theme.fg("toolTitle", theme.bold("codemode-bg ")) + theme.fg("muted", truncate(input.code ?? "", 60)),
+						0,
+						0,
+					);
+				},
+
+				renderResult: renderStarted,
+			});
+		}
+
+		// 没有任何后端可用时它毫无意义，所以一起联动。
+		if (!bash && !codemodeBackend) return;
+
+		pi.registerTool({
+			name: "bg",
+			label: "Background jobs",
+			description: "List, stop, or wait for background jobs started by bash-bg and codemode-bg.",
+			promptSnippet: "List, stop, or wait for background jobs",
+			parameters: Type.Object({
+				action: StringEnum(["list", "kill", "wait"] as const, {
+					description:
+						"list: show background jobs. kill: stop a running job by id. wait: block until a job finishes and return its output.",
+				}),
+				id: Type.Optional(
+					Type.String({ description: "Background job id. Required for kill; optional for wait (default: all running jobs)." }),
+				),
+			}),
+			prepareLoadout: hideWhenUnavailable(["bash", "codemode"], "bg", "any"),
+
+			async execute(_toolCallId, params, signal) {
+				if (params.action === "kill") {
+					if (!params.id) return fail("kill", "id is required for kill.");
+					const job = findJob(jobs, params.id);
+					if (!job) return fail("kill", `no background job with id '${params.id}'.`);
+					if (job.status !== "running") {
+						return {
+							content: [
+								{ type: "text" as const, text: `Background job ${job.id} had already finished (${statusText(job)}).` },
+							],
+							details: { action: "kill" as const },
+						};
+					}
+					kill(job, "killed");
+					return {
+						content: [{ type: "text" as const, text: `Killed background job ${job.id}.` }],
+						details: { action: "kill" as const },
+					};
+				}
+
+				if (params.action === "wait") {
+					const targets: LiveJob[] = [];
+					if (params.id) {
+						const job = findJob(jobs, params.id);
+						if (!job) return fail("wait", `no background job with id '${params.id}'.`);
+						targets.push(job);
+					} else {
+						targets.push(...runningJobs(jobs));
+						if (targets.length === 0) {
+							return {
+								content: [{ type: "text" as const, text: "No background job is running." }],
+								details: { action: "wait" as const },
+							};
+						}
+					}
+
+					try {
+						await Promise.all(targets.map((job) => waitFor(job, signal)));
+					} catch {
+						// 只有父轮 Esc 会走到这里；任务本身不受影响，结果仍会作为消息到达
+						return fail(
+							"wait",
+							"wait aborted. The background job keeps running; its output still arrives as a message when it finishes.",
+						);
+					}
+
+					// 已经回传过的任务不再输出一遍：模型必须先拿到 id 才能 wait，两次调用必然跨轮，
+					// 任务往往在那之前就完成了，重复输出只会浪费上下文。
+					const text = targets
+						.map((job) => {
+							if (job.delivered) {
+								return `[${job.kind}-bg ${job.id}] ${job.label} — ${statusText(job)}\n\nThe output was delivered as a separate message; read it there instead of repeating it here.`;
+							}
+							job.delivered = true;
+							return deliveryContent(job);
+						})
+						.join("\n\n");
+
+					return {
+						content: [{ type: "text" as const, text }],
+						details: { action: "wait" as const, jobs: targets.map(snapshot) },
+					};
+				}
+
+				return {
+					content: [{ type: "text" as const, text: formatListLines(jobs).join("\n") }],
+					details: { action: "list" as const, jobs: jobs.map(snapshot) },
+				};
+			},
+
+			renderCall(args, theme) {
+				let text = theme.fg("toolTitle", theme.bold("bg ")) + theme.fg("muted", args.action);
+				if (args.id) text += ` ${theme.fg("accent", args.id)}`;
+				return new Text(text, 0, 0);
+			},
+
+			renderResult(result, { expanded }, theme) {
+				const details = result.details as BgToolDetails | undefined;
+				if (details?.error) return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
+				const first = result.content[0];
+				const text = first?.type === "text" ? first.text : "";
+
+				if (details?.action === "list" && (details.jobs?.length ?? 0) > 0 && !expanded) {
+					const shown = details.jobs!.slice(0, 5);
+					const head = theme.fg("muted", `${details.jobs!.length} background job(s):`);
+					const rows = shown.map(
+						(job) =>
+							`${theme.fg("accent", job.id)} ${theme.fg("muted", job.kind)} ${theme.fg("dim", job.text)} ${theme.fg("muted", truncate(job.label, 40))}`,
+					);
+					const more =
+						details.jobs!.length > shown.length
+							? `\n${theme.fg("dim", `... ${details.jobs!.length - shown.length} more`)}`
+							: "";
+					return new Text([head, ...rows].join("\n") + more, 0, 0);
+				}
+
+				return new Text(theme.fg("muted", text), 0, 0);
+			},
+		});
 	}
 
 	// ─── /bg 命令（人工入口） ───
@@ -295,187 +583,54 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 		if (body) box.addChild(new Text(body, 0, 0));
 		return box;
 	});
+}
 
-	// ─── 工具 ───
+// ─── 启用联动 ───
 
-	const fail = (action: BgToolDetails["action"], message: string) => ({
-		content: [{ type: "text" as const, text: `Error: ${message}` }],
-		details: { action, error: message } as BgToolDetails,
-	});
-
-	const limited = () =>
-		fail(
-			"list",
-			`too many background jobs (max ${MAX_RUNNING}). Wait for one to finish or stop one with bg kill.`,
-		);
-
-	pi.registerTool({
-		name: "bash-bg",
-		label: "Bash (background)",
-		description:
-			"Run a bash command in the background. Returns immediately; the command's output arrives as a message when it finishes.",
-		promptSnippet: "Run a bash command in the background",
-		parameters: Type.Object({
-			command: Type.String({ description: "Shell command to execute" }),
-			timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
-		}),
-
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const label = summarizeLabel(params.command);
-			const job = start("bash", label, async (signal) => {
-				const outcome = await ctx.executeTool(
-					"bash",
-					params.timeout === undefined ? { command: params.command } : { command: params.command, timeout: params.timeout },
-					{ signal },
-				);
-				return { result: outcome.result, isError: outcome.isError };
-			});
-			if (!job) return limited();
-			return {
-				content: [{ type: "text" as const, text: startText(job) }],
-				details: { action: "list" as const, jobs: [{ id: job.id, kind: job.kind, label: job.label, status: job.status, text: statusText(job) }] },
-			};
-		},
-
-		renderCall(args, theme) {
-			return new Text(theme.fg("toolTitle", theme.bold("bash-bg ")) + theme.fg("muted", truncate(args.command, 60)), 0, 0);
-		},
-
-		renderResult(result, _options, theme) {
-			const details = result.details as BgToolDetails | undefined;
-			if (details?.error) return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
-			const job = details?.jobs?.[0];
-			const first = result.content[0];
-			const text = first?.type === "text" ? first.text : "";
-			return new Text(
-				job ? `${theme.fg("accent", job.id)} ${theme.fg("muted", "started in background")}` : theme.fg("muted", text),
-				0,
-				0,
-			);
-		},
-	});
-
-	pi.registerTool({
-		name: "codemode-bg",
-		label: "Codemode (background)",
-		description:
-			"Run a codemode script in the background. Returns immediately; the script's result arrives as a message when it finishes.",
-		promptSnippet: "Run a codemode script in the background",
-		parameters: Type.Object({
-			code: Type.String({ description: "Raw JavaScript source." }),
-		}),
-
-		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-			const label = summarizeLabel(params.code);
-			if (!codemode) {
-				return fail("list", "codemode backend unavailable: this pi build does not export createCodemodeExtension().");
-			}
-			const job = start("codemode", label, async (signal) => {
-				const result = await codemode.execute(toolCallId, { code: params.code }, signal, undefined, ctx);
-				return { result, isError: result.isError === true };
-			});
-			if (!job) return limited();
-			return {
-				content: [{ type: "text" as const, text: startText(job) }],
-				details: { action: "list" as const, jobs: [{ id: job.id, kind: job.kind, label: job.label, status: job.status, text: statusText(job) }] },
-			};
-		},
-
-		renderCall(args, theme) {
-			return new Text(theme.fg("toolTitle", theme.bold("codemode-bg ")) + theme.fg("muted", truncate(args.code, 60)), 0, 0);
-		},
-
-		renderResult(result, _options, theme) {
-			const details = result.details as BgToolDetails | undefined;
-			if (details?.error) return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
-			const job = details?.jobs?.[0];
-			const first = result.content[0];
-			const text = first?.type === "text" ? first.text : "";
-			return new Text(
-				job ? `${theme.fg("accent", job.id)} ${theme.fg("muted", "started in background")}` : theme.fg("muted", text),
-				0,
-				0,
-			);
-		},
-	});
-
-	pi.registerTool({
-		name: "bg",
-		label: "Background jobs",
-		description: "List or stop background jobs started by bash-bg and codemode-bg.",
-		promptSnippet: "List or stop background jobs",
-		parameters: Type.Object({
-			action: StringEnum(["list", "kill"] as const, {
-				description: "list: show background jobs. kill: stop a running job by id.",
-			}),
-			id: Type.Optional(Type.String({ description: "Background job id. Required for kill." })),
-		}),
-
-		async execute(_toolCallId, params) {
-			if (params.action === "kill") {
-				if (!params.id) return fail("kill", "id is required for kill.");
-				const job = findJob(jobs, params.id);
-				if (!job) return fail("kill", `no background job with id '${params.id}'.`);
-				if (job.status !== "running") {
-					return {
-						content: [{ type: "text" as const, text: `Background job ${job.id} had already finished (${statusText(job)}).` }],
-						details: { action: "kill" as const },
-					};
-				}
-				kill(job, "killed");
-				return {
-					content: [{ type: "text" as const, text: `Killed background job ${job.id}.` }],
-					details: { action: "kill" as const },
-				};
-			}
-
-			return {
-				content: [{ type: "text" as const, text: formatListLines(jobs).join("\n") }],
-				details: {
-					action: "list" as const,
-					jobs: jobs.map((job) => ({
-						id: job.id,
-						kind: job.kind,
-						label: job.label,
-						status: job.status,
-						text: statusText(job),
-					})),
-				},
-			};
-		},
-
-		renderCall(args, theme) {
-			let text = theme.fg("toolTitle", theme.bold("bg ")) + theme.fg("muted", args.action);
-			if (args.id) text += ` ${theme.fg("accent", args.id)}`;
-			return new Text(text, 0, 0);
-		},
-
-		renderResult(result, { expanded }, theme) {
-			const details = result.details as BgToolDetails | undefined;
-			if (details?.error) return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
-			const first = result.content[0];
-			const text = first?.type === "text" ? first.text : "";
-
-			if (details?.action === "list" && (details.jobs?.length ?? 0) > 0 && !expanded) {
-				const shown = details.jobs!.slice(0, 5);
-				const head = theme.fg("muted", `${details.jobs!.length} background job(s):`);
-				const rows = shown.map(
-					(job) =>
-						`${theme.fg("accent", job.id)} ${theme.fg("muted", job.kind)} ${theme.fg("dim", job.text)} ${theme.fg("muted", truncate(job.label, 40))}`,
-				);
-				const more =
-					details.jobs!.length > shown.length
-						? `\n${theme.fg("dim", `... ${details.jobs!.length - shown.length} more`)}`
-						: "";
-				return new Text([head, ...rows].join("\n") + more, 0, 0);
-			}
-
-			return new Text(theme.fg("muted", text), 0, 0);
-		},
-	});
+/**
+ * 内置工具离开 active 集合时，把本工具从请求的声明里移除。
+ *
+ * 只是「模型看不见」，工具仍然 active、仍能被 `ctx.executeTool` 与 codemode 脚本调到——
+ * 这正好覆盖 `session_start` 快照管不到的那条路径（会话中途被 `setActiveTools` 关掉）。
+ * `any` 表示任意一个名字在 declared 里就保留。
+ */
+function hideWhenUnavailable(
+	source: string | readonly string[],
+	self: string,
+	mode: "all" | "any" = "all",
+): (loadout: ToolLoadout) => { hiddenDeclarations: string[] } | undefined {
+	const names = typeof source === "string" ? [source] : source;
+	return (loadout) => {
+		const declared = new Set(loadout.declared.map((tool) => tool.name));
+		const available =
+			mode === "any" ? names.some((name) => declared.has(name)) : names.every((name) => declared.has(name));
+		return available ? undefined : { hiddenDeclarations: [self] };
+	};
 }
 
 // ─── 结果解析 ───
+
+function snapshot(job: BgJob): BgJobSnapshot {
+	return { id: job.id, kind: job.kind, label: job.label, status: job.status, text: statusText(job) };
+}
+
+/** bash-bg / codemode-bg 共用的结果渲染：只显示 id，正文在完成消息里。 */
+function renderStarted(
+	result: AgentToolResult<BgToolDetails | undefined>,
+	_options: ToolRenderResultOptions,
+	theme: Theme,
+): Text {
+	const details = result.details;
+	if (details?.error) return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
+	const job = details?.jobs?.[0];
+	const first = result.content[0];
+	const text = first?.type === "text" ? first.text : "";
+	return new Text(
+		job ? `${theme.fg("accent", job.id)} ${theme.fg("muted", "started in background")}` : theme.fg("muted", text),
+		0,
+		0,
+	);
+}
 
 function resultText(result: ToolOutcome["result"]): string {
 	const parts = (result.content ?? [])

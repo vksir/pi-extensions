@@ -2,7 +2,7 @@
  * pi-bg 的任务表：纯数据与纯函数。
  *
  * 这里不碰 pi、不碰进程、不碰时钟之外的东西，便于直接跑 node --test。
- * 任务表本身是扩展模块级变量：`session_shutdown`（含 `/reload` 的 reason:"reload"）
+ * 任务表本身是扩展模块级变量：`session_shutdown`（`/new`、`/reload`、`/resume`、`/fork`、确认退出）
  * 会 kill 掉全部在跑任务，因此不需要 globalThis 那个跨 reload 载体（对比 ADR-0001）。
  */
 

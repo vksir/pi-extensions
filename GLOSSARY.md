@@ -108,6 +108,22 @@ _Avoid_: 异步任务、后台进程、job、subprocess
 后台任务结束时把输出作为 `pi-bg` 自定义消息投递给会话的动作；投递点是当前 turn 的工具跑完、下一次 LLM 调用之前，agent 空闲时立刻起一轮。被 `bg kill` 终止的任务不回传。
 _Avoid_: 通知、回调、推送、notify
 
+**交付 (bg delivery state)**：
+一份输出是“只到达一次”的状态：要么作为 `pi-bg` 消息回传，要么被 `bg wait` 的 tool result 接过。后到的 `bg wait` 只报状态，不重复输出。
+_Avoid_: 消费、去重、已读
+
+**等候 (bg wait)**：
+`bg wait [id]` 阻塞到任务结束、直接把原样输出放进 tool result 的动作；省略 id 则等全部在跑任务。父轮 Esc 取消的只是「等」，任务照跑、结果仍会回传。
+_Avoid_: 轮询、poll、join、同步等待
+
+**启用联动 (availability)**：
+三个后台工具都跟着内置工具的启用状态走：`bash` 未启用就不注册 `bash-bg`，两个后端都未启用就连 `bg` 也不注册。schema 复用 `getAllTools()` 里内置工具的那一份，所以不是「功能相同」的承诺，而是同一份声明。
+_Avoid_: 动态开关、条件注册、feature flag
+
 **委托 (delegation)**：
 后台工具把执行交给内置 `bash` / `codemode` 完成的做法——后台工具只是外壳，不重新实现命令执行、截断与沙箱（见 ADR-0006）。
 _Avoid_: 包装、转发、代理、wrap
+
+**存续域 (lifetime)**：
+后台任务只活在当前会话里：`/new`、`/reload`、`/resume`、`/fork`、退出都中止全部在跑任务。
+_Avoid_: 进程级、全局、persistent
