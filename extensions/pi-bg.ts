@@ -32,6 +32,7 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	createCodemodeExtension,
+	keyHint,
 	type AgentToolResult,
 	type ExtensionAPI,
 	type ExtensionToolContext,
@@ -321,10 +322,11 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 					return startedReply(job);
 				},
 
-				renderCall(args, theme) {
+				renderCall(args, theme, context) {
 					const input = args as { command?: string };
 					return new Text(
-						theme.fg("toolTitle", theme.bold("bash-bg ")) + theme.fg("muted", truncate(input.command ?? "", 60)),
+						theme.fg("toolTitle", theme.bold("bash-bg ")) +
+							theme.fg("muted", previewArg(input.command ?? "", context.expanded, theme)),
 						0,
 						0,
 					);
@@ -354,10 +356,11 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 					return startedReply(job);
 				},
 
-				renderCall(args, theme) {
+				renderCall(args, theme, context) {
 					const input = args as { code?: string };
 					return new Text(
-						theme.fg("toolTitle", theme.bold("codemode-bg ")) + theme.fg("muted", truncate(input.code ?? "", 60)),
+						theme.fg("toolTitle", theme.bold("codemode-bg ")) +
+							theme.fg("muted", previewArg(input.code ?? "", context.expanded, theme)),
 						0,
 						0,
 					);
@@ -609,6 +612,31 @@ function hideWhenUnavailable(
 }
 
 // ─── 结果解析 ───
+
+/** 折叠时最多显示的命令行数，以及每行的字符上限。 */
+const ARG_PREVIEW_LINES = 3;
+const ARG_PREVIEW_CHARS = 100;
+
+/**
+ * 命令 / 脚本的折叠预览：最多 3 行、每行 100 字符，截断就提示 ctrl+o。
+ * 展开时原样返回，换行交给 Text 处理（与内置 codemode 的 renderCall 同一思路）。
+ */
+function previewArg(text: string, expanded: boolean, theme: Theme): string {
+	const normalized = text.replace(/\r/g, "").trimEnd();
+	if (expanded) return normalized;
+	const allLines = normalized.split("\n");
+	const shown = allLines.slice(0, ARG_PREVIEW_LINES).map((line) => clipLine(line, ARG_PREVIEW_CHARS));
+	const hiddenLines = allLines.length - shown.length;
+	const clipped = hiddenLines > 0 || shown.some((line, index) => line !== allLines[index]);
+	if (!clipped) return shown.join("\n");
+	const detail = hiddenLines > 0 ? `${hiddenLines} more line${hiddenLines === 1 ? "" : "s"}` : "truncated";
+	return `${shown.join("\n")}\n${theme.fg("dim", `… (${detail}, `)}${keyHint("app.tools.expand", "to expand")}${theme.fg("dim", ")")}`;
+}
+
+/** 按字符截断单行，不压缩空白（命令里的缩进有意义）。 */
+function clipLine(line: string, max: number): string {
+	return line.length <= max ? line : `${line.slice(0, max - 1)}…`;
+}
 
 function snapshot(job: BgJob): BgJobSnapshot {
 	return { id: job.id, kind: job.kind, label: job.label, status: job.status, text: statusText(job) };
