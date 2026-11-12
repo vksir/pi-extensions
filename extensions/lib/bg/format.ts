@@ -22,6 +22,14 @@ export function statusLabel(status: BgStatus): string {
 	return status === "done" ? "done" : status;
 }
 
+/**
+ * 任务在文本里的正式称呼：**永远**带 `bg-job` 前缀。
+ * 裸 8 位十六进制 id 与子 Agent 的 id 同形，模型会误调 `get_subagent_result`。
+ */
+export function jobRef(job: BgJob): string {
+	return `bg-job ${job.id}`;
+}
+
 /** `running · 3.2s` / `done · exit 0 · 12.4s` / `failed · exit 1 · 12.4s` / `killed · 3.2s`。 */
 export function statusText(job: BgJob): string {
 	const parts: string[] = [statusLabel(job.status)];
@@ -34,12 +42,18 @@ export function statusText(job: BgJob): string {
 /** 启动成功的工具返回：告知 id、结果回传方式与会话绑定的存续域。 */
 export function startText(job: BgJob): string {
 	const what = job.label ? ` (${job.label})` : "";
-	return `Started background job ${job.id}${what}. Its output arrives as a message when it finishes; use \`bg wait ${job.id}\` to block for it, \`bg list\` to inspect, or \`bg kill\` to stop it. Background jobs end with the session: /new, /reload, and exit stop them.`;
+	return `${jobRef(job)} started in background${what}. Its output arrives as a message when it finishes; use \`bg-job wait ${job.id}\` to block for it, \`bg-job list\` to inspect, or \`bg-job kill ${job.id}\` to stop it. Background jobs end with the session: /new, /reload, and exit stop them.`;
+}
+
+/** `bg-job wait` 超时的返回：任务还在跑，结果仍会作为消息回传。 */
+export function waitTimeoutText(job: BgJob, waited: string): string {
+	const what = job.label ? ` (${job.label})` : "";
+	return `${jobRef(job)}${what} — ${statusText(job)}. Still running after waiting ${waited}; its output still arrives as a message when it finishes. Use \`bg-job wait ${job.id}\` to keep waiting.`;
 }
 
 /** 完成消息的正文：头行 + 内置工具的原样输出。 */
 export function deliveryContent(job: BgJob): string {
-	const head = `[${job.kind}-bg ${job.id}] ${job.label} — ${statusText(job)}`;
+	const head = `[${jobRef(job)}] ${job.kind}-bg · ${job.label} — ${statusText(job)}`;
 	const body = job.output && job.output.trim().length > 0 ? job.output : EMPTY_OUTPUT;
 	return `${head}\n\n${body}`;
 }
@@ -51,13 +65,13 @@ export function splitDelivery(content: string): { head: string; body: string } {
 	return { head: content.slice(0, index), body: content.slice(index + 2) };
 }
 
-/** `bg list` 与 `/bg` 共用的列表行：在跑在前（启动序），已完成在后（新到旧）。 */
+/** `bg-job list` 与 `/bg` 共用的列表行：在跑在前（启动序），已完成在后（新到旧）。 */
 export function formatListLines(jobs: readonly BgJob[]): string[] {
 	if (jobs.length === 0) return ["没有后台任务。"];
 	const running = jobs.filter((job) => job.status === "running");
 	const finished = jobs.filter((job) => job.status !== "running").reverse();
 	const lines = [...running, ...finished].map(
-		(job) => `${job.id} — ${job.kind} · ${statusText(job)} · ${job.label}`,
+		(job) => `${jobRef(job)} — ${job.kind} · ${statusText(job)} · ${job.label}`,
 	);
 	return [`共 ${running.length} 个在跑 / ${finished.length} 条已完成`, "", ...lines];
 }
