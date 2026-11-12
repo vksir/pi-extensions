@@ -97,3 +97,17 @@ _Avoid_: herdr-core 环境、HC 环境
 **标签更名 (tab rename)**：
 `/name` 更名会话时把 pi 所在的窗口标签同步改名；两代 herdr 命令不同（`herdr tab rename` / `herdr-app do tab.rename`），失败一律静默放弃。
 _Avoid_: 重命名窗口、title rename
+
+### 后台任务（pi-bg）
+
+**后台任务 (bg job)**：
+由 `bash-bg` / `codemode-bg` 启动、立刻把控制权交还模型、自身继续执行的一次命令或脚本，拥有一个 8 位十六进制的任务 id。
+_Avoid_: 异步任务、后台进程、job、subprocess
+
+**结果回传 (bg delivery)**：
+后台任务结束时把输出作为 `pi-bg` 自定义消息投递给会话的动作；投递点是当前 turn 的工具跑完、下一次 LLM 调用之前，agent 空闲时立刻起一轮。被 `bg kill` 终止的任务不回传。
+_Avoid_: 通知、回调、推送、notify
+
+**委托 (delegation)**：
+后台工具把执行交给内置 `bash` / `codemode` 完成的做法——后台工具只是外壳，不重新实现命令执行、截断与沙箱（见 ADR-0006）。
+_Avoid_: 包装、转发、代理、wrap

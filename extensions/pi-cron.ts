@@ -57,7 +57,7 @@ export type { CronConversion, CronFields } from "./lib/cron/schedule.ts";
 
 // ─── 常量 ───
 
-const MAX_JOBS = 50;
+const MAX_JOBS = 64;
 /** setTimeout 的安全分块：2^31-1 ms ≈ 24.8 天，取 6 小时留足余量 */
 const TICK_CHUNK_MS = 6 * 60 * 60 * 1000;
 const STORE_KEY = Symbol.for("vkzha.pi-cron.jobs");

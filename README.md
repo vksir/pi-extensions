@@ -17,6 +17,7 @@
 | [pi-context](extensions/pi-context.ts) | `/context` 触发一次空转请求，导出这次请求的系统提示词与工具声明（含 codemode 动态描述），两者同源 |
 | [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron <间隔> [once] <prompt>`、`/cron list`、`/cron delete [id]` |
 | [pi-btw](extensions/pi-btw.ts) | 顺带分派：仅在 herdr / herdr app 环境注册 `/btw <消息>`，新开一个标签，fork 当前会话启动 pi 并把消息作为首条消息递交 |
+| [pi-bg](extensions/pi-bg.ts) | 后台运行：`bash-bg` / `codemode-bg` 立即返回，结束后把结果作为消息发回会话；`bg` 工具与 `/bg` 命令查看/终止 |
 
 `/balance codex` 需要先通过 `/login openai-codex` 登录 ChatGPT Plus/Pro 订阅。`/balance opencode` 查 OpenCode Go 的 5 小时/周/月额度，需要先配置 `opencode-go` 的 API Key。
 
@@ -83,6 +84,23 @@ node --test 'tests/pi-title.test.ts'
 node --test 'tests/herdr.test.ts' 'tests/pi-btw.test.ts'
 ```
 
+### 后台运行（bash-bg / codemode-bg）
+
+两个后台工具都是内置工具的**薄壳**：真正的执行委托给 `bash` / `codemode`（`ctx.executeTool`），因此截断（尾部 2000 行 / 50KB，附全文临时文件路径）、退出码、结构化输出、`tool_call` hook 与权限检查全部与内置逐字一致；后台脚本里调 `tools.*` 的语义也与 `codemode` 相同。为什么不自研、也不做成 `bash` 的一个参数，见 [ADR-0006](docs/adr/0006-bg-tools-delegate-to-builtin.md)。
+
+- 启动立刻返回，结果**不**出现在 tool result 里，而是任务结束时以自定义消息 `pi-bg` 回传：头行 `[bash-bg b3f1a2c4] npm test — done · exit 0 · 12s`，空行后是内置工具的原样输出（空输出为 `(no output)`）。
+- 回传走 `pi.sendMessage(..., { deliverAs: "steer", triggerTurn: true })`：不打断当前 LLM 调用，当前 turn 的工具跑完、下次调用前投递；agent 空闲时立刻起一轮。与 [@tintinweb/pi-subagents](https://www.npmjs.com/package/@tintinweb/pi-subagents) 的后台 Agent 同一通道。
+- 后台任务受**自己的** `AbortController` 约束。发起它的 tool call 被 Esc 中断不会连坐杀掉后台任务。
+- `bg` 工具与 `/bg` 命令：列出在跑任务与最近 20 条已完成记录；`bg kill <id>`（或 `/bg kill`）中止任务，连带杀掉它的进程树。同时最多 64 个任务，超出直接拒绝。
+- 存续域是**进程级**：`session_shutdown`（含 `/reload`）中止全部在跑任务，`/new` 之后任务表只保留在跑条目。已完成但未回传的结果随会话一起消失，与 pi-cron 同一取舍（[ADR-0001](docs/adr/0001-cron-tasks-are-process-scoped.md)）。
+- **Windows + Git Bash 的已知边界**：pi 的 `killProcessTree` 在 Windows 上用 `taskkill /F /T <pid>`，而 MSYS 子进程（`sleep`、`grep` 这类）在 Windows 记录的父进程并不是 bash，所以中止后可能残留孤儿进程。对前台 `bash` 调用按 Esc 是**完全一样**的行为，不是 pi-bg 引入的；`bg kill` 的"已终止"保证的是本次会话不再回传、内置工具已收到 abort。
+
+回归测试（Node.js 24+）：
+
+```bash
+node --test 'tests/pi-bg.test.ts'
+```
+
 ### 通知配置
 
 pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式下静默。
@@ -119,6 +137,8 @@ pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式�
 | `lib/subagents.ts` | pi-subagents 注册表的子 agent 存活探测 |
 | `lib/cron/schedule.ts` | cron 表达式解析、下次触发、间隔换算（纯函数） |
 | `lib/cron/presentation.ts` | 排期的人类可读化与触发 prompt 包装 |
+| `lib/bg/jobs.ts` | 后台任务表：上限、淘汰、id 分配（纯函数） |
+| `lib/bg/format.ts` | 后台任务的启动/回传/列表文本 |
 | `lib/balance/providers.ts` | Provider 凭据、请求与响应归一化 |
 | `lib/balance/render.ts` | `/balance` 结果排版 |
 | `lib/json.ts` | Agent 数据目录 JSON 的容错读取与原子写入 |
