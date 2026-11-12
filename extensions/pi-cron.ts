@@ -265,6 +265,17 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
+	 * 作废欠跑（D51：手动打断不补跑）。
+	 * 一次性 job 的唯一那次已过期（nextFireAt 已推成 Infinity），留着只会变成永不触发的僵尸，
+	 * 一并删除；循环 job 的排期在 tick 里已推进到未来，删掉欠跑即可照常继续。
+	 */
+	function discardBacklog(job: CronJob): void {
+		if (job.backlog === 0) return;
+		job.backlog = 0;
+		if (!job.recurring && !Number.isFinite(job.nextFireAt)) removeJob(job.id);
+	}
+
+	/**
 	 * 创建后的首次执行（D6：创建即执行，仅循环任务）。
 	 * 与定期触发同一通道：空闲才注入；忙碌（含 ctx 未知）时记欠跑，agent_settled 后补跑，
 	 * 绝不 steer 打断进行中的会话。idle 分支复用 deliver，保证两条路径行为逐字一致。
@@ -322,8 +333,15 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// 空闲后补跑欠下的 cron job；一次补一个，触发的新一轮结束后会再次 settle
-	pi.on("agent_settled", (_event, ctx) => {
+	pi.on("agent_settled", (event, ctx) => {
 		currentCtx = ctx;
+		// 手动打断（Esc）：不补跑。用户按 Esc 是要「停」，此刻再注一条延迟的触发等于无视打断，
+		// 且会立刻起一轮新会话；到期的欠跑直接作废（D51）。
+		if (event.aborted) {
+			for (const t of [...jobs()]) discardBacklog(t);
+			arm();
+			return;
+		}
 		const waiting = jobs().filter((t) => t.backlog > 0);
 		if (waiting.length > 0) {
 			waiting.sort((a, b) => a.createdAt - b.createdAt);

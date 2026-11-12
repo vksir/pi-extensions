@@ -49,8 +49,12 @@ _Avoid_: 重复任务、loop
 _Avoid_: 单次任务、reminder、timer
 
 **欠跑 (Backlog)**：
-agent 忙碌期间已经到期的触发。欠跑会被合并：agent 一旦空闲，至多补一次触发。
+agent 忙碌期间已经到期的触发。欠跑会被合并：agent 一旦空闲，至多补一次触发；但用户手动打断（Esc）时直接作废，不补发。
 _Avoid_: 积压队列、补跑次数、pending fires
+
+**手动打断 (Abort)**：
+用户按 Esc 中止当前一轮。打断后的 settle 不补跑欠跑，到期的欠跑作废——「停」就是「停」，不拿延迟的触发再起一轮。已过期的一次性 cron job 因此无法再触发，直接删除。
+_Avoid_: 取消、中止信号、interrupt
 
 **进程级 (Process-scoped)**：
 cron job 的存续范围——活过 `/reload` 与 `/resume`，随 pi 进程退出而消失。
