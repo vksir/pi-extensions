@@ -4,7 +4,16 @@
 
 ## 兼容性
 
-需要 Pi 1.x（最低 `1.0.0`）；仓库的 Pi 开发依赖与 peer 依赖均以此版本为基线。
+需要 Pi ≥ `1.5.2`；仓库的 Pi 开发依赖与 peer 依赖均以此版本为基线。
+
+类型检查与回归测试（Node.js 24+）：
+
+```bash
+npx tsc -p tsconfig.json
+node --test tests/*.test.ts
+```
+
+`tsconfig.json` 只做类型检查，不参与构建：扩展由 pi 直接加载 `.ts`。它把 `@earendil-works/pi-ai` 映射到 pi 的扩展视图（`pi-ai/compat` + TypeBox 的 `Type`/`Static`/`StringEnum`），与 pi loader 的运行时解析保持一致。
 
 ## 扩展列表
 
