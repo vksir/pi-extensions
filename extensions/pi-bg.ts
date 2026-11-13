@@ -2,17 +2,17 @@
  * pi-bg —— 后台运行的 bash 与 codemode
  *
  * 三个工具 + 一个人工入口，全部与内置工具的启用状态联动：
- *   bash-bg {command, timeout?}                    bash 的后台版本
- *   codemode-bg {code}                             codemode 的后台版本
- *   bg-job {action: list | kill | wait, id?, timeout?}  查看 / 终止 / 等候
+ *   bash_bg {command, timeout?}                    bash 的后台版本
+ *   codemode_bg {code}                             codemode 的后台版本
+ *   bg_job {action: list | kill | wait, id?, timeout?}  查看 / 终止 / 等候
  *   /bg [kill <id>]                                人工入口，0 常驻
  *
- * 任务 id 在一切文本里都写成 `bg-job <id>`（`jobRef`）：裸 8 位十六进制 id 与子 Agent 的
+ * 任务 id 在一切文本里都写成 `bg_job <id>`（`jobRef`）：裸 8 位十六进制 id 与子 Agent 的
  * id 同形，模型会误调 `get_subagent_result`。
  *
  * 两个后台工具都是**薄壳**，执行一律委托内置实现（ADR-0006）：
- *   - bash-bg 走 `ctx.executeTool("bash", ...)`；
- *   - codemode-bg 走 `createCodemodeExtension()` 造出的工具定义——`codemode` 的暴露是
+ *   - bash_bg 走 `ctx.executeTool("bash", ...)`；
+ *   - codemode_bg 走 `createCodemodeExtension()` 造出的工具定义——`codemode` 的暴露是
  *     `model-only`，`ctx.executeTool` 根本调不到它（只认 direct / codemode / deferred），
  *     而 pi 只导出工厂、不导出沙箱，所以用一个吞掉 `registerTool` 的 shim 把真定义接住。
  *
@@ -23,7 +23,7 @@
  *
  * 完成回传走 `pi.sendMessage(..., { deliverAs: "steer", triggerTurn: true })`，
  * 与 Agent 后台模式同一通道：当前 turn 的工具跑完、下次 LLM 调用前投递；agent 空闲时立刻起一轮。
- * 绝不把工具入参的 signal 传给后台任务——父轮 Esc 会连坐。`bg-job wait` 接过结果时不再回传，
+ * 绝不把工具入参的 signal 传给后台任务——父轮 Esc 会连坐。`bg_job wait` 接过结果时不再回传，
  * 避免同一份输出出现两次。
  *
  * 存续域与会话绑定：`/new`、`/reload`、`/resume`、`/fork`、退出都会触发 `session_shutdown`，
@@ -81,12 +81,12 @@ interface JobOutcome {
 	isError: boolean;
 }
 
-/** 在跑任务额外握着中止句柄与等待者；`bg-job kill`、`session_shutdown`、`bg-job wait` 都走它们。 */
+/** 在跑任务额外握着中止句柄与等待者；`bg_job kill`、`session_shutdown`、`bg_job wait` 都走它们。 */
 interface LiveJob extends BgJob {
 	controller: AbortController;
 	/** 等这个任务结束的回调；非空时不回传，由等待方直接取结果。 */
 	waiters: Array<() => void>;
-	/** 结果是否已经交给模型（作为自定义消息回传，或被 `bg-job wait` 接过）；避免同一份输出出现两次。 */
+	/** 结果是否已经交给模型（作为自定义消息回传，或被 `bg_job wait` 接过）；避免同一份输出出现两次。 */
 	delivered: boolean;
 }
 
@@ -281,10 +281,10 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 				job.durationMs = Date.now() - startedAt;
 				const waiters = job.waiters.splice(0);
 				if (waiters.length > 0) {
-					// `bg-job wait` 正在等：结果由它的 tool result 交付，不再回传一遍
+					// `bg_job wait` 正在等：结果由它的 tool result 交付，不再回传一遍
 					for (const resolve of waiters) resolve();
 				} else if (job.status === "done" || job.status === "failed") {
-					// 被 kill 的任务不回传：动手的人已经拿到 bg-job kill 的结果
+					// 被 kill 的任务不回传：动手的人已经拿到 bg_job kill 的结果
 					deliver(job);
 				}
 			}
@@ -301,7 +301,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 	const limited = () =>
 		fail(
 			"list",
-			`too many background jobs (max ${MAX_RUNNING}). Wait for one to finish or stop one with bg-job kill.`,
+			`too many background jobs (max ${MAX_RUNNING}). Wait for one to finish or stop one with bg_job kill.`,
 		);
 
 	const startedReply = (job: LiveJob) => ({
@@ -322,14 +322,14 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 
 		if (bash) {
 			pi.registerTool({
-				name: "bash-bg",
+				name: "bash_bg",
 				label: "Bash (background)",
 				description:
 					"Run a bash command in the background. Returns immediately; the command's output arrives as a message when it finishes.",
 				promptSnippet: "Run a bash command in the background",
 				// 直接复用内置工具的 schema：pi 给 bash 加参数时这里自动跟上
 				parameters: bash.parameters,
-				prepareLoadout: hideWhenUnavailable("bash", "bash-bg"),
+				prepareLoadout: hideWhenUnavailable("bash", "bash_bg"),
 
 				async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 					const input = params as { command: string; timeout?: number };
@@ -344,7 +344,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 				renderCall(args, theme, context) {
 					const input = args as { command?: string };
 					return new Text(
-						theme.fg("toolTitle", theme.bold("bash-bg ")) +
+						theme.fg("toolTitle", theme.bold("bash_bg ")) +
 							theme.fg("muted", previewArg(input.command ?? "", context.expanded, theme)),
 						0,
 						0,
@@ -357,13 +357,13 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 
 		if (codemodeBackend) {
 			pi.registerTool({
-				name: "codemode-bg",
+				name: "codemode_bg",
 				label: "Codemode (background)",
 				description:
 					"Run a codemode script in the background. Returns immediately; the script's result arrives as a message when it finishes.",
 				promptSnippet: "Run a codemode script in the background",
 				parameters: codemodeBackend.parameters,
-				prepareLoadout: hideWhenUnavailable("codemode", "codemode-bg"),
+				prepareLoadout: hideWhenUnavailable("codemode", "codemode_bg"),
 
 				async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 					const input = params as { code: string };
@@ -378,7 +378,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 				renderCall(args, theme, context) {
 					const input = args as { code?: string };
 					return new Text(
-						theme.fg("toolTitle", theme.bold("codemode-bg ")) +
+						theme.fg("toolTitle", theme.bold("codemode_bg ")) +
 							theme.fg("muted", previewArg(input.code ?? "", context.expanded, theme)),
 						0,
 						0,
@@ -393,9 +393,9 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 		if (!bash && !codemodeBackend) return;
 
 		pi.registerTool({
-			name: "bg-job",
+			name: "bg_job",
 			label: "Background jobs",
-			description: "List, stop, or wait for background jobs started by bash-bg and codemode-bg.",
+			description: "List, stop, or wait for background jobs started by bash_bg and codemode_bg.",
 			promptSnippet: "List, stop, or wait for background jobs",
 			parameters: Type.Object({
 				action: StringEnum(["list", "kill", "wait"] as const, {
@@ -412,7 +412,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 					}),
 				),
 			}),
-			prepareLoadout: hideWhenUnavailable(["bash", "codemode"], "bg-job", "any"),
+			prepareLoadout: hideWhenUnavailable(["bash", "codemode"], "bg_job", "any"),
 
 			async execute(_toolCallId, params, signal) {
 				if (params.action === "kill") {
@@ -473,7 +473,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 								return waitTimeoutText(job, elapsedText(timeoutMs ?? 0));
 							}
 							if (job.delivered) {
-								return `${jobRef(job)} ${job.kind}-bg · ${job.label} — ${statusText(job)}\n\nThe output was delivered as a separate message; read it there instead of repeating it here.`;
+								return `${jobRef(job)} ${job.kind}_bg · ${job.label} — ${statusText(job)}\n\nThe output was delivered as a separate message; read it there instead of repeating it here.`;
 							}
 							job.delivered = true;
 							return deliveryContent(job);
@@ -493,7 +493,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 			},
 
 			renderCall(args, theme) {
-				let text = theme.fg("toolTitle", theme.bold("bg-job ")) + theme.fg("muted", args.action);
+				let text = theme.fg("toolTitle", theme.bold("bg_job ")) + theme.fg("muted", args.action);
 				if (args.id) text += ` ${theme.fg("accent", args.id)}`;
 				if (args.timeout !== undefined) text += theme.fg("muted", ` timeout=${args.timeout}s`);
 				return new Text(text, 0, 0);
@@ -510,7 +510,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 					const head = theme.fg("muted", `${details.jobs!.length} background job(s):`);
 					const rows = shown.map(
 						(job) =>
-							`${theme.fg("accent", `bg-job ${job.id}`)} ${theme.fg("muted", job.kind)} ${theme.fg("dim", job.text)} ${theme.fg("muted", truncate(job.label, 40))}`,
+							`${theme.fg("accent", `bg_job ${job.id}`)} ${theme.fg("muted", job.kind)} ${theme.fg("dim", job.text)} ${theme.fg("muted", truncate(job.label, 40))}`,
 					);
 					const more =
 						details.jobs!.length > shown.length
@@ -611,7 +611,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null):
 		const tone = details?.status === "failed" ? "error" : details?.status === "done" ? "success" : "warning";
 		// 头行由 details 重排：正文里的头行只给模型看，TUI 不重复渲染状态
 		const headline = details
-			? theme.fg("customMessageText", `[bg-job ${details.id}] ${details.kind}-bg · ${details.label}`) +
+			? theme.fg("customMessageText", `[bg_job ${details.id}] ${details.kind}_bg · ${details.label}`) +
 				theme.fg(tone, ` — ${details.text}`)
 			: theme.fg(tone, head);
 
@@ -676,7 +676,7 @@ function snapshot(job: BgJob): BgJobSnapshot {
 	return { id: job.id, kind: job.kind, label: job.label, status: job.status, text: statusText(job) };
 }
 
-/** bash-bg / codemode-bg 共用的结果渲染：只显示 id，正文在完成消息里。 */
+/** bash_bg / codemode_bg 共用的结果渲染：只显示 id，正文在完成消息里。 */
 function renderStarted(
 	result: AgentToolResult<BgToolDetails | undefined>,
 	_options: ToolRenderResultOptions,
@@ -689,7 +689,7 @@ function renderStarted(
 	const text = first?.type === "text" ? first.text : "";
 	return new Text(
 		job
-			? `${theme.fg("accent", `bg-job ${job.id}`)} ${theme.fg("muted", "started in background")}`
+			? `${theme.fg("accent", `bg_job ${job.id}`)} ${theme.fg("muted", "started in background")}`
 			: theme.fg("muted", text),
 		0,
 		0,

@@ -126,27 +126,27 @@ test("状态行带上退出码与耗时", () => {
 	assert.equal(statusText(job({ kind: "codemode", status: "done", durationMs: 2_100 })), "done · 2.1s");
 });
 
-test("启动返回带 bg-job 前缀的 id、回传方式、bg-job wait 与会话绑定的存续域", () => {
+test("启动返回带 bg_job 前缀的 id、回传方式、bg_job wait 与会话绑定的存续域", () => {
 	const text = startText(job());
-	assert.match(text, /bg-job b3f1a2c4 started in background \(npm test\)/);
-	assert.match(text, /bg-job wait b3f1a2c4/);
-	assert.match(text, /bg-job kill/);
+	assert.match(text, /bg_job b3f1a2c4 started in background \(npm test\)/);
+	assert.match(text, /bg_job wait b3f1a2c4/);
+	assert.match(text, /bg_job kill/);
 	assert.match(text, /end with the session/);
 });
 
 test("等候超时的文本：报状态、任务照跑、提示继续等", () => {
 	const text = waitTimeoutText(job({ startedAt: Date.now() - 2_000 }), "2.0s");
-	assert.match(text, /^bg-job b3f1a2c4 \(npm test\) — running · /);
+	assert.match(text, /^bg_job b3f1a2c4 \(npm test\) — running · /);
 	assert.match(text, /Still running after waiting 2\.0s/);
 	assert.match(text, /still arrives as a message/);
-	assert.match(text, /bg-job wait b3f1a2c4/);
+	assert.match(text, /bg_job wait b3f1a2c4/);
 });
 
 test("完成消息是头行 + 原样输出，空输出退回占位", () => {
 	const done = job({ status: "done", exitCode: 0, durationMs: 12_400, output: "line 1\nline 2" });
 	assert.equal(
 		deliveryContent(done),
-		"[bg-job b3f1a2c4] bash-bg · npm test — done · exit 0 · 12s\n\nline 1\nline 2",
+		"[bg_job b3f1a2c4] bash_bg · npm test — done · exit 0 · 12s\n\nline 1\nline 2",
 	);
 	assert.match(deliveryContent(job({ status: "done", output: "   " })), /\(no output\)$/);
 });
@@ -166,9 +166,9 @@ test("列表：在跑在前，已完成新到旧", () => {
 	]);
 	assert.equal(lines[0], "共 1 个在跑 / 2 条已完成");
 	assert.equal(lines[1], "");
-	assert.match(lines[2]!, /^bg-job run — bash · running · /);
-	assert.match(lines[3]!, /^bg-job new — bash · done/);
-	assert.match(lines[4]!, /^bg-job old — bash · done/);
+	assert.match(lines[2]!, /^bg_job run — bash · running · /);
+	assert.match(lines[3]!, /^bg_job new — bash · done/);
+	assert.match(lines[4]!, /^bg_job old — bash · done/);
 });
 
 // ─── 扩展接线：注册、委托、回传、终止 ───
@@ -273,7 +273,7 @@ test("captureCodemodeTool 接住真实的 codemode 工具定义", () => {
 	assert.equal(typeof definition!.execute, "function");
 });
 
-test("bash-bg 委托内置 bash，结束后以 steer + triggerTurn 回传", async () => {
+test("bash_bg 委托内置 bash，结束后以 steer + triggerTurn 回传", async () => {
 	const { tools, sent } = setup();
 	const calls: Array<{ name: string; args: any }> = [];
 	const ctx = {
@@ -288,9 +288,9 @@ test("bash-bg 委托内置 bash，结束后以 steer + triggerTurn 回传", asyn
 		},
 	};
 
-	const result = await tools.get("bash-bg").execute("call-1", { command: "echo hello" }, undefined, undefined, ctx);
+	const result = await tools.get("bash_bg").execute("call-1", { command: "echo hello" }, undefined, undefined, ctx);
 	const id = result.details.jobs[0].id;
-	assert.match(result.content[0].text, new RegExp(`bg-job ${id} started in background`));
+	assert.match(result.content[0].text, new RegExp(`bg_job ${id} started in background`));
 	assert.deepEqual(calls, [{ name: "bash", args: { command: "echo hello" } }]);
 
 	await until(() => sent.length === 1);
@@ -299,13 +299,13 @@ test("bash-bg 委托内置 bash，结束后以 steer + triggerTurn 回传", asyn
 	assert.equal(sent[0]!.message.customType, "pi-bg");
 	assert.equal(sent[0]!.message.display, true);
 	assert.ok(
-		sent[0]!.message.content.startsWith(`[bg-job ${id}] bash-bg · echo hello — done · exit 0 · `),
+		sent[0]!.message.content.startsWith(`[bg_job ${id}] bash_bg · echo hello — done · exit 0 · `),
 		sent[0]!.message.content,
 	);
 	assert.match(sent[0]!.message.content, /hello\nCommand exited with code 0$/);
 });
 
-test("bash-bg 把入参原样透传给内置 bash", async () => {
+test("bash_bg 把入参原样透传给内置 bash", async () => {
 	const { tools, sent } = setup();
 	const calls: Array<{ name: string; args: any }> = [];
 	const ctx = {
@@ -315,46 +315,46 @@ test("bash-bg 把入参原样透传给内置 bash", async () => {
 		},
 	};
 
-	await tools.get("bash-bg").execute("call-1", { command: "echo hello", timeout: 5 }, undefined, undefined, ctx);
+	await tools.get("bash_bg").execute("call-1", { command: "echo hello", timeout: 5 }, undefined, undefined, ctx);
 	await until(() => sent.length === 1);
 	// timeout 也一并透传：schema 来自内置 bash，pi 加参数时这里无需改
 	assert.deepEqual(calls, [{ name: "bash", args: { command: "echo hello", timeout: 5 } }]);
 });
 
-test("codemode-bg 调用接住的定义，而不是 executeTool", async () => {
+test("codemode_bg 调用接住的定义，而不是 executeTool", async () => {
 	const calls: Array<{ code: unknown }> = [];
 	const { tools, sent } = setup({ codemode: stubCodemode(calls) });
 	const ctx = {
 		executeTool: async () => {
-			throw new Error("codemode-bg 不该走 executeTool");
+			throw new Error("codemode_bg 不该走 executeTool");
 		},
 	};
 
-	const result = await tools.get("codemode-bg").execute("call-1", { code: "return 42" }, undefined, undefined, ctx);
+	const result = await tools.get("codemode_bg").execute("call-1", { code: "return 42" }, undefined, undefined, ctx);
 	const id = result.details.jobs[0].id;
 	await until(() => sent.length === 1);
 	assert.deepEqual(calls, [{ code: "return 42" }]);
-	assert.ok(sent[0]!.message.content.startsWith(`[bg-job ${id}] codemode-bg · return 42 — done · `), sent[0]!.message.content);
+	assert.ok(sent[0]!.message.content.startsWith(`[bg_job ${id}] codemode_bg · return 42 — done · `), sent[0]!.message.content);
 	assert.match(sent[0]!.message.content, /Script completed\n42$/);
 });
 
-test("codemode 后端接不到时不注册 codemode-bg", () => {
+test("codemode 后端接不到时不注册 codemode_bg", () => {
 	const { tools } = setup({ codemode: null });
-	assert.equal(tools.has("codemode-bg"), false);
-	assert.equal(tools.has("bash-bg"), true);
+	assert.equal(tools.has("codemode_bg"), false);
+	assert.equal(tools.has("bash_bg"), true);
 });
 
-test("未启用 bash 时不注册 bash-bg", () => {
+test("未启用 bash 时不注册 bash_bg", () => {
 	const { tools } = setup({ active: ["codemode"] });
-	assert.equal(tools.has("bash-bg"), false);
-	assert.equal(tools.has("codemode-bg"), true);
-	assert.equal(tools.has("bg-job"), true);
+	assert.equal(tools.has("bash_bg"), false);
+	assert.equal(tools.has("codemode_bg"), true);
+	assert.equal(tools.has("bg_job"), true);
 });
 
-test("未启用 codemode 时不注册 codemode-bg", () => {
+test("未启用 codemode 时不注册 codemode_bg", () => {
 	const { tools } = setup({ active: ["bash"] });
-	assert.equal(tools.has("codemode-bg"), false);
-	assert.equal(tools.has("bash-bg"), true);
+	assert.equal(tools.has("codemode_bg"), false);
+	assert.equal(tools.has("bash_bg"), true);
 });
 
 test("两个后端都未启用时 bg 也不注册", () => {
@@ -364,20 +364,20 @@ test("两个后端都未启用时 bg 也不注册", () => {
 
 test("schema 直接复用内置工具的那一份", () => {
 	const { tools } = setup({ codemode: stubCodemode([]) });
-	assert.equal(tools.get("bash-bg").parameters, SCHEMAS.bash);
+	assert.equal(tools.get("bash_bg").parameters, SCHEMAS.bash);
 });
 
 test("prepareLoadout：后端离开 declared 时隐藏自己", () => {
 	const { tools } = setup();
-	const hideBash = tools.get("bash-bg").prepareLoadout;
+	const hideBash = tools.get("bash_bg").prepareLoadout;
 	assert.equal(hideBash({ declared: [{ name: "bash" }] }), undefined);
-	assert.deepEqual(hideBash({ declared: [{ name: "read" }] }), { hiddenDeclarations: ["bash-bg"] });
+	assert.deepEqual(hideBash({ declared: [{ name: "read" }] }), { hiddenDeclarations: ["bash_bg"] });
 
 	// bg 只要还有一个后端在就保留
-	const hideBg = tools.get("bg-job").prepareLoadout;
+	const hideBg = tools.get("bg_job").prepareLoadout;
 	assert.equal(hideBg({ declared: [{ name: "bash" }] }), undefined);
 	assert.equal(hideBg({ declared: [{ name: "codemode" }] }), undefined);
-	assert.deepEqual(hideBg({ declared: [] }), { hiddenDeclarations: ["bg-job"] });
+	assert.deepEqual(hideBg({ declared: [] }), { hiddenDeclarations: ["bg_job"] });
 });
 
 test("父轮 signal 不传给后台任务：已中止的入参不阻止任务完成", async () => {
@@ -391,7 +391,7 @@ test("父轮 signal 不传给后台任务：已中止的入参不阻止任务完
 	};
 	const parent = new AbortController();
 	parent.abort();
-	await tools.get("bash-bg").execute("call-1", { command: "true" }, parent.signal, undefined, ctx);
+	await tools.get("bash_bg").execute("call-1", { command: "true" }, parent.signal, undefined, ctx);
 	await until(() => sent.length === 1);
 
 	assert.ok(seenSignal);
@@ -399,7 +399,7 @@ test("父轮 signal 不传给后台任务：已中止的入参不阻止任务完
 	assert.equal(seenSignal.aborted, false);
 });
 
-test("bg-job kill 中止任务且不回传", async () => {
+test("bg_job kill 中止任务且不回传", async () => {
 	const { tools, sent } = setup();
 	let aborted = false;
 	const ctx = {
@@ -412,10 +412,10 @@ test("bg-job kill 中止任务且不回传", async () => {
 			}),
 	};
 
-	const started = await tools.get("bash-bg").execute("call-1", { command: "sleep 60" }, undefined, undefined, ctx);
+	const started = await tools.get("bash_bg").execute("call-1", { command: "sleep 60" }, undefined, undefined, ctx);
 	const id = started.details.jobs[0].id;
-	const killed = await tools.get("bg-job").execute("call-2", { action: "kill", id });
-	assert.equal(killed.content[0].text, `Killed bg-job ${id}.`);
+	const killed = await tools.get("bg_job").execute("call-2", { action: "kill", id });
+	assert.equal(killed.content[0].text, `Killed bg_job ${id}.`);
 
 	await until(() => aborted);
 	await new Promise((resolve) => setTimeout(resolve, 20));
@@ -426,10 +426,10 @@ test("并发上限 64：超出直接拒绝", async () => {
 	const { tools } = setup();
 	const ctx = { executeTool: () => new Promise(() => {}) };
 	for (let index = 0; index < 64; index += 1) {
-		const result = await tools.get("bash-bg").execute(`call-${index}`, { command: `cmd-${index}` }, undefined, undefined, ctx);
-		assert.match(result.content[0].text, /bg-job .+ started in background/);
+		const result = await tools.get("bash_bg").execute(`call-${index}`, { command: `cmd-${index}` }, undefined, undefined, ctx);
+		assert.match(result.content[0].text, /bg_job .+ started in background/);
 	}
-	const refused = await tools.get("bash-bg").execute("call-65", { command: "cmd-65" }, undefined, undefined, ctx);
+	const refused = await tools.get("bash_bg").execute("call-65", { command: "cmd-65" }, undefined, undefined, ctx);
 	assert.match(refused.content[0].text, /^Error: too many background jobs \(max 64\)/);
 });
 
@@ -454,33 +454,33 @@ test("session_shutdown 中止在跑任务且不再回传", async () => {
 				});
 			}),
 	};
-	const started = await tools.get("bash-bg").execute("call-1", { command: "sleep 60" }, undefined, undefined, ctx);
+	const started = await tools.get("bash_bg").execute("call-1", { command: "sleep 60" }, undefined, undefined, ctx);
 	const id = started.details.jobs[0].id;
 
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, {});
 	await until(() => aborted);
 	await new Promise((resolve) => setTimeout(resolve, 20));
 	assert.equal(sent.length, 0);
-	assert.match((await tools.get("bg-job").execute("call-2", { action: "list" })).content[0].text, new RegExp(id));
+	assert.match((await tools.get("bg_job").execute("call-2", { action: "list" })).content[0].text, new RegExp(id));
 });
 
 test("session_start 重入：清掉已完成记录且不重复注册", async () => {
 	const { tools, handlers, captured } = setup();
 	const registeredCount = captured.length;
 	const ctx = { executeTool: async (name: string) => outcome(name, "ok", { exit_code: 0 }) };
-	await tools.get("bash-bg").execute("call-1", { command: "true" }, undefined, undefined, ctx);
+	await tools.get("bash_bg").execute("call-1", { command: "true" }, undefined, undefined, ctx);
 	await new Promise((resolve) => setTimeout(resolve, 20));
-	assert.match((await tools.get("bg-job").execute("call-2", { action: "list" })).content[0].text, /共 0 个在跑 \/ 1 条已完成/);
+	assert.match((await tools.get("bg_job").execute("call-2", { action: "list" })).content[0].text, /共 0 个在跑 \/ 1 条已完成/);
 
 	// rebindCurrentSession 会在同一 runner 上二次触发 session_start
 	await handlers.get("session_start")!({ type: "session_start" }, {});
 	assert.equal(captured.length, registeredCount, "重入不该重复注册工具");
-	assert.match((await tools.get("bg-job").execute("call-3", { action: "list" })).content[0].text, /没有后台任务/);
+	assert.match((await tools.get("bg_job").execute("call-3", { action: "list" })).content[0].text, /没有后台任务/);
 });
 
-// ─── bg-job wait ───
+// ─── bg_job wait ───
 
-test("bg-job wait 等到结果，且不再回传", async () => {
+test("bg_job wait 等到结果，且不再回传", async () => {
 	const { tools, sent } = setup();
 	let resolveRun!: (value: unknown) => void;
 	const ctx = {
@@ -489,35 +489,35 @@ test("bg-job wait 等到结果，且不再回传", async () => {
 				resolveRun = resolve;
 			}),
 	};
-	const started = await tools.get("bash-bg").execute("call-1", { command: "sleep 1" }, undefined, undefined, ctx);
+	const started = await tools.get("bash_bg").execute("call-1", { command: "sleep 1" }, undefined, undefined, ctx);
 	const id = started.details.jobs[0].id;
 
-	const waiting = tools.get("bg-job").execute("call-2", { action: "wait", id }, undefined);
+	const waiting = tools.get("bg_job").execute("call-2", { action: "wait", id }, undefined);
 	// 给 waitFor 一个机会先把 waiter 挂上
 	await new Promise((resolve) => setTimeout(resolve, 10));
 	resolveRun(outcome("bash", "waited!", { exit_code: 0 }));
 
 	const result = await waiting;
 	assert.match(result.content[0].text, /waited!/);
-	assert.match(result.content[0].text, new RegExp(`\\[bg-job ${id}\\]`));
+	assert.match(result.content[0].text, new RegExp(`\\[bg_job ${id}\\]`));
 	await new Promise((resolve) => setTimeout(resolve, 20));
 	assert.equal(sent.length, 0, "wait 接过结果后不该再回传");
 });
 
-test("bg-job wait 对已回传的任务只给状态，不重复输出", async () => {
+test("bg_job wait 对已回传的任务只给状态，不重复输出", async () => {
 	const { tools, sent } = setup();
 	const ctx = { executeTool: async (name: string) => outcome(name, "already-sent", { exit_code: 0 }) };
-	const started = await tools.get("bash-bg").execute("call-1", { command: "true" }, undefined, undefined, ctx);
+	const started = await tools.get("bash_bg").execute("call-1", { command: "true" }, undefined, undefined, ctx);
 	const id = started.details.jobs[0].id;
 	await until(() => sent.length === 1);
 
-	const result = await tools.get("bg-job").execute("call-2", { action: "wait", id }, undefined);
+	const result = await tools.get("bg_job").execute("call-2", { action: "wait", id }, undefined);
 	assert.match(result.content[0].text, /delivered as a separate message; read it there instead of repeating it here/);
 	assert.doesNotMatch(result.content[0].text, /already-sent/);
 	assert.equal(sent.length, 1, "不该再回传一次");
 });
 
-test("bg-job wait 带 timeout：超时返回状态，任务继续跑且结果仍回传", async () => {
+test("bg_job wait 带 timeout：超时返回状态，任务继续跑且结果仍回传", async () => {
 	const { tools, sent } = setup();
 	let resolveRun!: (value: unknown) => void;
 	const ctx = {
@@ -526,11 +526,11 @@ test("bg-job wait 带 timeout：超时返回状态，任务继续跑且结果仍
 				resolveRun = resolve;
 			}),
 	};
-	const started = await tools.get("bash-bg").execute("call-1", { command: "sleep 60" }, undefined, undefined, ctx);
+	const started = await tools.get("bash_bg").execute("call-1", { command: "sleep 60" }, undefined, undefined, ctx);
 	const id = started.details.jobs[0].id;
 
-	const result = await tools.get("bg-job").execute("call-2", { action: "wait", id, timeout: 0.05 }, undefined);
-	assert.match(result.content[0].text, new RegExp(`bg-job ${id}`));
+	const result = await tools.get("bg_job").execute("call-2", { action: "wait", id, timeout: 0.05 }, undefined);
+	assert.match(result.content[0].text, new RegExp(`bg_job ${id}`));
 	assert.match(result.content[0].text, /Still running after waiting/);
 	assert.match(result.content[0].text, /still arrives as a message/);
 	assert.equal(sent.length, 0, "等待方没拿到结果，任务不该被当成已交付");
@@ -541,7 +541,7 @@ test("bg-job wait 带 timeout：超时返回状态，任务继续跑且结果仍
 	assert.match(sent[0]!.message.content, /late output$/);
 });
 
-test("bg-job wait 省略 id 时等全部在跑任务", async () => {
+test("bg_job wait 省略 id 时等全部在跑任务", async () => {
 	const { tools } = setup();
 	const resolvers: Array<(value: unknown) => void> = [];
 	const ctx = {
@@ -550,10 +550,10 @@ test("bg-job wait 省略 id 时等全部在跑任务", async () => {
 				resolvers.push(resolve);
 			}),
 	};
-	await tools.get("bash-bg").execute("call-1", { command: "a" }, undefined, undefined, ctx);
-	await tools.get("bash-bg").execute("call-2", { command: "b" }, undefined, undefined, ctx);
+	await tools.get("bash_bg").execute("call-1", { command: "a" }, undefined, undefined, ctx);
+	await tools.get("bash_bg").execute("call-2", { command: "b" }, undefined, undefined, ctx);
 
-	const waiting = tools.get("bg-job").execute("call-3", { action: "wait" }, undefined);
+	const waiting = tools.get("bg_job").execute("call-3", { action: "wait" }, undefined);
 	await new Promise((resolve) => setTimeout(resolve, 10));
 	for (const resolve of resolvers) resolve(outcome("bash", "ok", { exit_code: 0 }));
 
@@ -562,7 +562,7 @@ test("bg-job wait 省略 id 时等全部在跑任务", async () => {
 	assert.match(result.content[0].text, /ok/);
 });
 
-test("bg-job wait 被中止时任务继续跑，结果仍回传", async () => {
+test("bg_job wait 被中止时任务继续跑，结果仍回传", async () => {
 	const { tools, sent } = setup();
 	let resolveRun!: (value: unknown) => void;
 	const ctx = {
@@ -571,11 +571,11 @@ test("bg-job wait 被中止时任务继续跑，结果仍回传", async () => {
 				resolveRun = resolve;
 			}),
 	};
-	const started = await tools.get("bash-bg").execute("call-1", { command: "sleep 1" }, undefined, undefined, ctx);
+	const started = await tools.get("bash_bg").execute("call-1", { command: "sleep 1" }, undefined, undefined, ctx);
 	const id = started.details.jobs[0].id;
 
 	const parent = new AbortController();
-	const waiting = tools.get("bg-job").execute("call-2", { action: "wait", id }, parent.signal);
+	const waiting = tools.get("bg_job").execute("call-2", { action: "wait", id }, parent.signal);
 	await new Promise((resolve) => setTimeout(resolve, 10));
 	parent.abort();
 

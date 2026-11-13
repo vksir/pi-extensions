@@ -105,23 +105,23 @@ _Avoid_: 重命名窗口、title rename
 ### 后台任务（pi-bg）
 
 **后台任务 (bg job)**：
-由 `bash-bg` / `codemode-bg` 启动、立刻把控制权交还模型、自身继续执行的一次命令或脚本，拥有一个 8 位十六进制的任务 id。id 在文本与工具参数之外一律写作 `bg-job <id>`，不单独出现（避免与子 Agent 的 id 混淆）。
+由 `bash_bg` / `codemode_bg` 启动、立刻把控制权交还模型、自身继续执行的一次命令或脚本，拥有一个 8 位十六进制的任务 id。id 在文本与工具参数之外一律写作 `bg_job <id>`，不单独出现（避免与子 Agent 的 id 混淆）。
 _Avoid_: 异步任务、后台进程、job、subprocess
 
 **结果回传 (bg delivery)**：
-后台任务结束时把输出作为 `pi-bg` 自定义消息投递给会话的动作；投递点是当前 turn 的工具跑完、下一次 LLM 调用之前，agent 空闲时立刻起一轮。被 `bg-job kill` 终止的任务不回传。
+后台任务结束时把输出作为 `pi-bg` 自定义消息投递给会话的动作；投递点是当前 turn 的工具跑完、下一次 LLM 调用之前，agent 空闲时立刻起一轮。被 `bg_job kill` 终止的任务不回传。
 _Avoid_: 通知、回调、推送、notify
 
 **交付 (bg delivery state)**：
-一份输出是“只到达一次”的状态：要么作为 `pi-bg` 消息回传，要么被 `bg-job wait` 的 tool result 接过。后到的 `bg-job wait` 只报状态，不重复输出。
+一份输出是“只到达一次”的状态：要么作为 `pi-bg` 消息回传，要么被 `bg_job wait` 的 tool result 接过。后到的 `bg_job wait` 只报状态，不重复输出。
 _Avoid_: 消费、去重、已读
 
 **等候 (bg wait)**：
-`bg-job wait [id] [timeout]` 阻塞到任务结束、直接把原样输出放进 tool result 的动作；省略 id 则等全部在跑任务，`timeout`（秒）到点只报状态、任务继续跑。父轮 Esc 或超时取消的只是「等」，任务照跑、结果仍会回传。
+`bg_job wait [id] [timeout]` 阻塞到任务结束、直接把原样输出放进 tool result 的动作；省略 id 则等全部在跑任务，`timeout`（秒）到点只报状态、任务继续跑。父轮 Esc 或超时取消的只是「等」，任务照跑、结果仍会回传。
 _Avoid_: 轮询、poll、join、同步等待
 
 **启用联动 (availability)**：
-三个后台工具都跟着内置工具的启用状态走：`bash` 未启用就不注册 `bash-bg`，两个后端都未启用就连 `bg-job` 也不注册。schema 复用 `getAllTools()` 里内置工具的那一份，所以不是「功能相同」的承诺，而是同一份声明。
+三个后台工具都跟着内置工具的启用状态走：`bash` 未启用就不注册 `bash_bg`，两个后端都未启用就连 `bg_job` 也不注册。schema 复用 `getAllTools()` 里内置工具的那一份，所以不是「功能相同」的承诺，而是同一份声明。
 _Avoid_: 动态开关、条件注册、feature flag
 
 **委托 (delegation)**：
