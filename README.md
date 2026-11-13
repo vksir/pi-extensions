@@ -12,7 +12,7 @@
 |------|------|
 | [pi-balance](extensions/pi-balance.ts) | 查询 AI 模型提供商余额/额度（支持 DeepSeek、Moonshot、OpenRouter、OpenAI Codex、OpenCode Go、智谱 GLM）；`/balance` 列支持的 Provider，`/balance all` 查全部，`/balance <provider>` 查单个 |
 | [pi-notify](extensions/pi-notify.ts) | 任务完成后发送桌面通知（支持 iTerm2、Kitty、Ghostty、WezTerm、Windows Terminal）；需 Pi ≥ 1.3.0 |
-| [pi-title](extensions/pi-title.ts) | Agent 运行时在窗口标题显示旋转动画，结束后恢复原标题；herdr 环境（两代）不修改窗口标题，`/name` 更名时同步重命名所在标签（旧 herdr 经 CLI 直接寻址，herdr app 经 herdr-app CLI ls 寻址）；进程内子 agent 会话（ctx.mode 非 "tui"）不参与标题与标签管理 |
+| [pi-title](extensions/pi-title.ts) | Agent 运行时在窗口标题显示旋转动画，结束后恢复原标题；herdr 环境（两代）不修改窗口标题，`/name` 更名与会话启动（resume / `/reload` / 切换会话）时同步重命名所在标签（旧 herdr 经 CLI 直接寻址，herdr app 经 herdr-app CLI ls 寻址）；进程内子 agent 会话（ctx.mode 非 "tui"）不参与标题与标签管理 |
 | [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 用量，支持 `/token` 命令；footer 状态行里插入最近一次响应的输出速率（`R1.5M 42t/s CH97.1%`） |
 | [pi-context](extensions/pi-context.ts) | `/context` 触发一次空转请求，导出这次请求的系统提示词与工具声明（含 codemode 动态描述），两者同源 |
 | [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron <间隔> [once] <prompt>`、`/cron list`、`/cron delete [id]` |
@@ -60,6 +60,8 @@ node --test 'tests/pi-context.test.ts'
 
 - **旧 herdr**（`HERDR_ENV=1`）：`HERDR_TAB_ID` 直接给出标签 id，经 `herdr` CLI（或注入的 `HERDR_BIN_PATH`）`tab rename` 更名。
 - **herdr app**（`HC_TERMINAL_ID`）：标签 id 不在 env 里，先 `herdr-app ls` 找到装着本终端的 tab，再 `herdr-app do tab.rename` 改名（空名恢复按序号命名）。窗口未开、终端不在窗口里等失败静默放弃，详见 ADR-0005。
+
+会话启动（`pi -c` resume、`/reload`、切换会话）后 pi 会把终端标题重写成 `π - <会话名> - <cwd>`，而 herdr 在标签没有名字时显示的就是这个标题——恢复出来的命名会话因此会显示成 `π - abc - <cwd>`。所以会话名存在时，启动后同样把标签对齐到会话名，herdr 里仍旧只有 `abc`；无名会话启动时不动标签，既不洗掉人为改的标签名，也不把上一会话的名字留在新会话上。
 
 回归测试：
 

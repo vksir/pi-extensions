@@ -8,6 +8,10 @@
  * 标签（env 探测与更名命令在 lib/herdr.ts）：旧 herdr 的 HERDR_TAB_ID 直接寻址，
  * herdr app 经 herdr-app CLI 先 ls 寻址再改名。窗口未开等失败静默放弃。
  *
+ * 会话启动（resume、/reload、切换会话）后 pi 会把终端标题重写成
+ * `π - <会话名> - <cwd>`，而 herdr 在标签未命名时就显示这个标题，于是恢复出来的
+ * 命名会话会变成 `π - abc - <cwd>`。因此会话名存在时，启动后把标签重新对齐到它。
+ *
  * 子会话：进程内子 agent（如 @tintinweb/pi-subagents）会在同一进程里为子会话
  * 重新加载本扩展，并触发各自的 agent 与更名事件；其 ctx.mode 不是 "tui"。
  * 全部 handler 据此忽略子会话，标题与标签只由主 TUI 会话管理。
@@ -89,17 +93,28 @@ export default function (pi: ExtensionAPI) {
 		// 两代 herdr 都支持更名（寻址差异见 lib/herdr.ts）；两套 env 都缺失时
 		// renamer 为空，/name 更名静默空转，窗口标题照旧不动。
 		const renamer = createTabRenamer((command, args) => pi.exec(command, args));
-		// /name 可能连续执行，串行排队，保证最后一次重命名最终胜出。
+		// 更名可能连续发生（/name、启动对齐），串行排队，保证最后一次重命名最终胜出。
 		let renameQueue: Promise<void> = Promise.resolve();
+		// label 在入队前捕获：连续 /name 各自带走当时的会话名，队尾者最终胜出。
+		const align = (label: string): void => {
+			renameQueue = renameQueue
+				.then(() => renamer?.rename(label))
+				.catch(() => undefined); // 失败场景静默放弃
+		};
 		pi.on("session_info_changed", (event, ctx) => {
 			// 子会话更名（子 agent 派生时的 setSessionName）不得触碰主 tab：
 			// 标签寻址 env（HERDR_TAB_ID / HC_TERMINAL_ID）是进程级的，指向主 pi。
 			if (ctx.mode !== "tui") return;
-			const label = event.name?.trim() ?? ""; // /name 清除会话名时同步清空标签
-			// label 在入队前捕获：连续 /name 各自带走当时的会话名，队尾者最终胜出。
-			renameQueue = renameQueue
-				.then(() => renamer?.rename(label))
-				.catch(() => undefined); // 失败场景静默放弃
+			align(event.name?.trim() ?? ""); // /name 清除会话名时同步清空标签
+		});
+		pi.on("session_start", (_event, ctx) => {
+			if (ctx.mode !== "tui") return;
+			// resume / /reload / 切换会话后，pi 的内置标题会变回 `π - <会话名> - <cwd>`；
+			// 标签未命名时 herdr 显示的就是这个标题。会话名存在就把标签对齐回去，
+			// herdr 里只留下会话名。无名会话不动标签：既不洗掉人为改的名，也不凭空
+			// 把上一会话的名字留在新会话的标签上。
+			const name = ctx.sessionManager.getSessionName()?.trim() ?? "";
+			if (name) align(name);
 		});
 		return;
 	}

@@ -99,7 +99,7 @@ _Avoid_: herdr CLI 环境、herdr v1
 _Avoid_: herdr-core 环境、HC 环境
 
 **标签更名 (tab rename)**：
-`/name` 更名会话时把 pi 所在的窗口标签同步改名；两代 herdr 命令不同（`herdr tab rename` / `herdr-app do tab.rename`），失败一律静默放弃。
+`/name` 更名会话时把 pi 所在的窗口标签同步改名；会话启动（resume、`/reload`、切换会话）后按已有会话名再对齐一次，免得 herdr 在未命名标签上回落到 pi 的 `π - <会话名> - <cwd>` 标题。两代 herdr 命令不同（`herdr tab rename` / `herdr-app do tab.rename`），失败一律静默放弃。
 _Avoid_: 重命名窗口、title rename
 
 ### 后台任务（pi-bg）

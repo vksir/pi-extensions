@@ -178,6 +178,59 @@ test("旧 herdr：子 agent 会话更名不得触碰主标签", async () => {
 	}
 });
 
+test("herdr app：resume / 切换会话后把标签重新对齐到会话名", async () => {
+	const s = await setup({ variant: "app" });
+	try {
+		// pi 启动后内置标题会变回 `π - sess - <cwd>`，标签得重新对齐回会话名。
+		s.fire("session_start", { type: "session_start", reason: "resume" });
+		assert.deepEqual(await s.execCalls(), [
+			{ command: "herdr-app", args: ["ls"] },
+			{ command: "herdr-app", args: ["do", "tab.rename", "--id", "tb-1", "--name", "sess"] },
+		]);
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("旧 herdr：resume 后把标签重新对齐到会话名", async () => {
+	const s = await setup({ variant: "legacy" });
+	try {
+		s.fire("session_start", { type: "session_start", reason: "resume" });
+		assert.deepEqual(await s.execCalls(), [
+			{ command: "herdr-stub", args: ["tab", "rename", "tab-1", "sess"] },
+		]);
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("herdr 两代：无名会话启动时不动标签", async () => {
+	for (const variant of ["legacy", "app"] as const) {
+		const s = await setup({ variant });
+		try {
+			s.fire("session_start", { type: "session_start", reason: "startup" }, {
+				...s.ctx,
+				sessionManager: { getSessionName: () => undefined },
+			});
+			assert.deepEqual(await s.execCalls(), []);
+		} finally {
+			shutdown(s);
+		}
+	}
+});
+
+test("herdr 两代：子 agent 会话启动不得触碰主标签", async () => {
+	for (const variant of ["legacy", "app"] as const) {
+		const s = await setup({ variant });
+		try {
+			s.fire("session_start", { type: "session_start", reason: "startup" }, { ...s.ctx, mode: "print" });
+			assert.deepEqual(await s.execCalls(), []);
+		} finally {
+			shutdown(s);
+		}
+	}
+});
+
 test("普通终端：主会话 agent 运行时播放标题动画并恢复原标题", async () => {
 	const s = await setup();
 	try {
