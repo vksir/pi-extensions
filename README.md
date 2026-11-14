@@ -25,7 +25,7 @@ node --test tests/*.test.ts
 | [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 用量，支持 `/token` 命令；footer 状态行里插入最近一次响应的输出速率（`R1.5M 42t/s CH97.1%`） |
 | [pi-context](extensions/pi-context.ts) | `/context` 触发一次空转请求，导出这次请求的系统提示词与工具声明（含 codemode 动态描述），两者同源 |
 | [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron <间隔> [once] <prompt>`、`/cron list`、`/cron delete [id]` |
-| [pi-btw](extensions/pi-btw.ts) | 顺带分派：仅在 herdr / herdr app 环境注册 `/btw <消息>`，新开一个标签，fork 当前会话启动 pi 并把消息作为首条消息递交 |
+| [pi-btw](extensions/pi-btw.ts) | 顺带分派：仅在 herdr / herdr app 环境注册 `/btw <消息>`，新开一个标签，fork 当前会话启动 pi 并把消息作为首条消息递交；本轮还在跑时先把 fork 源截到上一个完整轮次，避免新会话继承半截 turn（见 [ADR-0008](docs/adr/0008-btw-forks-at-turn-boundary.md)） |
 | [pi-bg](extensions/pi-bg.ts) | 后台运行：`bash_bg` / `codemode_bg` 立即返回，结束后把结果作为消息发回会话；`bg_job` 工具与 `/bg` 命令查看/终止/等候，并与内置工具的启用状态联动 |
 | [pi-herdr-agent](extensions/pi-herdr-agent.ts) | 用 herdr-core（hc）的终端树跑子 agent：`agent` 拉起、`agent_job` 管理（list / wait / kill / ask / steer），结果按 asker 自动回发；`/agent list` 显示 agent 树；仅 herdr app + hc 环境生效 |
 
@@ -90,10 +90,12 @@ node --test 'tests/pi-title.test.ts'
 
 以 `--no-session` 启动（无会话文件可 fork）时 `/btw` 直接报错拒绝，不降级成全新会话。标签与首条消息的代际编排在 `extensions/lib/herdr.ts`，与 pi-title 共用环境探测。
 
+本轮还在跑时（模型正在生成、工具正在执行）敲 `/btw`，会话文件末尾必然是半截 turn：本轮的 user 消息已落盘但没有回答，或带 `toolCall` 的 assistant 还没有 `toolResult`。直接 fork 会让新 pi 把这半截当成自己的完整过去，从第一句话起就跑偏。所以忙碌时先由 `extensions/lib/session-snapshot.ts` 把会话截到**最后一个完整 turn 的边界**（一条不含 `toolCall` 的 assistant 消息），写进系统临时目录再 fork；成功通知会说明回退了多远、丢了几条未完成记录。代价是 fork 丢掉本轮进展，换来干净的历史。设计取舍见 [ADR-0008](docs/adr/0008-btw-forks-at-turn-boundary.md)。
+
 回归测试（Node.js 24+）：
 
 ```bash
-node --test 'tests/herdr.test.ts' 'tests/pi-btw.test.ts'
+node --test 'tests/herdr.test.ts' 'tests/pi-btw.test.ts' 'tests/session-snapshot.test.ts'
 ```
 
 ### 后台运行（bash_bg / codemode_bg）
@@ -116,8 +118,6 @@ node --test 'tests/herdr.test.ts' 'tests/pi-btw.test.ts'
 ```bash
 node --test 'tests/pi-bg.test.ts'
 ```
-
-### 通知配置
 
 ### 子 agent（herdr-agent）
 
@@ -152,6 +152,8 @@ node --test 'tests/pi-bg.test.ts'
 node --test 'tests/pi-herdr-agent.test.ts'
 ```
 
+### 通知配置
+
 pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式下静默。
 
 主 agent 因 [@tintinweb/pi-subagents](https://www.npmjs.com/package/@tintinweb/pi-subagents) 的进程内子 agent 仍在运行或排队而停下等待时（同样触发 `agent_settled`），不发通知——只有真正完成才通知。探测实现在 `lib/subagents.ts`：注册表取不到时（未安装、被过滤、形状变化）一律按没有子 agent 处理，照常通知。作为 herdr 子 agent 运行的会话（有 `PI_AGENT_ID`）同样不通知：它的一轮结束不是人在等的那件事。
@@ -183,11 +185,11 @@ pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式�
 | 模块 | 职责 |
 |------|------|
 | `lib/herdr.ts` | 两代 herdr 环境探测、标签更名、新标签启动 |
-| `lib/subagents.ts` | pi-subagents 注册表的子 agent 存活探测 |
-| `lib/cron/schedule.ts` | cron 表达式解析、下次触发、间隔换算（纯函数） |
 | `lib/hc.ts` | herdr-core 的 JSON-RPC 客户端（命名管道、一行一条） |
 | `lib/agent-protocol.ts` | 子 agent 的消息信封、名称校验、结果截断（纯函数） |
 | `lib/output-file.ts` | 超长结果落临时文件（与 pi 内置输出文件同套约定） |
+| `lib/subagents.ts` | pi-subagents 注册表的子 agent 存活探测 |
+| `lib/cron/schedule.ts` | cron 表达式解析、下次触发、间隔换算（纯函数） |
 | `lib/cron/presentation.ts` | 排期的人类可读化与触发 prompt 包装 |
 | `lib/bg/jobs.ts` | 后台任务表：上限、淘汰、id 分配（纯函数） |
 | `lib/bg/format.ts` | 后台任务的启动/回传/列表文本 |

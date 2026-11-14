@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 type Handler = (args: string, ctx: FakeCtx) => Promise<void> | void;
@@ -6,6 +9,7 @@ type Handler = (args: string, ctx: FakeCtx) => Promise<void> | void;
 interface FakeCtx {
 	sessionManager: { getSessionFile: () => string | undefined };
 	ui: { notify: (message: string, type?: "info" | "warning" | "error") => void };
+	isIdle: () => boolean;
 }
 
 interface ExecScript {
@@ -23,6 +27,8 @@ interface Setup {
 	scriptExec: (responses: ExecScript[]) => void;
 	/** 改写假 ctx 返回的当前会话文件；undefined 模拟无 session 文件 */
 	setSessionFile: (file: string | undefined) => void;
+	/** 模拟 agent 是否在跑 turn（默认空闲） */
+	setBusy: (busy: boolean) => void;
 	notifies: { message: string; type?: string }[];
 	/** 恢复 setup 改动的进程环境变量 */
 	restoreEnv: () => void;
@@ -66,6 +72,7 @@ async function setup(options: { variant?: "legacy" | "app" | "none" } = {}): Pro
 
 	const notifies: { message: string; type?: string }[] = [];
 	let sessionFile: string | undefined = "/tmp/sess/current.json";
+	let busy = false;
 	const ctx: FakeCtx = {
 		sessionManager: { getSessionFile: () => sessionFile },
 		ui: {
@@ -73,6 +80,7 @@ async function setup(options: { variant?: "legacy" | "app" | "none" } = {}): Pro
 				notifies.push({ message, type });
 			},
 		},
+		isIdle: () => !busy,
 	};
 
 	return {
@@ -88,6 +96,9 @@ async function setup(options: { variant?: "legacy" | "app" | "none" } = {}): Pro
 		},
 		setSessionFile: (file) => {
 			sessionFile = file;
+		},
+		setBusy: (value) => {
+			busy = value;
 		},
 		notifies,
 		restoreEnv: () => {
@@ -195,5 +206,150 @@ test("CLI 失败：error 通知带原因", async () => {
 		await s.run("btw", "hello");
 		assert.equal(s.notifies[0]!.type, "error");
 		assert.match(s.notifies[0]!.message, /no window/);
+	});
+});
+
+// ---- agent 忙碌时的安全快照 ----
+
+const STAMP = "2026-01-01T00:00:00.000Z";
+
+function headerLine(): Record<string, unknown> {
+	return { type: "session", version: 3, id: "sess-btw", timestamp: STAMP, cwd: process.cwd() };
+}
+
+function messageLine(
+	type: "user" | "assistant" | "toolCall",
+	id: string,
+	parentId: string | null,
+): Record<string, unknown> {
+	if (type === "user") {
+		return {
+			type: "message",
+			id,
+			parentId,
+			timestamp: STAMP,
+			message: { role: "user", content: "问题", timestamp: 0 },
+		};
+	}
+	const content =
+		type === "assistant"
+			? [{ type: "text", text: "答" }]
+			: [{ type: "toolCall", id: "c1", name: "bash", arguments: {} }];
+	return {
+		type: "message",
+		id,
+		parentId,
+		timestamp: STAMP,
+		message: {
+			role: "assistant",
+			content,
+			api: "test",
+			provider: "test",
+			model: "test",
+			usage: {},
+			stopReason: type === "assistant" ? "stop" : "toolUse",
+			timestamp: 0,
+		},
+	};
+}
+
+function writeSessionFile(entries: Record<string, unknown>[]): string {
+	const dir = mkdtempSync(join(tmpdir(), "pi-btw-session-"));
+	const file = join(dir, "current.jsonl");
+	writeFileSync(file, entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""), "utf-8");
+	return file;
+}
+
+function readSessionFile(file: string): Record<string, unknown>[] {
+	return readFileSync(file, "utf-8")
+		.split("\n")
+		.filter((line) => line.trim())
+		.map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+test("agent 忙碌（流式生成中）：fork 改走截到上一轮边界的快照，并说明丢弃条数", async () => {
+	await withSetup({ variant: "app" }, async (s) => {
+		const file = writeSessionFile([
+			headerLine(),
+			messageLine("user", "u1", null),
+			messageLine("assistant", "a1", "u1"),
+			messageLine("user", "u2", "a1"),
+		]);
+		s.setSessionFile(file);
+		s.setBusy(true);
+		await s.run("btw", "顺便查一下");
+
+		const calls = s.execCalls();
+		assert.equal(calls.length, 1);
+		const argv = JSON.parse(calls[0]!.args[calls[0]!.args.indexOf("--argv") + 1]!);
+		const forkPath = argv[2] as string;
+		assert.notEqual(forkPath, file);
+		assert.deepEqual(readSessionFile(forkPath), [
+			headerLine(),
+			messageLine("user", "u1", null),
+			messageLine("assistant", "a1", "u1"),
+		]);
+		assert.equal(readSessionFile(file).length, 4, "源会话不该被改动");
+		assert.equal(s.notifies[0]!.type, "info");
+		assert.match(s.notifies[0]!.message, /尚未结束/);
+		assert.match(s.notifies[0]!.message, /1 条/);
+	});
+});
+
+test("agent 忙碌（工具执行中）：悬空 toolCall 不会进入 fork 的上下文", async () => {
+	await withSetup({ variant: "legacy" }, async (s) => {
+		const file = writeSessionFile([
+			headerLine(),
+			messageLine("user", "u1", null),
+			messageLine("assistant", "a1", "u1"),
+			messageLine("user", "u2", "a1"),
+			messageLine("toolCall", "a2", "u2"),
+		]);
+		s.setSessionFile(file);
+		s.setBusy(true);
+		s.scriptExec([
+			{ stdout: '{"result":{"root_pane":{"pane_id":"w1:p1"}}}' },
+			{},
+			{ stdout: JSON.stringify({ result: { agents: [{ pane_id: "w1:p1", agent: "pi", agent_status: "idle" }] } }) },
+			{},
+			{},
+		]);
+		await s.run("btw", "顺便查一下");
+
+		const calls = s.execCalls();
+		const forkArg = calls[1]!.args[5]!;
+		const forkPath = forkArg.slice(1, -1); // pane run 把路径包在单引号里
+		assert.notEqual(forkPath, file);
+		const entries = readSessionFile(forkPath);
+		assert.equal(entries.length, 3);
+		assert.equal(entries[2]!.type, "message");
+	});
+});
+
+test("agent 忙碌但会话已停在完整边界：仍 fork 原文件", async () => {
+	await withSetup({ variant: "app" }, async (s) => {
+		const file = writeSessionFile([
+			headerLine(),
+			messageLine("user", "u1", null),
+			messageLine("assistant", "a1", "u1"),
+		]);
+		s.setSessionFile(file);
+		s.setBusy(true);
+		await s.run("btw", "顺便查一下");
+		const calls = s.execCalls();
+		const argv = JSON.parse(calls[0]!.args[calls[0]!.args.indexOf("--argv") + 1]!);
+		assert.equal(argv[2], file);
+		assert.doesNotMatch(s.notifies[0]!.message, /尚未结束/);
+	});
+});
+
+test("agent 忙碌且会话文件读不了：error 通知，不启动新标签", async () => {
+	await withSetup({ variant: "app" }, async (s) => {
+		s.setSessionFile(join(tmpdir(), "pi-btw-missing", "nope.jsonl"));
+		s.setBusy(true);
+		await s.run("btw", "顺便查一下");
+		assert.deepEqual(s.execCalls(), []);
+		assert.equal(s.notifies[0]!.type, "error");
+		assert.match(s.notifies[0]!.message, /快照/);
 	});
 });

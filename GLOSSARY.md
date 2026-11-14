@@ -85,8 +85,16 @@ _Avoid_: 旁支任务、side task、转交
 _Avoid_: 分身标签、影子会话、shadow session
 
 **fork 会话 (Forked Session)**：
-btw 标签里新 pi 的会话起点——以 `pi --fork <当前会话文件>` 从当前会话分叉，带全量上下文，fork 进当前工作目录。
+btw 标签里新 pi 的会话起点——以 `pi --fork <当前会话文件>` 从当前会话分叉，带全量上下文，fork 进当前工作目录。当前 turn 未结束时，fork 源先截到最后一个 turn 边界。
 _Avoid_: 新会话、克隆、clone、resume
+
+**turn 边界 (Turn Boundary)**：
+一条 content 里不含工具调用的 assistant 消息，代表一轮对话的收尾。pi 只在 `message_end` 落盘，会话文件在 turn 进行中必然停在半截；`/btw` 据此把 fork 源回退到最后一个完整轮次（见 ADR-0008）。
+_Avoid_: 检查点、断点、checkpoint、断点续跑
+
+**fork 快照 (Fork Snapshot)**：
+忙碌时由 `snapshotAtTurnBoundary()` 写进系统临时目录的会话副本——header + 当前分支到 turn 边界的前缀，供 `pi --fork` 使用；源会话只读。
+_Avoid_: 临时会话、备份会话、dump
 
 ### 标题与标签（pi-title）
 
