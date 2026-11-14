@@ -71,7 +71,7 @@ _Avoid_: 任务清单、调度表、registry
 _Avoid_: 分身、内部 agent、内嵌 agent
 
 **完成通知 (completion notification)**：
-主 agent settle 且没有进程内子 agent 在跑时发出的桌面通知；等子 agent 的 settle、中止与非交互模式一律静默。
+主 agent settle 且没有进程内子 agent 在跑时发出的桌面通知；等子 agent 的 settle、herdr 子 agent 会话（有 `PI_AGENT_ID`）、中止与非交互模式一律静默。
 _Avoid_: 结束提醒、done 提示
 
 ### 顺带分派（pi-btw）
@@ -131,3 +131,33 @@ _Avoid_: 包装、转发、代理、wrap
 **存续域 (lifetime)**：
 后台任务只活在当前会话里：`/new`、`/reload`、`/resume`、`/fork`、退出都中止全部在跑任务。
 _Avoid_: 进程级、全局、persistent
+
+### 子 agent（pi-herdr-agent）
+
+**herdr 子 agent (agent)**：
+由 `agent` 工具在 headless hc 终端里拉起的交互式 pi；每个都是独立进程、独立 pi 会话，按 hc 的 parent 关系组成树。与 pi-subagents 的进程内子 agent 是两种形态。
+_Avoid_: 进程内子 agent、subagent、分身、worker
+
+**agent id**：
+拉起时生成的 6 位十六进制短码（如 `a7k2f9`），跨 resume 不变，是工具参数与消息里唯一的寻址名。根 agent 的 id 是它的 hc 终端地址（如 `t4m`）。
+_Avoid_: 会话 id、uuid、handle、agent 名
+
+**name（侧边栏名）**：
+agent 的 hc 终端名，创建时固定，herdr-app 侧边栏显示的就是它；1–32 位 `[a-z0-9._-]`，活终端间唯一，非法或重名直接报错。只作显示，寻址一律用 agent id。
+_Avoid_: label、别名、标题、会话名
+
+**asker（当轮提问者）**：
+发起当前这一轮对话的 agent：可能是拉起者，也可能是后来通过 `agent_job ask` 提问的任意 agent。只活在接收方进程内存里，一轮 settle 后清空；拉起时的 prompt 也算一次 ask。
+_Avoid_: 调用方、owner、requester、父 agent（归属关系与当轮发起是两件事）
+
+**结果回发 (result delivery)**：
+子 agent 一轮结束（settle）时把最终 assistant 文本发给当轮 asker 的动作；没有 asker 的轮（人直接打字、收到 result、单纯 steer）不回发。
+_Avoid_: 通知、回调、completion、汇报
+
+**信封 (agent envelope)**：
+消息首行的一行标签 `<pi-agent from="…" addr="…" name="…" kind="ask|steer|result">`；接收方扩展在 `input` 事件里剥掉它，模型只看到正文。`kind=result` 的入站消息不设 asker，避免回环。
+_Avoid_: header、前缀、metadata、标记
+
+**会话推导 (derived session id)**：
+子 agent 的 pi 会话 id 由 agent id 确定性推导为 `pi-<agent id>`；resume 时按它扫 `sessions/*/` 找会话文件，不需要任何登记表。
+_Avoid_: 映射表、registry、session 映射

@@ -27,6 +27,7 @@ node --test tests/*.test.ts
 | [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron <间隔> [once] <prompt>`、`/cron list`、`/cron delete [id]` |
 | [pi-btw](extensions/pi-btw.ts) | 顺带分派：仅在 herdr / herdr app 环境注册 `/btw <消息>`，新开一个标签，fork 当前会话启动 pi 并把消息作为首条消息递交 |
 | [pi-bg](extensions/pi-bg.ts) | 后台运行：`bash_bg` / `codemode_bg` 立即返回，结束后把结果作为消息发回会话；`bg_job` 工具与 `/bg` 命令查看/终止/等候，并与内置工具的启用状态联动 |
+| [pi-herdr-agent](extensions/pi-herdr-agent.ts) | 用 herdr-core（hc）的终端树跑子 agent：`agent` 拉起、`agent_job` 管理（list / wait / kill / ask / steer），结果按 asker 自动回发；`/agent list` 显示 agent 树；仅 herdr app + hc 环境生效 |
 
 `/balance codex` 需要先通过 `/login openai-codex` 登录 ChatGPT Plus/Pro 订阅。`/balance opencode` 查 OpenCode Go 的 5 小时/周/月额度，需要先配置 `opencode-go` 的 API Key。
 
@@ -118,9 +119,42 @@ node --test 'tests/pi-bg.test.ts'
 
 ### 通知配置
 
+### 子 agent（herdr-agent）
+
+用 herdr-core（hc）的终端树替代进程内子 agent：每个 agent 都是 headless hc 终端里一个**交互式 pi** 进程，herdr-app 把它挂在父 tab 下当 sub-agent 显示（`agent.focus` 可临时给它一个 pane），pi 退出即销毁终端。只在 herdr app + hc 环境注册（`HC_TERMINAL_ID` 与 `HC_TERMINAL_SOCKET` 都在）。设计取舍见 [ADR-0007](docs/adr/0007-herdr-subagents-live-in-hc-terminal-tree.md)。
+
+两个工具：
+
+- `agent { prompt, name?, model?, thinking?, resume? }`：拉起子 agent，等 pi 就绪且 prompt 送达后返回 id / name，不等结果。`name` 是 hc 终端名（侧边栏显示），1–32 位 `[a-z0-9._-]`、活终端间唯一，非法或重名直接报错；省略用 agent id。`model` / `thinking` 省略时继承父 agent 当前值。结果作为消息回到当轮 asker（拉起也算一次 ask）。
+- `agent_job { action, id?, message?, timeout? }`：`list`（本 hc session 所有活 agent，带 relation / parent / depth / status）、`wait`（id 必填，只回状态，超时是 check-in）、`kill`（仅自己的后代）、`ask`（目标必须 idle，忙则报错）、`steer`（目标必须 working）。
+
+人工入口：`/agent list` 以**卡片式森林**渲染当前 hc session 的 agent 树——每棵独立的树一块（`▌` 引导），名字在前、id 在后，状态右对齐（不显示 cwd）；根显示 pi 会话名（无会话名时 `(root)`）；`●` 自己、`↑` 父 agent，父终端已消失的 agent 标「失联」。
+
+身份与寻址：
+
+- 子 agent id 是拉起时生成的 6 位十六进制短码，pi 会话 id 推导为 `pi-<id>`；resume 按 id 找会话文件重新拉起，不需要登记表。根 agent（人启动的 pi）的 id 是它的 hc 地址。
+- `name` 只作显示；asker、会话路径等可变语义不进 hc label。发现靠创建时写入的 label `pi.agent=<id>`。
+- 拉起时注入 `PI_AGENT_ID` / `PI_AGENT_NAME` / `PI_AGENT_PARENT` / `PI_AGENT_ROOT` / `PI_AGENT_DEPTH`，子进程的扩展据此知道自己是谁、在树里的哪一层。
+
+约束：
+
+- 树深最多三层（root → 子 → 孙），深度 2 的 agent 不再注册 `agent`。
+- resume 不允许换模型 / 思考级别：传了与会话记录不一致的值直接报错（避免缓存整体未命中）。
+- 结果正文超过 2000 行 / 50 KB 时按 bash 同款尾部截断，全文写 `pi-herdr-agent-*.log`，由 asker 自己读。
+- `kill` 只允许自己的后代；root 正常退出时递归清理直接子 agent；硬崩溃留下的孤儿在 `list` 里标 `orphan`。
+- 拉起时 `no_notify: true`：hc 的 note 不进消息通道；消息只有 `ask` 与结果回发。
+- 子 agent settle 时把 pi 内置 reporter 的 OSC `state=done` 在 stdout 层改写成 `state=idle`：hc 侧只看到 `working → idle`，不留下 done（根 agent 不受影响）。
+- 子 agent 卡在扩展 UI 弹窗时会给当轮 asker 发一条 blocked 提示。
+
+回归测试：
+
+```bash
+node --test 'tests/pi-herdr-agent.test.ts'
+```
+
 pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式下静默。
 
-主 agent 因 [@tintinweb/pi-subagents](https://www.npmjs.com/package/@tintinweb/pi-subagents) 的进程内子 agent 仍在运行或排队而停下等待时（同样触发 `agent_settled`），不发通知——只有真正完成才通知。探测实现在 `lib/subagents.ts`：注册表取不到时（未安装、被过滤、形状变化）一律按没有子 agent 处理，照常通知。
+主 agent 因 [@tintinweb/pi-subagents](https://www.npmjs.com/package/@tintinweb/pi-subagents) 的进程内子 agent 仍在运行或排队而停下等待时（同样触发 `agent_settled`），不发通知——只有真正完成才通知。探测实现在 `lib/subagents.ts`：注册表取不到时（未安装、被过滤、形状变化）一律按没有子 agent 处理，照常通知。作为 herdr 子 agent 运行的会话（有 `PI_AGENT_ID`）同样不通知：它的一轮结束不是人在等的那件事。
 
 在两代 [herdr](https://herdr.dev) 终端环境中（旧 herdr 注入 `HERDR_ENV=1`，或 herdr-core 注入 `HC_TERMINAL_ID`）默认启用；如需在 herdr 中禁用，在 settings.json 中配置：
 
@@ -151,6 +185,9 @@ pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式�
 | `lib/herdr.ts` | 两代 herdr 环境探测、标签更名、新标签启动 |
 | `lib/subagents.ts` | pi-subagents 注册表的子 agent 存活探测 |
 | `lib/cron/schedule.ts` | cron 表达式解析、下次触发、间隔换算（纯函数） |
+| `lib/hc.ts` | herdr-core 的 JSON-RPC 客户端（命名管道、一行一条） |
+| `lib/agent-protocol.ts` | 子 agent 的消息信封、名称校验、结果截断（纯函数） |
+| `lib/output-file.ts` | 超长结果落临时文件（与 pi 内置输出文件同套约定） |
 | `lib/cron/presentation.ts` | 排期的人类可读化与触发 prompt 包装 |
 | `lib/bg/jobs.ts` | 后台任务表：上限、淘汰、id 分配（纯函数） |
 | `lib/bg/format.ts` | 后台任务的启动/回传/列表文本 |

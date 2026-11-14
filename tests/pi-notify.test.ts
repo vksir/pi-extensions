@@ -99,7 +99,7 @@ interface Setup {
 let moduleSeq = 0;
 async function setup(): Promise<Setup> {
 	// 本进程可能带着 herdr 的环境变量，先摘掉再导入，让 inHerdrEnv 按否处理。
-	const herdrEnvKeys = ["HERDR_ENV", "HERDR_TAB_ID", "HERDR_BIN_PATH", "HC_TERMINAL_ID"] as const;
+	const herdrEnvKeys = ["HERDR_ENV", "HERDR_TAB_ID", "HERDR_BIN_PATH", "HC_TERMINAL_ID", "PI_AGENT_ID"] as const;
 	const savedEnv = new Map(herdrEnvKeys.map((k) => [k, process.env[k]]));
 	for (const k of herdrEnvKeys) delete process.env[k];
 
@@ -182,6 +182,17 @@ test("子 agent 结束后（hasRunning 翻 false）恢复通知", async () => {
 		running = false;
 		await t.fire();
 		assert.equal(t.oscWrites().length, 1);
+	} finally {
+		t.restore();
+	}
+});
+
+test("herdr 子 agent 会话的 settle 不通知", async () => {
+	const t = await setup();
+	try {
+		process.env.PI_AGENT_ID = "abcd";
+		await t.fire();
+		assert.deepEqual(t.oscWrites(), []);
 	} finally {
 		t.restore();
 	}

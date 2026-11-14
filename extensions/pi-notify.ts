@@ -11,6 +11,8 @@
  *
  * 主 agent 因 @tintinweb/pi-subagents 的进程内子 agent 仍在运行或排队而停下
  * 等待时，同样会触发 agent_settled，此时不算完成，不发通知（见 lib/subagents.ts）。
+ * 作为 herdr 子 agent 运行的会话（有 PI_AGENT_ID）也不发：它的一轮结束不是人
+ * 在等的那件事，通知只会变成噪音。
  */
 
 import { execFile } from "node:child_process";
@@ -93,6 +95,8 @@ export default function (pi: ExtensionAPI) {
 		// 扩展也会在 RPC/JSON/print 模式下加载，
 		// 直接写 process.stdout 会污染非交互输出，仅在 TUI 模式通知
 		if (event.aborted || ctx.mode !== "tui") return;
+		// herdr 子 agent 会话的一轮结束不面向人，不通知
+		if (process.env.PI_AGENT_ID?.trim()) return;
 		// 主 agent 停下来等进程内子 agent（运行或排队）也会 settle，这不是完成，
 		// 不通知；注册表取不到时按没有子 agent 处理，照常通知
 		if (hasRunningSubagents()) return;
