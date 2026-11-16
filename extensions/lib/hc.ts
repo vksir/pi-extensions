@@ -101,12 +101,19 @@ export interface HcWaitParams {
 	timeout?: number;
 }
 
+export interface HcLabelParams {
+	terminal: string;
+	/** 要设置的 label；`key=`（空串）表示删除。 */
+	labels: Record<string, string>;
+}
+
 export interface HcClient {
 	run(params: HcRunParams): Promise<HcRunResult>;
 	send(params: HcSendParams): Promise<HcSendResult>;
 	wait(params: HcWaitParams): Promise<HcWaitResult>;
 	get(terminal: string): Promise<HcTerminal>;
 	list(): Promise<HcTerminal[]>;
+	label(params: HcLabelParams): Promise<HcTerminal>;
 	kill(terminal: string): Promise<HcTerminal>;
 }
 
@@ -224,6 +231,9 @@ export function createHcClient(socketPath: string): HcClient {
 		async list() {
 			const result = (await rpc("terminal.list", {})) as { terminals?: HcTerminal[] };
 			return result.terminals ?? [];
+		},
+		async label(params) {
+			return (await rpc("terminal.label", params)) as HcTerminal;
 		},
 		async kill(terminal) {
 			return (await rpc("terminal.kill", { terminal })) as HcTerminal;

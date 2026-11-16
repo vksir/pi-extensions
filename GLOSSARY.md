@@ -147,11 +147,11 @@ _Avoid_: 进程级、全局、persistent
 _Avoid_: 进程内子 agent、subagent、分身、worker
 
 **agent id**：
-拉起时生成的 6 位十六进制短码（如 `a7k2f9`），跨 resume 不变，是工具参数与消息里唯一的寻址名。根 agent 的 id 是它的 hc 终端地址（如 `t4m`）。
+agent 的 6 位字母数字短码（如 `a7k2f9`），是工具参数与消息里唯一的寻址名。子 agent 的 id 在拉起时生成（与推导出的会话 id `pi-<id>` 绑定，跨 resume 不变）；根 agent 的 id 取自己会话 id 末尾 6 位（uuidv7 尾段，如 `5e6f70`），写进终端的 `pi.agent.root` label 供树里其它 agent 识别，`/new`、`/resume`、`/fork` 后随会话 id 重写；label 写不进去时退回 hc 终端地址（如 `t4m`）。
 _Avoid_: 会话 id、uuid、handle、agent 名
 
 **name（侧边栏名）**：
-agent 的 hc 终端名，创建时固定，herdr-app 侧边栏显示的就是它；1–32 位 `[a-z0-9._-]`，活终端间唯一，非法或重名直接报错。只作显示，寻址一律用 agent id。
+子 agent 的 hc 终端名，创建时固定，herdr-app 侧边栏显示的就是它；1–32 位 `[a-z0-9._-]`，活终端间唯一，非法或重名直接报错。根 agent 没有自己的 hc 名，`/agent list` 里的显示名取 pi 终端标题（`/name` 的会话名，未命名时 `π - <cwd>`），不取 hc 终端名。只作显示，寻址一律用 agent id。
 _Avoid_: label、别名、标题、会话名
 
 **asker（当轮提问者）**：
@@ -167,5 +167,5 @@ _Avoid_: 通知、回调、completion、汇报
 _Avoid_: header、前缀、metadata、标记
 
 **会话推导 (derived session id)**：
-子 agent 的 pi 会话 id 由 agent id 确定性推导为 `pi-<agent id>`；resume 时按它扫 `sessions/*/` 找会话文件，不需要任何登记表。
+子 agent 的 pi 会话 id 由 agent id 确定性推导为 `pi-<agent id>`；resume 时按它扫 `sessions/*/` 找会话文件，不需要任何登记表。根 agent 反过来：id 是从自己的会话 id 尾部截出来的。
 _Avoid_: 映射表、registry、session 映射

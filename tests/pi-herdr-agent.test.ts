@@ -10,16 +10,18 @@ import {
 } from "../extensions/lib/agent-protocol.ts";
 import {
 	buildRows,
+	currentTree,
 	formatAgentTree,
 	formatRows,
 	isDescendant,
 	lastAssistantText,
 	readSessionFacts,
 	rewriteDoneStatus,
+	rootIdOf,
 	type AgentRow,
 	type TreeLine,
 } from "../extensions/pi-herdr-agent.ts";
-import { HcError, type HcClient, type HcRunParams, type HcRunResult, type HcSendParams, type HcSendResult, type HcTerminal, type HcWaitParams, type HcWaitResult } from "../extensions/lib/hc.ts";
+import { HcError, type HcClient, type HcLabelParams, type HcRunParams, type HcRunResult, type HcSendParams, type HcSendResult, type HcTerminal, type HcWaitParams, type HcWaitResult } from "../extensions/lib/hc.ts";
 
 // ─── 测试替身 ───
 
@@ -153,13 +155,18 @@ class FakeHc implements HcClient {
 		this.record("kill", { terminal: name });
 		return terminal({ address: name, state: "finished" });
 	}
+
+	async label(params: HcLabelParams) {
+		this.record("label", params);
+		return this.terminals.find((candidate) => candidate.address === params.terminal) ?? terminal({ address: params.terminal });
+	}
 }
 
 interface FakeCtx {
 	cwd: string;
 	model: { provider: string; id: string } | undefined;
 	thinkingLevel: string | undefined;
-	sessionManager: { getSessionName: () => string | undefined };
+	sessionManager: { getSessionName: () => string | undefined; getSessionId: () => string };
 	modelRegistry: { getAll: () => { provider: string; id: string; name?: string }[] };
 }
 
@@ -168,7 +175,10 @@ function context(overrides: Partial<FakeCtx> = {}): FakeCtx {
 		cwd: "D:\\repo",
 		model: { provider: "p", id: "m" },
 		thinkingLevel: "high",
-		sessionManager: { getSessionName: () => undefined },
+		sessionManager: {
+			getSessionName: () => undefined,
+			getSessionId: () => "0193a5c4-8f2b-7c3d-9e01-2b3c4d5e6f70",
+		},
 		modelRegistry: { getAll: () => [{ provider: "p", id: "m", name: "M" }] },
 		...overrides,
 	};
@@ -651,20 +661,140 @@ test("formatAgentTree renders cards with self, parent and orphan marks", () => {
 	assert.deepEqual(formatAgentTree([]).map(treeText), ["没有正在运行的 agent。"]);
 });
 
-test("root name strips the title wrapper and never shows cwd", () => {
+test("root name follows the pi title: session name, else the default π - cwd title", () => {
 	const named = terminal({ address: "t4m", labels: {}, title: "π - herdr-agent - repo", cwd: "D:\\x\\repo" });
 	const unnamed = terminal({ address: "t4n", labels: {}, title: "π - repo", cwd: "D:\\x\\repo" });
-	const rows = buildRows([named, unnamed], "t4m", "t4m");
+	// hc 终端名（比如 herdr 标签自动起的编号/旧名）不参与根的显示名。
+	const renamed = terminal({ address: "t4p", name: "verify-1", labels: {}, title: "π - repo", cwd: "D:\\x\\repo" });
+	// 标题被别的程序改写成非 pi 格式时，退回 hc 终端名。
+	const foreign = terminal({ address: "t4q", name: "shell", labels: {}, title: "pwsh", cwd: "D:\\x\\repo" });
+	const rows = buildRows([named, unnamed, renamed, foreign], "t4m", "t4m");
 	const byId = new Map(rows.map((row) => [row.id, row]));
 	assert.equal(byId.get("t4m")?.name, "herdr-agent");
-	assert.equal(byId.get("t4n")?.name, "(root)");
+	assert.equal(byId.get("t4n")?.name, "π - repo");
+	assert.equal(byId.get("t4p")?.name, "π - repo");
+	assert.equal(byId.get("t4q")?.name, "shell");
 });
 
-test("/agent list appends one tree entry", async () => {
+test("root short id is the tail of its session id", () => {
+	assert.equal(rootIdOf("0193a5c4-8f2b-7c3d-9e01-2b3c4d5e6f70"), "5e6f70");
+	assert.equal(rootIdOf("pi-a7k2f9"), "a7k2f9");
+	assert.equal(rootIdOf("my.SESSION_id"), "sionid");
+});
+
+test("root writes its short id as a terminal label on session_start", async () => {
+	const hc = new FakeHc();
+	hc.terminals = [terminal({ address: "t4m", labels: {}, title: "π - repo", cwd: "D:\\repo" })];
+	const { pi } = await setup({ hc });
+
+	await pi.emit("session_start", { type: "session_start", reason: "startup" }, context());
+	assert.deepEqual(hc.callsOf("label")[0]?.params, {
+		terminal: "t4m",
+		labels: { "pi.agent.root": "5e6f70" },
+	});
+
+	// 会话切换（/new、/resume）：扩展实例重建，session_start 带新会话 id，label 重写。
+	await pi.emit(
+		"session_start",
+		{ type: "session_start", reason: "new" },
+		context({
+			sessionManager: {
+				getSessionName: () => undefined,
+				getSessionId: () => "0193a5c4-8f2b-7c3d-9e01-000000000001",
+			},
+		}),
+	);
+	assert.equal(hc.callsOf("label")[1]?.params.labels["pi.agent.root"], "000001");
+});
+
+test("root short id is used for list, launch env and message envelopes", async () => {
+	const hc = new FakeHc();
+	const labeledRoot = () =>
+		terminal({ address: "t4m", labels: { "pi.agent.root": "5e6f70" }, title: "π - repo", cwd: "D:\\repo" });
+	hc.terminals = [labeledRoot()];
+	const { pi } = await setup({ hc });
+	await pi.emit("session_start", { type: "session_start", reason: "startup" }, context());
+
+	// 子 agent 拿到的 parent/root 就是这个短 id。
+	await pi.tools.get("agent")!.execute("call", { prompt: "x" }, undefined, undefined, context());
+	assert.equal(hc.callsOf("run")[0].params.env.PI_AGENT_PARENT, "5e6f70");
+	assert.equal(hc.callsOf("run")[0].params.env.PI_AGENT_ROOT, "5e6f70");
+
+	// 自己的树按短 id 认识自己：row id 是 label 值，名字仍按标题推导。
+	const rows = buildRows([labeledRoot()], "5e6f70", "t4m");
+	assert.equal(rows[0].id, "5e6f70");
+	assert.equal(rows[0].relation, "self");
+	assert.equal(rows[0].name, "π - repo");
+
+	const handler = pi.commands.get("agent")!;
+	await handler("list", context());
+	const text = ((pi.entries.at(-1)?.data.lines ?? []) as TreeLine[]).map(treeText).join("\n");
+	assert.ok(text.includes("π - repo") || text.includes("repo"));
+	assert.ok(text.includes("5e6f70"));
+});
+
+test("sub-agents keep the injected id and never relabel; a failed label keeps the address id", async () => {
+	const hc = new FakeHc();
+	const { pi } = await setup({ hc, env: { PI_AGENT_ID: "abcd", PI_AGENT_DEPTH: "1" } });
+	await pi.emit("session_start", { type: "session_start", reason: "startup" }, context());
+	assert.equal(hc.callsOf("label").length, 0);
+
+	const failing = new FakeHc();
+	failing.label = async () => {
+		throw new HcError("unavailable", "no labels here");
+	};
+	failing.terminals = [terminal({ address: "t4m", labels: {}, title: "π - repo", cwd: "D:\\repo" })];
+	const root = await setup({ hc: failing });
+	await root.pi.emit("session_start", { type: "session_start", reason: "startup" }, context());
+
+	// label 没写进去：本轮进程仍用地址当 id，树里靠地址认自己，不出现“自己消失”。
+	const rows = buildRows([failing.terminals[0]], "t4m", "t4m");
+	assert.equal(rows[0].id, "t4m");
+	assert.equal(rows[0].relation, "self");
+});
+
+test("a stale pi.agent.root label on a kept shell is not an agent", () => {
+	const shell = terminal({
+		address: "t4z",
+		labels: { "pi.agent.root": "5e6f70" },
+		status: { app: "pwsh", state: "idle" },
+		name: "shell",
+		title: "pwsh",
+	});
+	assert.deepEqual(buildRows([shell], "t4z", "t4z"), []);
+});
+
+test("currentTree keeps only self's component", () => {
+	const root = terminal({ address: "t4m", labels: {}, title: "π - repo" });
+	const child = terminal({ address: "t10", name: "reviewer", labels: { "pi.agent": "aaaa" }, parent: "t4m" });
+	const sibling = terminal({ address: "t11", name: "helper", labels: { "pi.agent": "bbbb" }, parent: "t4m" });
+	const otherRoot = terminal({ address: "t9x", labels: {}, title: "π - other" });
+	const otherChild = terminal({ address: "t90", name: "stranger", labels: { "pi.agent": "cccc" }, parent: "t9x" });
+	const orphan = terminal({ address: "t13", name: "lost", labels: { "pi.agent": "dddd" }, parent: "t99" });
+
+	const rows = buildRows([root, child, sibling, otherRoot, otherChild, orphan], "aaaa", "t10");
+	const ids = (subset: AgentRow[]) => subset.map((row) => row.id).sort();
+
+	// 子 agent 视角：向上爬到根，再把根下整棵子树收进来；别的树与孤儿不在内。
+	assert.deepEqual(ids(currentTree(rows, "aaaa")), ["aaaa", "bbbb", "t4m"]);
+	// 根视角：自己的整棵树。
+	assert.deepEqual(ids(currentTree(rows, "t4m")), ["aaaa", "bbbb", "t4m"]);
+	// 找不到自己时：能靠 relation 找到就用它，否则宁可全部显示。
+	assert.deepEqual(ids(currentTree(rows, "nope")), ["aaaa", "bbbb", "t4m"]);
+	const foreign = buildRows([root, child, sibling, otherRoot, otherChild, orphan], "nope", "t99");
+	assert.equal(currentTree(foreign, "nope").length, foreign.length);
+
+	assert.equal(treeText(formatAgentTree(currentTree(rows, "aaaa"))[0]), "agent 树 · 3 个 agent");
+	assert.equal(treeText(formatAgentTree(rows, "全部 agent 树")[0]), "全部 agent 树 · 6 个 agent");
+});
+
+test("/agent list shows the current tree, /agent list-all shows every tree", async () => {
 	const hc = new FakeHc();
 	hc.terminals = [
-		terminal({ address: "t4m", labels: {} }),
+		terminal({ address: "t4m", labels: {}, title: "π - repo" }),
 		terminal({ address: "t10", name: "reviewer", labels: { "pi.agent": "aaaa" }, parent: "t4m" }),
+		terminal({ address: "t9x", labels: {}, title: "π - other" }),
+		terminal({ address: "t90", name: "stranger", labels: { "pi.agent": "cccc" }, parent: "t9x" }),
 	];
 	const { pi } = await setup({ hc, env: { PI_AGENT_ID: "aaaa", PI_AGENT_DEPTH: "1" } });
 
@@ -677,6 +807,12 @@ test("/agent list appends one tree entry", async () => {
 	const text = (entry?.data.lines as TreeLine[]).map(treeText);
 	assert.ok(text.some((line) => line.startsWith("agent 树")));
 	assert.ok(text.some((line) => line.includes("● reviewer  ·  aaaa")));
+	assert.ok(!text.some((line) => line.includes("stranger")));
+
+	await handler("list-all", context());
+	const all = (pi.entries.at(-1)?.data.lines as TreeLine[]).map(treeText);
+	assert.ok(all.some((line) => line.startsWith("全部 agent 树")));
+	assert.ok(all.some((line) => line.includes("stranger  ·  cccc")));
 });
 
 test("subagent done OSC is rewritten to idle", () => {

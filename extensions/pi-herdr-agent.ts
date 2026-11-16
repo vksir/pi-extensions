@@ -9,7 +9,9 @@
  * - 子 agent 的 id 是拉起时生成的 6 位十六进制短码（如 `a7k2f9`），跨 resume 不变；pi 会话 id 由它
  *   **推导**成 `pi-a7k2f9`（`--session-id`），resume 时按 id 找 `_pi-a7k2f9.jsonl` 重新拉起，
  *   不需要任何登记表。
- * - 根 agent（人直接启动的 pi）没有 env 注入，id 就是它的 hc 地址（如 `t4m`）。
+ * - 根 agent（人直接启动的 pi）没有 env 注入：id 取自己会话 id 末尾的 6 位（uuidv7 尾段的随机 hex），
+ *   并写进自己终端的 `pi.agent.root` label 供其它 agent 在 `terminal.list` 里认出来；
+ *   `/new`、`/resume`、`/fork` 后会话 id 变了就重写 label。label 写不进去时退回 hc 地址。
  * - `name` 是 hc 终端名（herdr-app 侧边栏显示的那个），创建时固定，只作显示；寻址一律用 id。
  * - 拉起时注入 `PI_AGENT_ID` / `PI_AGENT_NAME` / `PI_AGENT_PARENT` / `PI_AGENT_ROOT` /
  *   `PI_AGENT_DEPTH`，子进程的扩展据此知道自己是谁、在树里的哪一层。
@@ -31,8 +33,8 @@
  * 把这条报告改写成 `state=idle`，所以 hc 只看到 working → idle，不会留下 done。
  * 根 agent（没有 `PI_AGENT_ID`）保持 pi 原生行为。
  *
- * 人工入口：`/agent list` 把当前 hc session 的 agent 树渲染成卡片式森林（● 自己、
- * ↑ 父 agent、失联单独标注）。
+ * 人工入口：`/agent list` 把当前 agent 树渲染成卡片式森林（● 自己、↑ 父 agent、
+ * 失联单独标注）；`/agent list-all` 连同当前 hc session 里其它独立的树一起显示。
  */
 
 import { randomBytes } from "node:crypto";
@@ -64,6 +66,7 @@ import {
 	type HcWaitResult,
 } from "./lib/hc.ts";
 import { writeOutputFile } from "./lib/output-file.ts";
+import { basename } from "./lib/text.ts";
 
 // ─── 常量 ───
 
@@ -164,9 +167,33 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 
 	const self = env.HC_TERMINAL_ID!.trim();
 	const hc = options.hc ?? createHcClient(env.HC_TERMINAL_SOCKET!.trim());
-	const myId = env.PI_AGENT_ID?.trim() || self;
-	const myRoot = env.PI_AGENT_ROOT?.trim() || myId;
+	// 根 agent 的 id 要等 session_start 读到会话 id 才能定（见 syncRootId），先拿地址兑底。
+	const injectedId = env.PI_AGENT_ID?.trim();
+	let myId = injectedId || self;
+	let myRoot = env.PI_AGENT_ROOT?.trim() || myId;
 	const myDepth = Number.parseInt(env.PI_AGENT_DEPTH ?? "0", 10) || 0;
+
+	/**
+	 * 根 agent 的短 id：会话 id 末尾 6 位字母数字（uuidv7 的尾段就是随机 hex；
+	 * 自定义 `--session-id` 里的 `-` `_` `.` 先压掉）。
+	 */
+	const syncRootId = async (ctx: ExtensionContext): Promise<void> => {
+		if (injectedId) return;
+		const id = rootIdOf(ctx.sessionManager.getSessionId());
+		if (!id || id === myId) return;
+		// 先写 label 再切 id：写不进去就继续用 hc 地址，保持“树里能看到的就是我的 id”。
+		try {
+			await hc.label({ terminal: self, labels: { "pi.agent.root": id } });
+			myId = id;
+			myRoot = id;
+		} catch {
+			// 旧 core / 权限问题：维持地址式 id，不打断会话。
+		}
+	};
+
+	pi.on("session_start", async (_event, ctx) => {
+		await syncRootId(ctx);
+	});
 
 	// 每轮的状态：asker 只在内存里（label 不承担可变语义），settle 后清空。
 	let pendingAsker: Asker | undefined;
@@ -687,23 +714,32 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	});
 
 	pi.registerCommand("agent", {
-		description: "子 agent：/agent list 显示 agent 树",
+		description: "子 agent：/agent list 显示当前 agent 树，/agent list-all 显示全部 agent 树",
 		getArgumentCompletions: (prefix) => {
 			if (prefix.trim().includes(" ")) return null;
-			return "list".startsWith(prefix.trim()) ? [{ value: "list", label: "list" }] : null;
+			const wanted = prefix.trim();
+			const items = [
+				{ value: "list", label: "list" },
+				{ value: "list-all", label: "list-all" },
+			].filter((item) => item.value.startsWith(wanted));
+			return items.length > 0 ? items : null;
 		},
 		handler: async (rawArgs) => {
 			const args = rawArgs.trim();
-			if (args && args !== "list") {
+			if (args && args !== "list" && args !== "list-all") {
 				pi.appendEntry<TreeEntry>(TREE_ENTRY, {
-					lines: [{ left: [{ text: "用法：/agent list", tone: "muted" }], right: [] }],
+					lines: [{ left: [{ text: "用法：/agent list | /agent list-all", tone: "muted" }], right: [] }],
 				});
 				return;
 			}
 
+			// 默认只看自己所在的树；list-all 才跨树。
+			const all = args === "list-all";
 			try {
 				const rows = buildRows(await hc.list(), myId, self);
-				pi.appendEntry<TreeEntry>(TREE_ENTRY, { lines: formatAgentTree(rows) });
+				pi.appendEntry<TreeEntry>(TREE_ENTRY, {
+					lines: all ? formatAgentTree(rows, "全部 agent 树") : formatAgentTree(currentTree(rows, myId)),
+				});
 			} catch (error) {
 				pi.appendEntry<TreeEntry>(TREE_ENTRY, {
 					lines: [{ left: [{ text: `✗ 读取 agent 树失败：${errorMessage(error)}`, tone: "error" }], right: [] }],
@@ -750,21 +786,36 @@ function patchSettledStatus(env: NodeJS.ProcessEnv): void {
 	process.stdout.write = patched;
 }
 
-/** 根的显示名：优先 hc 终端名；否则从 pi 标题（`π - <会话名> - <cwd>`）里取会话名，不把 cwd 露出来。 */
+/**
+ * 根的显示名：跟 pi 的终端标题走（交互模式启动/`/name` 时由 pi 写入）。
+ * - 命名会话的标题是 `π - <会话名> - <cwd>`，只取会话名；
+ * - 未命名会话的标题是 `π - <cwd>`，原样显示这句默认终端名；
+ * - 标题缺失或被别的程序改写时，退回 hc 终端名。
+ */
 function rootLabel(terminal: HcTerminal): string {
+	const fallback = terminal.name?.trim() || "(root)";
 	const title = terminal.title?.trim() ?? "";
-	const prefixed = /^π\s*-\s*/.test(title);
 	const stripped = title.replace(/^π\s*-\s*/, "").trim();
-	if (!prefixed) return stripped || "(root)";
-	// 标题一定有「会话名 - cwd」两段；没有会话名时只剩 cwd 一段，就不显示 cwd。
-	const parts = stripped.split(" - ");
-	return parts.length >= 2 ? parts.slice(0, -1).join(" - ") : "(root)";
+	if (!stripped || stripped === title) return fallback;
+
+	// 用终端 cwd 的末段判断标题里有没有会话名：`<会话名> - <cwd>` 还是只有 `<cwd>`。
+	const cwdName = basename(terminal.cwd ?? "");
+	if (!cwdName) return stripped.replace(/\s+-\s*$/, "") || fallback;
+	if (stripped === cwdName) return title;
+	const suffix = ` - ${cwdName}`;
+	if (stripped.endsWith(suffix)) return stripped.slice(0, -suffix.length).trim() || fallback;
+	// cwd 与标题对不上（目录被挪动等）：照原样显示，别把信息丢掉。
+	return stripped;
 }
 
-/** 子 agent 的 id 由 label 给出；根 agent 没有 label，id 就是终端地址。 */
+/** 子 agent 的 id 由 `pi.agent` label 给出；根用自己写的 `pi.agent.root`；
+ * 都没有时退回终端地址（旧版本 / label 写入失败的兑底）*/
 function agentIdOf(terminal: HcTerminal): string | undefined {
 	const labeled = terminal.labels["pi.agent"]?.trim();
 	if (labeled) return labeled;
+	const rootLabeled = terminal.labels["pi.agent.root"]?.trim();
+	// 只在它仍是 pi 时算数：pi 退出后留在 keep 终端上的旧 label 不当 agent。
+	if (rootLabeled && terminal.status?.app === "pi") return rootLabeled;
 	if (terminal.status?.app === "pi") return terminal.address;
 	return undefined;
 }
@@ -778,6 +829,11 @@ function newAgentId(cwd: string, taken: Set<string>): string | undefined {
 		return id;
 	}
 	return undefined;
+}
+
+/** 根 agent 的短 id：会话 id 末尾 6 位字母数字（uuidv7 的尾段就是随机 hex）。 */
+export function rootIdOf(sessionId: string): string {
+	return sessionId.replace(/[^A-Za-z0-9]/g, "").slice(-6).toLowerCase();
 }
 
 /**
@@ -818,12 +874,16 @@ export function buildRows(terminals: HcTerminal[], selfId: string, selfAddr: str
 			const parentAddr = terminal.parent;
 			const parent = parentAddr ? byAddress.get(parentAddr)?.id ?? null : null;
 			let relation: AgentRow["relation"] = "other";
-			if (id === selfId) relation = "self";
+			// 根的 pi.agent.root label 可能写失败（或还没写完）：再认一次本终端地址。
+			if (id === selfId || terminal.address === selfAddr) relation = "self";
 			else if (selfParentAddr && terminal.address === selfParentAddr) relation = "parent";
 			else if (terminal.parent === selfAddr) relation = "child";
 			else if (selfParentAddr && terminal.parent === selfParentAddr) relation = "sibling";
 
-			const name = terminal.name?.trim() || (terminal.labels["pi.agent"] ? id : rootLabel(terminal));
+			// 子 agent 的 name 就是拉起时给 hc 的终端名；根没有自己的 name，从 pi 标题推导。
+			const name = terminal.labels["pi.agent"]
+				? terminal.name?.trim() || id
+				: rootLabel(terminal);
 			return {
 				id,
 				name,
@@ -839,10 +899,45 @@ export function buildRows(terminals: HcTerminal[], selfId: string, selfAddr: str
 }
 
 /**
+ * 当前树：`self` 所在的连通树——沿 parent 链爬到最上层（父不在列表里就停在 `self`），
+ * 再收该节点下的整棵子树。列表里找不到 self 时退回全部行（宁可多显示，不可报错）。
+ */
+export function currentTree(rows: AgentRow[], selfId: string): AgentRow[] {
+	const byId = new Map(rows.map((row) => [row.id, row]));
+	const self = byId.get(selfId) ?? rows.find((row) => row.relation === "self");
+	if (!self) return rows;
+
+	let rootId = self.id;
+	const climbed = new Set<string>([rootId]);
+	while (true) {
+		const parent = byId.get(rootId)?.parent;
+		if (!parent || !byId.has(parent) || climbed.has(parent)) break;
+		climbed.add(parent);
+		rootId = parent;
+	}
+
+	const children = new Map<string, string[]>();
+	for (const row of rows) {
+		if (!row.parent || !byId.has(row.parent)) continue;
+		children.set(row.parent, [...(children.get(row.parent) ?? []), row.id]);
+	}
+
+	const inTree = new Set<string>();
+	const stack = [rootId];
+	while (stack.length > 0) {
+		const id = stack.pop()!;
+		if (inTree.has(id)) continue;
+		inTree.add(id);
+		for (const kid of children.get(id) ?? []) stack.push(kid);
+	}
+	return rows.filter((row) => inTree.has(row.id));
+}
+
+/**
  * 把扁平行渲染成卡片式森林（`/agent list`）：每棵独立的树一块，根用 `▌` 引导，
  * 子层用 ├─ / └─；名字在前、id 在后，状态右对齐。
  */
-export function formatAgentTree(rows: AgentRow[]): TreeLine[] {
+export function formatAgentTree(rows: AgentRow[], title = "agent 树"): TreeLine[] {
 	if (rows.length === 0) {
 		return [{ left: [{ text: "没有正在运行的 agent。", tone: "muted" }], right: [] }];
 	}
@@ -859,7 +954,7 @@ export function formatAgentTree(rows: AgentRow[]): TreeLine[] {
 
 	const self = rows.find((row) => row.relation === "self");
 	const lines: TreeLine[] = [
-		{ left: [{ text: `agent 树 · ${rows.length} 个 agent`, tone: "muted" }], right: [] },
+		{ left: [{ text: `${title} · ${rows.length} 个 agent`, tone: "muted" }], right: [] },
 		{ left: [], right: [] },
 	];
 

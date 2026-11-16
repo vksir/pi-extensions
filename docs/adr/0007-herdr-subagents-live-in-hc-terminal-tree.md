@@ -5,8 +5,9 @@
 ## 决策
 
 - **一 agent 一终端一 pi**：`terminal.run` 直接以 `pi` 为 argv 启动，`parent` 指向调用者终端，`rm: true`（pi 退出即销毁终端），`no_notify: true`（hc 的 note 不参与语义）。
-- **身份靠 env 注入**：`PI_AGENT_ID` / `PI_AGENT_NAME` / `PI_AGENT_PARENT` / `PI_AGENT_ROOT` / `PI_AGENT_DEPTH`。根 agent（人启动的 pi）没有这些变量，id 取 hc 地址。
-- **id 与 name 分离**：id 是 6 位十六进制短码，跨 resume 不变；name 是 hc 终端名（侧边栏显示），创建时固定、只作显示——asker、会话路径这类可变语义不进 label。
+- **身份靠 env 注入**：`PI_AGENT_ID` / `PI_AGENT_NAME` / `PI_AGENT_PARENT` / `PI_AGENT_ROOT` / `PI_AGENT_DEPTH`。子 agent 的 id 在拉起时生成（6 位 hex），根 agent（人启动的 pi）的 id 取自己会话 id 末尾 6 位。
+- **根 agent 自己登记短 id**：`session_start` 时把会话 id 尾段写进自己终端的 `pi.agent.root` label（`/new`、`/resume`、`/fork` 后随会话 id 重写），树里其它 agent 从 `terminal.list` 即可认出根；label 写失败时退回 hc 地址。label 只承担这一项发现职责，asker 等可变语义仍不进 label。
+- **id 与 name 分离**：id 是 6 位字母数字短码，子 agent 跨 resume 不变（根的 id 随会话切换而变）；name 是 hc 终端名（侧边栏显示），创建时固定、只作显示；根的显示名取 pi 终端标题（`/name` 或 `π - <cwd>`）——asker、会话路径这类可变语义不进 label。
 - **会话 id 由 agent id 推导**为 `pi-<id>`；resume 扫 sessions 目录找 `_pi-<id>.jsonl`，读头里的 cwd 重新拉起。不引入第二份登记表（hc doc 是 per-session 的，换 session 就丢）。
 - **结果按 asker 回发**：消息首行信封带 kind（`ask` / `steer` / `result`），接收方在 `input` 事件里剥掉并记当轮 asker；settle 时把最终文本发回 asker，`kind=result` 不设 asker，避免回环。hc 自己会给发给 agent 的消息套一层 `<hc from="…">…</hc>`（`notes = false` 时不套），所以解析先剥运输层、再看信封。
 - **树深三层**（root 0 → 子 1 → 孙 2），深度 2 不再注册 `agent`；`kill` 只允许自己的后代；`session_shutdown(reason=quit)` 递归杀直接子 agent。
@@ -15,7 +16,7 @@
 
 - **继续用进程内子 agent**：与主 pi 共享进程，无法在 herdr-app 里当独立终端观察，崩溃会连坐，也没有 hc 的 parent 语义。
 - **`hc run` CLI**：`terminal.run` 的 `env` 没有 CLI 对应项，而身份注入是核心需求；socket 还免去命令行转义。
-- **doc / labels 当登记表**：labels 创建时固定，不承担可变语义；doc 按 hc session 隔离，换 session 旧登记就丢了。推导式会话 id 零存储、跨 session 成立，故弃用。
+- **doc / labels 当登记表**：labels 创建时固定，不承担可变语义；doc 按 hc session 隔离，换 session 旧登记就丢了。推导式会话 id 零存储、跨 session 成立，故弃用（例外：根 agent 只在自己终端上写一个 `pi.agent.root` 短 id 作发现提示，会话切换时重写）。
 - **预开标签页**：每个 agent 一个 herdr-app tab 会把标签栏塞满；headless 终端以 sub-agent 形式挂在父 tab 下，要看时 `agent.focus`。
 - **沿用 hc 的 note 作为状态通道**：note 是纯文本打进父 agent 输入，会额外触发回合，且只到父、不到 asker；与结果回发重复。
 - **允许 resume 换模型 / 思考级别**：会话缓存会整体未命中，代价远大于收益，所以传了不一致的值直接报错。
