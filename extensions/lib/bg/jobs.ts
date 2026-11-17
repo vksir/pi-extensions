@@ -10,17 +10,30 @@ export type BgKind = "bash" | "codemode";
 
 export type BgStatus = "running" | "done" | "failed" | "killed";
 
+/** `start` = 由 `bash_bg` / `codemode_bg` 启动；`promote` = 前台调用到点转后台。 */
+export type BgOrigin = "start" | "promote";
+
 export interface BgJob {
 	id: string;
 	kind: BgKind;
+	origin: BgOrigin;
 	/** 单行摘要：命令或脚本首行，用于列表与回传头行 */
 	label: string;
+	/** 工具入参原样保留，供 `bg_job show` 显示命令/脚本 */
+	input?: Record<string, unknown>;
 	startedAt: number;
 	status: BgStatus;
 	exitCode?: number;
 	durationMs?: number;
-	/** 内置工具返回的正文，原样保留（截断由内置工具自己做） */
+	/** 内置工具返回的正文；在跑任务里是最近一次 onUpdate 的快照 */
 	output?: string;
+	/** 输出被截断时，全量输出的临时文件 */
+	fullOutputPath?: string;
+}
+
+/** 任务在文本里的来源名：`bash_bg` / `codemode_bg` / `bash` / `codemode`。 */
+export function originLabel(job: BgJob): string {
+	return job.origin === "start" ? `${job.kind}_bg` : job.kind;
 }
 
 /** 同时在跑的任务上限；超出直接拒绝启动 */

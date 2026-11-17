@@ -25,7 +25,7 @@ cron job 的排期表示，5 字段（分钟 小时 日 月 星期），按进�
 _Avoid_: 计划表、schedule string、时间表
 
 **间隔 (Interval)**：
-用户用来描述排期的自然写法（如 `5m`、`2h`、`1d`，或多个片段连写如 `1h30m`），在创建 cron job 时被转换为 cron 表达式。
+用户用来描述排期的自然写法（如 `5m`、`2h`、`1d`，或多个片段连写如 `1h30m`），在创建 cron job 时被转换为 cron 表达式。省略时按默认间隔 `15m` 处理。
 _Avoid_: 周期、cadence、frequency
 
 **规范化 (Canonical Form)**：
@@ -113,7 +113,7 @@ _Avoid_: 重命名窗口、title rename
 ### 后台任务（pi-bg）
 
 **后台任务 (bg job)**：
-由 `bash_bg` / `codemode_bg` 启动、立刻把控制权交还模型、自身继续执行的一次命令或脚本，拥有一个 8 位十六进制的任务 id。id 在文本与工具参数之外一律写作 `bg_job <id>`，不单独出现（避免与子 Agent 的 id 混淆）。
+立刻把控制权交还模型、自身继续执行的一次命令或脚本，拥有一个 8 位十六进制的任务 id。两种来源：由 `bash_bg` / `codemode_bg` 直接启动，或由前台调用到点转后台（见「转后台」）。id 在文本与工具参数之外一律写作 `bg_job <id>`，不单独出现（避免与子 Agent 的 id 混淆）。
 _Avoid_: 异步任务、后台进程、job、subprocess
 
 **结果回传 (bg delivery)**：
@@ -135,6 +135,14 @@ _Avoid_: 动态开关、条件注册、feature flag
 **委托 (delegation)**：
 后台工具把执行交给内置 `bash` / `codemode` 完成的做法——后台工具只是外壳，不重新实现命令执行、截断与沙箱（见 ADR-0006）。
 _Avoid_: 包装、转发、代理、wrap
+
+**转后台 (promote)**：
+前台 `bash` / `codemode` 调用超过等待预算仍未结束，就把执行中的命令或脚本转为后台任务、立刻把控制权交还模型的动作；进程/沙箱不重启，输出不丢。只发生在模型直接调用那一层，嵌套调用（脚本里的 `tools.bash`、`bash_bg` 的委托）永不转。
+_Avoid_: 升级、转化、detach、backgrounding、超时
+
+**等待预算 (foreground budget)**：
+`pi-bg.promoteAfterSeconds` 的值，前台 `bash` / `codemode` 一次调用允许阻塞的最长时间；`<= 0` 表示关闭，此时连覆盖版都不注册。
+_Avoid_: 超时、timeout、上限、limit
 
 **存续域 (lifetime)**：
 后台任务只活在当前会话里：`/new`、`/reload`、`/resume`、`/fork`、退出都中止全部在跑任务。

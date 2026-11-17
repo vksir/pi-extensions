@@ -1,13 +1,15 @@
 /**
- * pi-bg 的全部面向人的文本：工具返回、完成消息、`/bg` 列表。
+ * pi-bg 的文本装配：把状态算成 `3.2s` / `done · exit 0 · 12.4s` 这类片段，
+ * 再交给 `prompt/pi-bg.ts` 拼成模型可见文案。
  *
- * 行为约定按 ADR-0002 放在**工具返回文本**里，工具 description 只留参数语义。
+ * 这里只留「格式」与「TUI 专用」的文本；所有模型可见的句子都在 prompt/ 里。
  */
 
-import type { BgJob, BgStatus } from "./jobs.ts";
+import { ERROR_PREFIX, piBgPrompt } from "../../../prompt/pi-bg.ts";
+import { type BgJob, type BgStatus, originLabel } from "./jobs.ts";
 
 /** 完成消息的空输出占位，对齐内置 bash 的 `(no output)`。 */
-const EMPTY_OUTPUT = "(no output)";
+const EMPTY_OUTPUT = piBgPrompt.results.noOutput();
 
 /** 毫秒 → `3.2s` / `42s` / `1m03s`。 */
 export function elapsedText(ms: number): string {
@@ -20,6 +22,13 @@ export function elapsedText(ms: number): string {
 
 export function statusLabel(status: BgStatus): string {
 	return status === "done" ? "done" : status;
+}
+
+/** 等待预算的人类可读形式：`5 minutes` / `90 seconds`。 */
+export function budgetText(seconds: number): string {
+	if (seconds < 60) return `${Math.round(seconds)} seconds`;
+	const minutes = seconds / 60;
+	return Number.isInteger(minutes) ? `${minutes} minutes` : `${Math.round(seconds)} seconds`;
 }
 
 /**
@@ -39,21 +48,33 @@ export function statusText(job: BgJob): string {
 	return parts.join(" · ");
 }
 
-/** 启动成功的工具返回：告知 id、结果回传方式与会话绑定的存续域。 */
-export function startText(job: BgJob): string {
-	const what = job.label ? ` (${job.label})` : "";
-	return `${jobRef(job)} started in background${what}. Its output arrives as a message when it finishes; use \`bg_job wait ${job.id}\` to block for it, \`bg_job list\` to inspect, or \`bg_job kill ${job.id}\` to stop it. Background jobs end with the session: /new, /reload, and exit stop them.`;
+/** 错误结果正文：`Error: ` + 小写子句。 */
+export function errorText(clause: string): string {
+	return `${ERROR_PREFIX}${clause}`;
 }
 
-/** `bg_job wait` 超时的返回：任务还在跑，结果仍会作为消息回传。 */
-export function waitTimeoutText(job: BgJob, waited: string): string {
-	const what = job.label ? ` (${job.label})` : "";
-	return `${jobRef(job)}${what} — ${statusText(job)}. Still running after waiting ${waited}; its output still arrives as a message when it finishes. Use \`bg_job wait ${job.id}\` to keep waiting.`;
+// ─── 模型可见文本 ───
+
+/** 启动成功的工具返回。 */
+export function startText(job: BgJob): string {
+	return piBgPrompt.results.started(job.id);
+}
+
+/** 晋升结果的 tool result 正文。 */
+export function promoteText(job: BgJob, ran: string, activity: string): string {
+	return job.kind === "bash"
+		? piBgPrompt.results.promotedBash(job.id, ran, activity)
+		: piBgPrompt.results.promotedCodemode(job.id, ran, activity);
+}
+
+/** `wait` 超时的返回：任务还在跑，结果仍会作为消息回传。 */
+export function waitTimeoutText(jobs: readonly BgJob[], waited: string): string {
+	return piBgPrompt.results.waitTimedOut(waited, jobs.map(jobRef).join(", "));
 }
 
 /** 完成消息的正文：头行 + 内置工具的原样输出。 */
 export function deliveryContent(job: BgJob): string {
-	const head = `[${jobRef(job)}] ${job.kind}_bg · ${job.label} — ${statusText(job)}`;
+	const head = piBgPrompt.messages.deliveryHead(job.id, originLabel(job), job.label, statusText(job));
 	const body = job.output && job.output.trim().length > 0 ? job.output : EMPTY_OUTPUT;
 	return `${head}\n\n${body}`;
 }
@@ -65,13 +86,32 @@ export function splitDelivery(content: string): { head: string; body: string } {
 	return { head: content.slice(0, index), body: content.slice(index + 2) };
 }
 
-/** `bg_job list` 与 `/bg` 共用的列表行：在跑在前（启动序），已完成在后（新到旧）。 */
-export function formatListLines(jobs: readonly BgJob[]): string[] {
-	if (jobs.length === 0) return ["没有后台任务。"];
+/** 表格型的一行：`bg_job <id> — bash · running · 3.2s · npm test`。 */
+export function listRow(job: BgJob): string {
+	return piBgPrompt.results.listRow(jobRef(job), job.kind, statusText(job), job.label);
+}
+
+/** `bg_job list` 与 `/bg` 共用的行序：在跑在前（启动序），已完成在后（新到旧）。 */
+export function orderedJobs(jobs: readonly BgJob[]): BgJob[] {
 	const running = jobs.filter((job) => job.status === "running");
 	const finished = jobs.filter((job) => job.status !== "running").reverse();
-	const lines = [...running, ...finished].map(
-		(job) => `${jobRef(job)} — ${job.kind} · ${statusText(job)} · ${job.label}`,
-	);
-	return [`共 ${running.length} 个在跑 / ${finished.length} 条已完成`, "", ...lines];
+	return [...running, ...finished];
+}
+
+/** 模型可见的 `bg_job list` 正文。 */
+export function listText(jobs: readonly BgJob[]): string {
+	if (jobs.length === 0) return piBgPrompt.results.listEmpty();
+	const running = jobs.filter((job) => job.status === "running").length;
+	const finished = jobs.length - running;
+	return [piBgPrompt.results.listSummary(running, finished), "", ...orderedJobs(jobs).map(listRow)].join("\n");
+}
+
+// ─── TUI 专用（人类可读，中文） ───
+
+/** `/bg` 命令的列表正文：中文表头 + 与工具共用的行。 */
+export function bgCommandLines(jobs: readonly BgJob[]): string[] {
+	if (jobs.length === 0) return ["没有后台任务。"];
+	const running = jobs.filter((job) => job.status === "running").length;
+	const finished = jobs.length - running;
+	return [`共 ${running} 个在跑 / ${finished} 条已完成`, "", ...orderedJobs(jobs).map(listRow)];
 }

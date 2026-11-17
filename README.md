@@ -24,9 +24,9 @@ node --test tests/*.test.ts
 | [pi-title](extensions/pi-title.ts) | Agent 运行时在窗口标题显示旋转动画，结束后恢复原标题；herdr 环境（两代）不修改窗口标题，`/name` 更名与会话启动（resume / `/reload` / 切换会话）时同步重命名所在标签（旧 herdr 经 CLI 直接寻址，herdr app 经 herdr-app CLI ls 寻址）；进程内子 agent 会话（ctx.mode 非 "tui"）不参与标题与标签管理 |
 | [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 用量，支持 `/token` 命令；footer 状态行里插入最近一次响应的输出速率（`R1.5M 42t/s CH97.1%`） |
 | [pi-context](extensions/pi-context.ts) | `/context` 触发一次空转请求，导出这次请求的系统提示词与工具声明（含 codemode 动态描述），两者同源 |
-| [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron <间隔> [once] <prompt>`、`/cron list`、`/cron delete [id]` |
+| [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron [间隔] [once] <prompt>`（省略间隔按 `15m`）、`/cron list`、`/cron delete [id]` |
 | [pi-btw](extensions/pi-btw.ts) | 顺带分派：仅在 herdr / herdr app 环境注册 `/btw <消息>`，新开一个标签，fork 当前会话启动 pi 并把消息作为首条消息递交；本轮还在跑时先把 fork 源截到上一个完整轮次，避免新会话继承半截 turn（见 [ADR-0008](docs/adr/0008-btw-forks-at-turn-boundary.md)） |
-| [pi-bg](extensions/pi-bg.ts) | 后台运行：`bash_bg` / `codemode_bg` 立即返回，结束后把结果作为消息发回会话；`bg_job` 工具与 `/bg` 命令查看/终止/等候，并与内置工具的启用状态联动 |
+| [pi-bg](extensions/pi-bg.ts) | 后台运行：`bash_bg` / `codemode_bg` 立即返回，结束后把结果作为消息回发；前台 `bash` / `codemode` 超过等待预算（默认 5 分钟）自动转成后台任务；`bg_job` 工具（list / show / kill / wait）与 `/bg` 命令查看/终止/等候，并与内置工具的启用状态联动 |
 | [pi-herdr-agent](extensions/pi-herdr-agent.ts) | 用 herdr-core（hc）的终端树跑子 agent：`agent` 拉起、`agent_job` 管理（list / wait / kill / ask / steer），结果按 asker 自动回发；`/agent list` 显示 agent 树；仅 herdr app + hc 环境生效 |
 
 `/balance codex` 需要先通过 `/login openai-codex` 登录 ChatGPT Plus/Pro 订阅。`/balance opencode` 查 OpenCode Go 的 5 小时/周/月额度，需要先配置 `opencode-go` 的 API Key。
@@ -98,18 +98,25 @@ node --test 'tests/pi-title.test.ts'
 node --test 'tests/herdr.test.ts' 'tests/pi-btw.test.ts' 'tests/session-snapshot.test.ts'
 ```
 
-### 后台运行（bash_bg / codemode_bg）
+### 后台运行（bash_bg / codemode_bg / 前台转后台）
 
 两个后台工具都是内置工具的**薄壳**：真正的执行委托给 `bash` / `codemode`（`ctx.executeTool`），因此截断（尾部 2000 行 / 50KB，附全文临时文件路径）、退出码、结构化输出、`tool_call` hook 与权限检查全部与内置逐字一致；后台脚本里调 `tools.*` 的语义也与 `codemode` 相同。为什么不自研、也不做成 `bash` 的一个参数，见 [ADR-0006](docs/adr/0006-bg-tools-delegate-to-builtin.md)。
 
-- 启动立刻返回，结果**不**出现在 tool result 里，而是任务结束时以自定义消息 `pi-bg` 回传：头行 `[bg_job b3f1a2c4] bash_bg · npm test — done · exit 0 · 12s`，空行后是内置工具的原样输出（空输出为 `(no output)`）。
+- 启动返回只有一行 `bg_job b3f1a2c4 started in background.`，完整结果**不**出现在 tool result 里，而是任务结束时以自定义消息 `pi-bg` 回传：头行 `[bg_job b3f1a2c4] bash_bg · npm test — done · exit 0 · 12s`，空行后是内置工具的原样输出（空输出为 `(no output)`）。
 - 回传走 `pi.sendMessage(..., { deliverAs: "steer", triggerTurn: true })`：不打断当前 LLM 调用，当前 turn 的工具跑完、下次调用前投递；agent 空闲时立刻起一轮。与 [@tintinweb/pi-subagents](https://www.npmjs.com/package/@tintinweb/pi-subagents) 的后台 Agent 同一通道。
 - 后台任务受**自己的** `AbortController` 约束。发起它的 tool call 被 Esc 中断不会连坐杀掉后台任务。
+- **前台自动转后台**：模型直接调用 `bash` / `codemode` 时，超过等待预算还没结束，就把执行中的命令/脚本转成后台任务、立刻把控制权交还模型，进程/沙箱**不重启**。返回 `bash promoted to bg_job b3f1a2c4 after 5m00s. Still running, last output 1m42s ago.`，之后按后台任务同一套回传。为什么可以覆盖内置工具、以及这条能力的退场条件，见 [ADR-0010](docs/adr/0010-foreground-budget-promotes-to-bg.md)。
+  - 只发生在模型直接调用那一层：脚本里的 `tools.bash`、`bash_bg` 的委托都是嵌套调用，永不转后台，返回形状与内置逐字一致。
+  - 模型显式给了 `timeout` 时不转：到点就按超时失败，不在背后继续跑。
+  - 晋升不受并发上限限制；`bash_bg` / `codemode_bg` 仍受 64 上限。
+  - 晋升后父轮 Esc 不再连坐（与后台任务一致）。
+  - 等待预算 = `settings.json` 的 `pi-bg.promoteAfterSeconds`（默认 `300`，`<= 0` 关闭；关闭时连覆盖版都不注册）。
 - **任务 id 一律写成 `bg_job <id>`**：启动返回、完成消息、列表、`bg_job kill` 的回显都是 `bg_job a3307cb8 started in background` 这种形式。裸 8 位十六进制 id 与子 Agent 的 id 同形，模型会误调 `get_subagent_result`，所以 id 从不单独出现。
-- `bg_job` 工具与 `/bg` 命令：列出在跑任务与最近 20 条已完成记录；`bg_job kill <id>`（或 `/bg kill`）中止任务，连带杀掉它的进程树；`bg_job wait [id] [timeout]` 阻塞到任务结束并**直接返回输出**（省略 id 则等全部在跑任务）。同时最多 64 个任务，超出直接拒绝。
+- `bg_job` 工具与 `/bg` 命令：列出在跑任务与最近 20 条已完成记录；`bg_job show <id>`（或 `/bg show <id>`）打印命令/脚本、状态与输出（在跑任务给已产出的部分）；`bg_job kill <id>`（或 `/bg kill`）中止任务，连带杀掉它的进程树；`bg_job wait [id] [timeout]` 阻塞到任务结束并**直接返回输出**（省略 id 则等全部在跑任务）。`bash_bg` / `codemode_bg` 同时最多 64 个任务，超出直接拒绝（转后台的不占这个名额）。
 - `bg_job wait` 的 `timeout`（秒）是**等候**的上限，不是任务的超时：到点只返回各任务当前状态，任务继续跑、结果仍作为消息回传；省略则一直等到结束。`wait` 在任务**完成前**发起时结果直接进 tool result、不再作为消息回传；任务**已经回传过**时只给状态，不重复输出（模型必须先拿到 id 才能 wait，两次调用必然跳轮，所以后者是常态）。父轮 Esc 取消的只是「等」这个动作，同样是任务照跑、结果仍会到达。
 - **与内置工具的启用状态联动**：三个工具都在 `session_start` 里注册，注册前读 `getActiveTools()`。`bash` 未启用就根本不注册 `bash_bg`，`codemode` 未启用就不注册 `codemode_bg`，两个都未启用就连 `bg_job` 也不注册。schema 直接复用 `getAllTools()` 里内置工具的那一份，所以 pi 给内置工具加参数时这里不用跟。`prepareLoadout` 只兜「会话中途被 `setActiveTools` 关掉」这条快照覆盖不到的路径。
 - **存续域与会话绑定**：`/new`、`/reload`、`/resume`、`/fork`、退出都会触发 `session_shutdown`，一律中止全部在跑任务；`/new` 与 `/reload` 还会重建扩展实例，任务表随之清空。已完成但未回传的结果随会话一起消失，与 pi-cron 同一取舍（[ADR-0001](docs/adr/0001-cron-tasks-are-process-scoped.md)）。
+- **文案**：给模型的文字全部在 `prompt/pi-bg.ts`，规则见 `prompt/README.md`。「长命令用后台工具」这条跨调用的规则写在 `bash_bg` / `codemode_bg` 的 `promptGuidelines` 里（工具被隐藏时规则自动消失），不写进返回值。
 - **缓存稳定性**：三个工具在首次 `session_start` 注册一次（幂等守卫挡住 `rebindCurrentSession` 的二次触发），`description` / `promptSnippet` / `parameters` 全部确定，`prepareLoadout` 是纯函数，所以一局会话内系统提示词、工具列表与顺序都不变。`session_shutdown` 不区分 reason，五种理由都是「离开这个会话」。
 - **Windows + Git Bash 的不保证项**：pi 的 `killProcessTree` 在 Windows 上用 `taskkill /F /T <pid>`，而 MSYS 子进程（`sleep`、`grep` 这类）在 Windows 记录的父进程并不是 bash，所以中止后可能残留孤儿进程。对前台 `bash` 调用按 Esc 是**完全一样**的行为，不是 pi-bg 引入的。所以 `/new` 与 `bg_job kill` 保证的是「本次会话不再回传、内置执行已收到 abort」，**不是**「进程一定被杀死」——这个保证在 Windows + MSYS 上是弱的。
 
@@ -192,7 +199,8 @@ pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式�
 | `lib/cron/schedule.ts` | cron 表达式解析、下次触发、间隔换算（纯函数） |
 | `lib/cron/presentation.ts` | 排期的人类可读化与触发 prompt 包装 |
 | `lib/bg/jobs.ts` | 后台任务表：上限、淘汰、id 分配（纯函数） |
-| `lib/bg/format.ts` | 后台任务的启动/回传/列表文本 |
+| `lib/bg/format.ts` | 后台任务的格式片段（耗时、状态行）与 TUI 专用文本 |
+| `prompt/` | 全部模型可见文案，按扩展一文件；规则见 `prompt/README.md` |
 | `lib/balance/providers.ts` | Provider 凭据、请求与响应归一化 |
 | `lib/balance/render.ts` | `/balance` 结果排版 |
 | `lib/json.ts` | Agent 数据目录 JSON 的容错读取与原子写入 |

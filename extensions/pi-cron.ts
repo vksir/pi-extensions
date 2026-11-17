@@ -2,7 +2,7 @@
  * pi-cron —— 进程级 cron job
  *
  * 两个入口：
- *   /cron <间隔> [once] <prompt> | /cron list | /cron delete [id]   人工，间隔由代码解析
+ *   /cron [间隔] [once] <prompt> | /cron list | /cron delete [id]   人工，间隔由代码解析（省略则 15m）
  *   cron(action: create | list | delete)                            模型，自行构造 cron 表达式
  *
  * 存续域为「进程级」：
@@ -11,8 +11,9 @@
  *     必丢，globalThis 是唯一能跨 reload 存活又不跨进程的载体。
  *   - 进程退出时 globalThis 随之消失，无需任何清理代码。
  *
- * 常驻上下文只有 `cron` 工具的 description + 参数 schema（≈192 tokens）；人工命令不占
- * 常驻；行为约定（立即执行、回执、进程级说明）写在工具返回文本里，调用后付费。
+ * 常驻上下文只有 `cron` 工具的 description + 参数 schema；人工命令不占常驻。
+ * 文案在 `prompt/pi-cron.ts`：跨调用的规则（进程级存续域）随 description 常驻一次，
+ * 单次行为（创建后立即执行、回执）仍在返回文本里，调用后付费。
  */
 
 import { randomUUID } from "node:crypto";
@@ -20,6 +21,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { ERROR_PREFIX, piCronPrompt } from "../prompt/pi-cron.ts";
 import {
 	cronToHuman,
 	cronToHumanZh,
@@ -64,6 +66,9 @@ const STORE_KEY = Symbol.for("vkzha.pi-cron.jobs");
 const CUSTOM_TYPE = "pi-cron";
 const INFO_TYPE = "pi-cron-info";
 const PROMPT_PREVIEW = 80;
+/** 省略间隔时的默认值：`/cron <prompt>` 即「每 15 分钟」 */
+const DEFAULT_INTERVAL_MS = 15 * 60 * 1000;
+const DEFAULT_INTERVAL_LABEL = "15m";
 
 // ─── 类型 ───
 
@@ -133,13 +138,14 @@ function store(): CronStore {
 
 const USAGE_LINES: CronInfoLine[] = [
 	{ text: "用法：", tone: "text" },
-	{ text: "/cron <间隔> [once] <prompt>   创建定时任务", tone: "dim" },
+	{ text: "/cron [间隔] [once] <prompt>   创建定时任务（省略间隔默认 15m）", tone: "dim" },
 	{ text: "/cron list                     列出当前任务", tone: "dim" },
 	{ text: "/cron delete [id]              删除任务（省略 id 则弹出选择）", tone: "dim" },
 	{ text: "", tone: "dim" },
 	{ text: "间隔：Ns / Nm / Nh / Nd，可复合（如 1h30m）；cron 最小粒度 1 分钟，秒级向上取整", tone: "dim" },
 	{ text: "once：只触发一次（从现在算起 <间隔> 之后），触发后自动删除", tone: "dim" },
 	{ text: "不加 once：循环触发，且创建后立即执行一次", tone: "dim" },
+	{ text: `省略间隔时按 ${DEFAULT_INTERVAL_LABEL} 处理，如 /cron 检查构建状态`, tone: "dim" },
 ];
 
 function jobLines(job: CronJob, now: number): CronInfoLine[] {
@@ -390,7 +396,7 @@ export default function (pi: ExtensionAPI) {
 	);
 
 	pi.registerCommand("cron", {
-		description: "定时任务：/cron <间隔> [once] <prompt> | /cron list | /cron delete [id]",
+		description: "定时任务：/cron [间隔] [once] <prompt>（间隔省略则 15m） | /cron list | /cron delete [id]",
 		getArgumentCompletions: (prefix) => {
 			if (prefix.trim().includes(" ")) return null;
 			const typed = prefix.trim();
@@ -405,7 +411,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const [head, ...rest] = args.split(/\s+/);
+			const [head, ...tail] = args.split(/\s+/);
 
 			if (head === "list") {
 				const list = jobs();
@@ -423,7 +429,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (head === "delete") {
-				const id = rest[0];
+				const id = tail[0];
 				if (id) {
 					if (!removeJob(id)) {
 						info([{ text: `✗ 没有 id 为 ${id} 的定时任务，用 /cron list 查看`, tone: "error" }]);
@@ -454,14 +460,18 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const interval = parseInterval(head);
+			// 首 token 以数字开头才算间隔（`5m`、`1h30m`）；否则整行都是 prompt，走默认间隔
+			const explicitInterval = /^\d/.test(head);
+			const interval = explicitInterval ? parseInterval(head) : DEFAULT_INTERVAL_MS;
 			if (interval === null) {
 				info([{ text: `✗ 无法识别的间隔「${head}」`, tone: "error" }, { text: "", tone: "dim" }, ...USAGE_LINES]);
 				return;
 			}
 
-			const once = rest[0]?.toLowerCase() === "once";
-			const prompt = (once ? rest.slice(1) : rest).join(" ").trim();
+			// 首 token 不是间隔时，它会与剩余 token 一起作为 prompt（`/cron once <prompt>` 也走这里）
+			const body = explicitInterval ? tail : [head, ...tail];
+			const once = body[0]?.toLowerCase() === "once";
+			const prompt = (once ? body.slice(1) : body).join(" ").trim();
 			if (!prompt) {
 				info([{ text: "✗ 缺少 prompt", tone: "error" }, { text: "", tone: "dim" }, ...USAGE_LINES]);
 				return;
@@ -494,6 +504,8 @@ export default function (pi: ExtensionAPI) {
 					tone: "text",
 				},
 			];
+			if (!explicitInterval)
+				confirmation.push({ text: `未指定间隔，按默认 ${DEFAULT_INTERVAL_LABEL} 处理`, tone: "dim" });
 			if (!once && conversion.note) confirmation.push({ text: `⚠ ${conversion.note}`, tone: "warning" });
 			if (!once) confirmation.push({ text: `取消：/cron delete ${job.id}`, tone: "dim" });
 			info(confirmation);
@@ -506,65 +518,51 @@ export default function (pi: ExtensionAPI) {
 	// ─── 工具 ───
 
 	const fail = (action: CronToolDetails["action"], message: string) => ({
-		content: [{ type: "text" as const, text: `Error: ${message}` }],
+		content: [{ type: "text" as const, text: `${ERROR_PREFIX}${message}` }],
 		details: { action, error: message } as CronToolDetails,
 	});
 
 	pi.registerTool({
 		name: "cron",
 		label: "Cron",
-		description: "Create, list, or delete cron jobs; a cron job delivers a prompt to you on a cron schedule.",
+		description: piCronPrompt.declarations.cron.description,
 		parameters: Type.Object({
 			action: StringEnum(["create", "list", "delete"] as const, {
-				description: "create: schedule a cron job. list: show cron jobs. delete: cancel a cron job by id.",
+				description: piCronPrompt.declarations.cron.parameters.action,
 			}),
-			cron: Type.Optional(
-				Type.String({
-					description:
-						"5-field cron (minute hour day-of-month month day-of-week), local time. Required for create.",
-				}),
-			),
-			prompt: Type.Optional(
-				Type.String({ description: "Prompt delivered verbatim on every fire. Required for create." }),
-			),
-			recurring: Type.Optional(
-				Type.Boolean({ description: "Default true. false = fire once, then delete the cron job." }),
-			),
-			id: Type.Optional(Type.String({ description: "Cron job id. Required for delete." })),
+			cron: Type.Optional(Type.String({ description: piCronPrompt.declarations.cron.parameters.cron })),
+			prompt: Type.Optional(Type.String({ description: piCronPrompt.declarations.cron.parameters.prompt })),
+			recurring: Type.Optional(Type.Boolean({ description: piCronPrompt.declarations.cron.parameters.recurring })),
+			id: Type.Optional(Type.String({ description: piCronPrompt.declarations.cron.parameters.id })),
 		}),
 
 		async execute(_toolCallId, params) {
 			switch (params.action) {
 				case "create": {
-					if (!params.cron || !params.prompt) return fail("create", "create requires both cron and prompt.");
+					if (!params.cron || !params.prompt)
+						return fail("create", piCronPrompt.results.errors.createMissing());
 
 					const result = createJob(params.cron, params.prompt, params.recurring !== false);
 					if (!result.ok) {
 						if (result.code === "invalid-cron") {
-							return fail(
-								"create",
-								`invalid cron expression '${params.cron}'. Expected 5 fields: minute hour day-of-month month day-of-week.`,
-							);
+							return fail("create", piCronPrompt.results.errors.invalidCron(params.cron));
 						}
 						if (result.code === "no-match") {
-							return fail(
-								"create",
-								`cron expression '${params.cron}' does not match any calendar date in the next year.`,
-							);
+							return fail("create", piCronPrompt.results.errors.noMatch(params.cron));
 						}
-						return fail("create", `too many cron jobs (max ${MAX_JOBS}). Delete one first.`);
+						return fail("create", piCronPrompt.results.errors.tooMany(MAX_JOBS));
 					}
 
 					const { job, next } = result;
 					const when = next.toLocaleString();
-					const tail = "Cron jobs are process-scoped and are cleared when pi exits.";
+					const human = cronToHuman(job.cron);
 					return {
 						content: [
 							{
 								type: "text" as const,
 								text: job.recurring
-									? `Created recurring cron job ${job.id} (${cronToHuman(job.cron)}). Next fire ${when}. Run its prompt now as the first iteration instead of waiting for the first fire. ${tail}`
-									: `Created one-shot cron job ${job.id} (${cronToHuman(job.cron)}). It fires once at ${when}, then deletes itself. ${tail}`,
+									? piCronPrompt.results.createdRecurring(job.id, human, when)
+									: piCronPrompt.results.createdOnce(job.id, human, when),
 							},
 						],
 						details: { action: "create" } as CronToolDetails,
@@ -575,7 +573,7 @@ export default function (pi: ExtensionAPI) {
 					const list = jobs();
 					if (list.length === 0) {
 						return {
-							content: [{ type: "text" as const, text: "No cron jobs." }],
+							content: [{ type: "text" as const, text: piCronPrompt.results.listEmpty() }],
 							details: { action: "list", jobs: [] } as CronToolDetails,
 						};
 					}
@@ -587,7 +585,14 @@ export default function (pi: ExtensionAPI) {
 						const fired = t.fireCount > 0 ? ` · fired ${t.fireCount}x` : "";
 						const missed = t.backlog > 0 ? ` · ${t.backlog} missed` : "";
 						const kind = t.recurring ? "" : " · one-shot";
-						return `${t.id} — ${cronToHuman(t.cron)} (${t.cron}) · ${next}${fired}${missed}${kind}: ${truncate(t.prompt, PROMPT_PREVIEW)}`;
+						return piCronPrompt.results.listRow(
+							t.id,
+							cronToHuman(t.cron),
+							t.cron,
+							next,
+							`${fired}${missed}${kind}`,
+							truncate(t.prompt, PROMPT_PREVIEW),
+						);
 					});
 
 					return {
@@ -608,17 +613,17 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "delete": {
-					if (!params.id) return fail("delete", "id is required for delete.");
-					if (!removeJob(params.id)) return fail("delete", `no cron job with id '${params.id}'.`);
+					if (!params.id) return fail("delete", piCronPrompt.results.errors.idRequired());
+					if (!removeJob(params.id)) return fail("delete", piCronPrompt.results.errors.unknownJob(params.id));
 					arm();
 					return {
-						content: [{ type: "text" as const, text: `Deleted cron job ${params.id}.` }],
+						content: [{ type: "text" as const, text: piCronPrompt.results.deleted(params.id) }],
 						details: { action: "delete" } as CronToolDetails,
 					};
 				}
 
 				default:
-					return fail("list", `unknown action '${String(params.action)}'.`);
+					return fail("list", piCronPrompt.results.errors.unknownAction(String(params.action)));
 			}
 		},
 

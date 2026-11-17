@@ -57,6 +57,7 @@ import {
 	validateAgentName,
 } from "./lib/agent-protocol.ts";
 import { errorMessage } from "./lib/errors.ts";
+import { ERROR_PREFIX, piHerdrAgentPrompt } from "../prompt/pi-herdr-agent.ts";
 import {
 	createHcClient,
 	HcError,
@@ -235,7 +236,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			if (pendingAsker) {
 				// 并发的第二个 ask 抢在对方进入 working 之前到达：第一个 asker 拥有这一轮，
 				// 第二个只能收到一句忙。消息正文仍会交给模型，但结果不会回给它。
-				const busy = `${agentSourceLine(myId, displayName(ctx))} Busy: another request is already pending. Try again when this agent is idle.`;
+				const busy = `${agentSourceLine(myId, displayName(ctx))} ${piHerdrAgentPrompt.reports.busy()}`;
 				void sendReport(envelope, ctx, busy);
 			} else {
 				pendingAsker = { id: envelope.from, addr: envelope.addr, name: envelope.name };
@@ -263,7 +264,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		if (!asker) return;
 
 		const body = event.aborted
-			? `${agentSourceLine(myId, displayName(ctx))}\nRun aborted.`
+			? `${agentSourceLine(myId, displayName(ctx))}\n${piHerdrAgentPrompt.reports.runAborted()}`
 			: await resultBody(answer, ctx);
 		await sendReport(asker, ctx, body);
 	});
@@ -275,7 +276,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		await sendReport(
 			pendingAsker,
 			ctx,
-			`${agentSourceLine(myId, displayName(ctx))} Blocked waiting for human input${detail}.`,
+			`${agentSourceLine(myId, displayName(ctx))} ${piHerdrAgentPrompt.reports.blocked(detail)}`,
 		);
 	});
 
@@ -300,16 +301,16 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	const resultBody = async (answer: string | undefined, ctx: ExtensionContext): Promise<string> => {
 		const source = agentSourceLine(myId, displayName(ctx));
 		const text = answer?.trim();
-		if (!text) return `${source}\nNo text output this turn.`;
+		if (!text) return `${source}\n${piHerdrAgentPrompt.reports.noText()}`;
 
 		const truncation = truncateTail(text);
 		if (!truncation.truncated) return `${source}\n${text}`;
 
 		try {
 			const path = options.spill ? await options.spill(text) : await writeOutputFile("pi-herdr-agent", ".log", text);
-			return `${source}\n${truncation.text}\n\n[Output truncated. Full output: ${path}]`;
+			return `${source}\n${truncation.text}\n\n${piHerdrAgentPrompt.reports.truncatedWithPath(path)}`;
 		} catch (error) {
-			return `${source}\n${truncation.text}\n\n[Output truncated: ${errorMessage(error)}]`;
+			return `${source}\n${truncation.text}\n\n${piHerdrAgentPrompt.reports.truncated(errorMessage(error))}`;
 		}
 	};
 
@@ -319,30 +320,17 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		pi.registerTool({
 			name: "agent",
 			label: "Agent",
-			description:
-				"Start a sub-agent in its own terminal; it runs a separate pi session and sends its final answer back as a message. name: 1-32 chars of a-z 0-9 . _ -, unique among running agents. model and thinking default to yours. resume continues an exited agent by id.",
-			promptSnippet: "Start a sub-agent that reports back by message",
+			description: piHerdrAgentPrompt.declarations.agent.description,
+			promptSnippet: piHerdrAgentPrompt.system.snippets.agent,
 			parameters: Type.Object({
-				prompt: Type.String({ description: "The task for the sub-agent." }),
-				name: Type.Optional(
-					Type.String({
-						description:
-							"Sidebar name: 1-32 chars of a-z, 0-9, '.', '_' or '-', unique among running agents. Defaults to the agent id.",
-					}),
-				),
-				model: Type.Optional(
-					Type.String({
-						description: "Model as provider/id or a fuzzy name. Defaults to your current model.",
-					}),
-				),
+				prompt: Type.String({ description: piHerdrAgentPrompt.declarations.agent.parameters.prompt }),
+				name: Type.Optional(Type.String({ description: piHerdrAgentPrompt.declarations.agent.parameters.name })),
+				model: Type.Optional(Type.String({ description: piHerdrAgentPrompt.declarations.agent.parameters.model })),
 				thinking: Type.Optional(
-					StringEnum(THINKING_LEVELS, { description: "Thinking level. Defaults to yours." }),
+					StringEnum(THINKING_LEVELS, { description: piHerdrAgentPrompt.declarations.agent.parameters.thinking }),
 				),
 				resume: Type.Optional(
-					Type.String({
-						description:
-							"Agent id whose exited session to continue instead of starting a new one. Model and thinking must match the session.",
-					}),
+					Type.String({ description: piHerdrAgentPrompt.declarations.agent.parameters.resume }),
 				),
 			}),
 
@@ -367,11 +355,11 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 				.filter((id): id is string => Boolean(id)),
 		);
 		const id = newAgentId(ctx.cwd, taken);
-		if (!id) return fail("could not allocate an unused agent id.", "start");
+		if (!id) return fail(piHerdrAgentPrompt.results.errors.noId(), "start");
 
 		const name = params.name ?? id;
 		const invalidName = validateAgentName(name);
-		if (invalidName) return fail(`invalid name '${name}': ${invalidName}`, "start", id);
+		if (invalidName) return fail(piHerdrAgentPrompt.results.errors.invalidName(name, invalidName), "start", id);
 
 		const model = params.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
 		const thinking = params.thinking ?? ctx.thinkingLevel;
@@ -388,32 +376,33 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		const id = params.resume!;
 		const terminals = await hc.list();
 		if (terminals.some((terminal) => agentIdOf(terminal) === id && terminal.state === "live")) {
-			return fail(`agent '${id}' is still running; use agent_job ask or agent_job steer.`, "resume", id);
+			return fail(piHerdrAgentPrompt.results.errors.stillRunning(id), "resume", id);
 		}
 
 		const session = await findSession(`pi-${id}`, options.sessionDir);
-		if (!session) return fail(`no session for agent '${id}'.`, "resume", id);
+		if (!session) return fail(piHerdrAgentPrompt.results.errors.noSession(id), "resume", id);
 
 		const facts = readSessionFacts(session.path);
-		if (!facts?.cwd) return fail(`session for agent '${id}' has no working directory.`, "resume", id);
+		if (!facts?.cwd) return fail(piHerdrAgentPrompt.results.errors.noSessionCwd(id), "resume", id);
 
 		// resume 不允许换脑：缓存未命中的代价太大（见 ADR）。
 		if (params.model) {
 			const resolved = resolveModel(ctx, params.model);
-			if (!resolved) return fail(`unknown model '${params.model}'. Pass provider/id.`, "resume", id);
+			if (!resolved) return fail(piHerdrAgentPrompt.results.errors.unknownModel(params.model), "resume", id);
 			if (resolved.provider !== facts.provider || resolved.id !== facts.modelId) {
 				return fail(
-					`agent '${id}' runs ${facts.provider ?? "?"}/${facts.modelId ?? "?"}; resume cannot switch models.`,
+					piHerdrAgentPrompt.results.errors.resumeModelMismatch(id, facts.provider ?? "?", facts.modelId ?? "?"),
 					"resume",
 					id,
 				);
 			}
 		}
 		if (params.thinking) {
-			if (!facts.thinking) return fail(`agent '${id}' has no recorded thinking level; resume cannot verify it.`, "resume", id);
+			if (!facts.thinking)
+				return fail(piHerdrAgentPrompt.results.errors.resumeThinkingMissing(id), "resume", id);
 			if (params.thinking !== facts.thinking) {
 				return fail(
-					`agent '${id}' uses thinking '${facts.thinking}'; resume cannot switch thinking levels.`,
+					piHerdrAgentPrompt.results.errors.resumeThinkingMismatch(id, facts.thinking),
 					"resume",
 					id,
 				);
@@ -422,7 +411,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 
 		const name = params.name ?? facts.name ?? id;
 		const invalidName = validateAgentName(name);
-		if (invalidName) return fail(`invalid name '${name}': ${invalidName}`, "resume", id);
+		if (invalidName) return fail(piHerdrAgentPrompt.results.errors.invalidName(name, invalidName), "resume", id);
 
 		await launch({
 			id,
@@ -434,7 +423,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			prompt: params.prompt,
 			ctx,
 		});
-		return ok(`Resumed agent ${id} as '${name}'. Its final answer will arrive as a message.`, {
+		return ok(piHerdrAgentPrompt.results.resumedAgent(id, name), {
 			action: "resume",
 			id,
 			name,
@@ -545,20 +534,18 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		pi.registerTool({
 			name: "agent_job",
 			label: "Agent jobs",
-			description:
-				"Manage sub-agents: list, wait, kill, ask, steer. ask works only when the target is idle (busy is an error); steer only while it is working. Only your own descendants can be killed.",
-			promptSnippet: "List, wait on, stop, ask, or steer sub-agents",
+			description: piHerdrAgentPrompt.declarations.agentJob.description,
+			promptSnippet: piHerdrAgentPrompt.system.snippets.agentJob,
 			parameters: Type.Object({
 				action: StringEnum(["list", "wait", "kill", "ask", "steer"] as const, {
-					description:
-						"list: running agents. wait: block until one stops working. kill: end one of your descendants. ask: send a request to an idle agent; its answer arrives as a message. steer: insert a message into a working agent.",
+					description: piHerdrAgentPrompt.declarations.agentJob.parameters.action,
 				}),
-				id: Type.Optional(Type.String({ description: "Agent id. Required for wait, kill, ask and steer." })),
-				message: Type.Optional(Type.String({ description: "Message for ask and steer." })),
+				id: Type.Optional(Type.String({ description: piHerdrAgentPrompt.declarations.agentJob.parameters.id })),
+				message: Type.Optional(
+					Type.String({ description: piHerdrAgentPrompt.declarations.agentJob.parameters.message }),
+				),
 				timeout: Type.Optional(
-					Type.Number({
-						description: "wait only: max seconds before returning. A timeout is a check-in, not a failure.",
-					}),
+					Type.Number({ description: piHerdrAgentPrompt.declarations.agentJob.parameters.timeout }),
 				),
 			}),
 
@@ -588,8 +575,8 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	};
 
 	const waitJob = async (params: AgentJobParams, _ctx: ExtensionContext) => {
-		if (!params.id) return fail("id is required for wait.", "wait");
-		if (params.id === myId) return fail("an agent cannot wait on itself.", "wait", params.id);
+		if (!params.id) return fail(piHerdrAgentPrompt.results.errors.idRequired("wait"), "wait");
+		if (params.id === myId) return fail(piHerdrAgentPrompt.results.errors.cannotActOnSelf("wait on"), "wait", params.id);
 		const target = await requireTarget(params.id);
 		const timeout =
 			params.timeout !== undefined && Number.isFinite(params.timeout)
@@ -599,28 +586,31 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		const label = `${target.row.id} (${target.row.name})`;
 
 		if (!wait.ended) {
-			return ok(`${label}: still running (${wait.status ?? "unknown"}, turn ${wait.turn}).`, {
+			return ok(piHerdrAgentPrompt.results.waitStillRunning(label, wait.status ?? "unknown", wait.turn), {
 				action: "wait",
 				id: target.row.id,
 			});
 		}
 		if (wait.reason === "exit") {
-			return ok(`${label}: exited (code ${wait.exit_code ?? "?"}).`, { action: "wait", id: target.row.id });
+			return ok(piHerdrAgentPrompt.results.waitExited(label, String(wait.exit_code ?? "?")), {
+				action: "wait",
+				id: target.row.id,
+			});
 		}
-		return ok(`${label}: ${wait.status ?? wait.reason} (turn ${wait.turn}).`, {
+		return ok(piHerdrAgentPrompt.results.waitStatus(label, wait.status ?? wait.reason, wait.turn), {
 			action: "wait",
 			id: target.row.id,
 		});
 	};
 
 	const killJob = async (params: AgentJobParams) => {
-		if (!params.id) return fail("id is required for kill.", "kill");
+		if (!params.id) return fail(piHerdrAgentPrompt.results.errors.idRequired("kill"), "kill");
 		const terminals = await hc.list();
 		const target = terminals.find((terminal) => agentIdOf(terminal) === params.id && terminal.state === "live");
-		if (!target) return fail(`agent '${params.id}' is not running.`, "kill", params.id);
-		if (target.address === self) return fail("an agent cannot kill itself.", "kill", params.id);
+		if (!target) return fail(piHerdrAgentPrompt.results.errors.notRunning(params.id), "kill", params.id);
+		if (target.address === self) return fail(piHerdrAgentPrompt.results.errors.cannotActOnSelf("kill"), "kill", params.id);
 		if (!isDescendant(target, terminals, self)) {
-			return fail(`agent '${params.id}' is not your descendant; only your own subtree can be killed.`, "kill", params.id);
+			return fail(piHerdrAgentPrompt.results.errors.notDescendant(params.id), "kill", params.id);
 		}
 		await hc.kill(target.address).catch((error: unknown) => {
 			// `rm: true` 的终端在 kill 成功后会被立刻删除，core 有时把这次删除回成 not_found /
@@ -628,17 +618,17 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			if (error instanceof HcError && (error.kind === "not_found" || error.kind === "finished")) return;
 			throw error;
 		});
-		return ok(`Killed agent ${params.id}.`, { action: "kill", id: params.id });
+		return ok(piHerdrAgentPrompt.results.killed(params.id), { action: "kill", id: params.id });
 	};
 
 	const askJob = async (params: AgentJobParams, ctx: ExtensionContext) => {
-		if (!params.id) return fail("id is required for ask.", "ask");
-		if (!params.message?.trim()) return fail("message is required for ask.", "ask", params.id);
+		if (!params.id) return fail(piHerdrAgentPrompt.results.errors.idRequired("ask"), "ask");
+		if (!params.message?.trim()) return fail(piHerdrAgentPrompt.results.errors.messageRequired("ask"), "ask", params.id);
 		const target = await requireTarget(params.id);
-		if (target.row.id === myId) return fail("an agent cannot ask itself.", "ask", params.id);
+		if (target.row.id === myId) return fail(piHerdrAgentPrompt.results.errors.cannotActOnSelf("ask"), "ask", params.id);
 		const status = target.terminal.status?.state;
 		if (!status || !ASKABLE.has(status)) {
-			return fail(`agent '${params.id}' is ${status ?? "not ready"}; ask works only when it is idle.`, "ask", params.id);
+			return fail(piHerdrAgentPrompt.results.errors.askNotIdle(params.id, status ?? "not ready"), "ask", params.id);
 		}
 
 		const sent = await hc.send({
@@ -654,25 +644,21 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			// done 是「结束但还没被看」，hc 的 if 只认 idle/working，所以那一档不带 if。
 			if: status === "idle" ? "idle" : undefined,
 		});
-		const pending = sent.started === false ? " It has not started working yet." : "";
-		return ok(`Asked ${target.row.id} (${target.row.name}). Its answer will arrive as a message when the turn ends.${pending}`, {
+		const pending = sent.started === false ? piHerdrAgentPrompt.results.askPending() : "";
+		return ok(piHerdrAgentPrompt.results.asked(target.row.id, target.row.name, pending), {
 			action: "ask",
 			id: target.row.id,
 		});
 	};
 
 	const steerJob = async (params: AgentJobParams, ctx: ExtensionContext) => {
-		if (!params.id) return fail("id is required for steer.", "steer");
-		if (!params.message?.trim()) return fail("message is required for steer.", "steer", params.id);
+		if (!params.id) return fail(piHerdrAgentPrompt.results.errors.idRequired("steer"), "steer");
+		if (!params.message?.trim()) return fail(piHerdrAgentPrompt.results.errors.messageRequired("steer"), "steer", params.id);
 		const target = await requireTarget(params.id);
-		if (target.row.id === myId) return fail("an agent cannot steer itself.", "steer", params.id);
+		if (target.row.id === myId) return fail(piHerdrAgentPrompt.results.errors.cannotActOnSelf("steer"), "steer", params.id);
 		const status = target.terminal.status?.state;
 		if (status !== "working") {
-			return fail(
-				`agent '${params.id}' is ${status ?? "not working"}; steer works only while it is running. Use ask when it is idle.`,
-				"steer",
-				params.id,
-			);
+			return fail(piHerdrAgentPrompt.results.errors.steerNotWorking(params.id, status ?? "not working"), "steer", params.id);
 		}
 
 		await hc.send({
@@ -687,15 +673,15 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			}),
 			if: "working",
 		});
-		return ok(`Steered ${target.row.id} (${target.row.name}).`, { action: "steer", id: target.row.id });
+		return ok(piHerdrAgentPrompt.results.steered(target.row.id, target.row.name), { action: "steer", id: target.row.id });
 	};
 
 	const requireTarget = async (id: string): Promise<{ terminal: HcTerminal; row: AgentRow }> => {
 		const terminals = await hc.list();
 		const terminal = terminals.find((candidate) => agentIdOf(candidate) === id && candidate.state === "live");
-		if (!terminal) throw new Error(`agent '${id}' is not running.`);
+		if (!terminal) throw new Error(piHerdrAgentPrompt.results.errors.notRunning(id));
 		const row = buildRows(terminals, myId, self).find((candidate) => candidate.id === id);
-		if (!row) throw new Error(`agent '${id}' is not running.`);
+		if (!row) throw new Error(piHerdrAgentPrompt.results.errors.notRunning(id));
 		return { terminal, row };
 	};
 
@@ -1084,7 +1070,7 @@ function treeWidth(theme: Theme, lines: TreeLine[], width: number): number {
 
 /** 表格化 list；孤儿在 status 后面标出来，免得只看到 parent 为空。 */
 export function formatRows(rows: AgentRow[]): string {
-	if (rows.length === 0) return "No agents are running.";
+	if (rows.length === 0) return piHerdrAgentPrompt.results.listEmpty();
 	const header = ["id", "name", "relation", "status", "depth"];
 	const cells = rows.map((row) => [
 		row.id,
@@ -1213,28 +1199,28 @@ function humanError(error: unknown, id?: string): string {
 	if (error instanceof HcError) {
 		switch (error.kind) {
 			case "not_found":
-				return id ? `agent '${id}' is not running.` : "terminal not found.";
+				return id ? piHerdrAgentPrompt.results.errors.notRunning(id) : piHerdrAgentPrompt.results.errors.terminalNotFound();
 			case "finished":
-				return id ? `agent '${id}' has exited.` : "terminal has exited.";
+				return id ? piHerdrAgentPrompt.results.errors.agentExited(id) : piHerdrAgentPrompt.results.errors.terminalExited();
 			case "blocked":
-				return id
-					? `agent '${id}' is blocked on a dialog; answer it in its terminal first.`
-					: "terminal is blocked on a dialog.";
+				return id ? piHerdrAgentPrompt.results.errors.agentBlocked(id) : piHerdrAgentPrompt.results.errors.terminalBlocked();
 			case "status_mismatch":
-				return id ? `agent '${id}' changed state; the action needs the documented state.` : "status mismatch.";
+				return id
+					? piHerdrAgentPrompt.results.errors.agentStatusMismatch(id)
+					: piHerdrAgentPrompt.results.errors.terminalStatusMismatch();
 			case "name_taken":
-				return "name is already used by a running agent.";
+				return piHerdrAgentPrompt.results.errors.nameTaken();
 			case "spawn_failed":
-				return `could not start pi in a new terminal: ${error.message}`;
+				return piHerdrAgentPrompt.results.errors.spawnFailed(error.message);
 			default:
-				return `herdr-core ${error.kind}: ${error.message}`;
+				return piHerdrAgentPrompt.results.errors.coreError(error.kind, error.message);
 		}
 	}
 	return errorMessage(error);
 }
 
 const fail = (message: string, action?: AgentToolDetails["action"], id?: string) => ({
-	content: [{ type: "text" as const, text: `Error: ${message}` }],
+	content: [{ type: "text" as const, text: `${ERROR_PREFIX}${message}` }],
 	details: { action, id, error: message } as AgentToolDetails,
 });
 

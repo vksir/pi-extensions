@@ -9,6 +9,7 @@
   "type": "module",
   "files": [
     "extensions/",
+    "prompt/",
     "package.json"
   ],
   "peerDependencies": {
