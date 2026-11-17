@@ -4,7 +4,7 @@
 
 我们据此决定：**用同名注册覆盖内置 `bash` / `codemode`，只换 `execute` 与 `renderResult`**，给前台调用一个**等待预算**（`pi-bg.promoteAfterSeconds`，默认 300 秒，`<= 0` 关闭）。到点仍未结束就把它转成后台任务（见 [GLOSSARY](../../GLOSSARY.md) 的「转后台」）：
 
-- 传给内置实现的是**自己的** AbortController。晋升前把父轮 Esc 转发下去（保持现状），晋升那一刻摘掉监听，此后父轮怎么结束都不连坐。
+- 传给内置实现的是**自己的** AbortController；模型显式给的 `timeout` 原样透传，到点仍然失败，但它不再阻止晋升——E2E 里模型会主动给 `bash` 加 `timeout`，一旦「有 timeout 就不晋升」，兜底就等于不存在。晋升前把父轮 Esc 转发下去（保持现状），晋升那一刻摘掉监听，此后父轮怎么结束都不连坐。
 - 晋升后的任务进 `pi-bg` 的任务表，复用既有的 `bg_job`（list / show / kill / wait）与 steer 回传通道；并发上限只约束 `bash_bg` / `codemode_bg`，转后台的不占名额。
 - 重建内置定义用 `createBashToolDefinition(cwd, { shellPath, shellCommandPrefix })`——与 pi core 取自同一对设置项；`codemode` 用 `createCodemodeExtension()` 的 shim 接住的那份定义（与 ADR-0006 同一手法）。
 

@@ -720,14 +720,12 @@ test("嵌套调用不晋升", async () => {
 	assert.equal((await pending).content[0].text, "script output");
 });
 
-test("模型显式给了 timeout 时不晋升", async () => {
+test("显式 timeout 照样晋升，timeout 继续作用在后台任务上", async () => {
 	const bash = hangingBash();
 	const { tools } = setup({ promoteAfterSeconds: 0.05, createBash: () => bash.definition });
-	const pending = tools.get("bash").execute("call-1", { command: "true", timeout: 600 }, undefined, undefined, {});
-	const raced = await Promise.race([pending, new Promise((resolve) => setTimeout(() => resolve("waiting"), 150))]);
-	assert.equal(raced, "waiting");
+	const result = await tools.get("bash").execute("call-1", { command: "true", timeout: 600 }, undefined, undefined, {});
+	assert.match(result.content[0].text, /^bash promoted to bg_job /);
 	bash.finish("ok");
-	assert.equal((await pending).content[0].text, "ok");
 });
 
 test("前台 codemode 到点晋升：活动信号来自嵌套调用快照", async () => {

@@ -8,7 +8,7 @@
  *   /bg [kill <id>]                                人工入口，0 常驻
  *
  * 任务 id 在一切文本里都写成 `bg_job <id>`（`jobRef`）：裸 8 位十六进制 id 与子 Agent 的
- * id 同形，模型会误调 `get_subagent_result`。模型可见文案统一在 `prompt/pi-bg.ts`。
+ * id 同形，模型会误调 `get_subagent_result`。模型可见文案统一在 `extensions/prompt/pi-bg.ts`。
  *
  * 两个后台工具都是**薄壳**，执行一律委托内置实现（ADR-0006）：
  *   - bash_bg 走 `ctx.executeTool("bash", ...)`；
@@ -55,7 +55,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { ERROR_PREFIX, piBgPrompt } from "../prompt/pi-bg.ts";
+import { ERROR_PREFIX, piBgPrompt } from "./prompt/pi-bg.ts";
 import {
 	type BgJob,
 	type BgKind,
@@ -746,8 +746,10 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 			...base,
 			execute: async (toolCallId: string, params: any, signal: any, onUpdate: any, ctx: any) => {
 				const input = params as { command: string; timeout?: number };
-				// 显式 timeout 是模型的明确意图：到点就让它失败，不在背后继续跑
-				if (isNested(toolCallId) || input.timeout !== undefined) {
+				// 嵌套调用不晋升。显式 timeout 仍然照转：timeout 一路透传给内置实现，
+				// 到点照样失败，只是不再让整轮陪着它一起卡住（E2E 发现模型常自己加 timeout，
+				// 一旦因此跳过晋升，兜底就等于不存在）。
+				if (isNested(toolCallId)) {
 					return base.execute(toolCallId, params, signal, onUpdate, ctx);
 				}
 				return watch({

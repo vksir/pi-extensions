@@ -57,7 +57,7 @@ import {
 	validateAgentName,
 } from "./lib/agent-protocol.ts";
 import { errorMessage } from "./lib/errors.ts";
-import { ERROR_PREFIX, piHerdrAgentPrompt } from "../prompt/pi-herdr-agent.ts";
+import { ERROR_PREFIX, piHerdrAgentPrompt } from "./prompt/pi-herdr-agent.ts";
 import {
 	createHcClient,
 	HcError,

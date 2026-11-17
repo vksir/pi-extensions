@@ -12,7 +12,7 @@
  *   - 进程退出时 globalThis 随之消失，无需任何清理代码。
  *
  * 常驻上下文只有 `cron` 工具的 description + 参数 schema；人工命令不占常驻。
- * 文案在 `prompt/pi-cron.ts`：跨调用的规则（进程级存续域）随 description 常驻一次，
+ * 文案在 `extensions/prompt/pi-cron.ts`：跨调用的规则（进程级存续域）随 description 常驻一次，
  * 单次行为（创建后立即执行、回执）仍在返回文本里，调用后付费。
  */
 
@@ -21,7 +21,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { ERROR_PREFIX, piCronPrompt } from "../prompt/pi-cron.ts";
+import { ERROR_PREFIX, piCronPrompt } from "./prompt/pi-cron.ts";
 import {
 	cronToHuman,
 	cronToHumanZh,

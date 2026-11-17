@@ -1,11 +1,11 @@
 /**
  * pi-bg 的文本装配：把状态算成 `3.2s` / `done · exit 0 · 12.4s` 这类片段，
- * 再交给 `prompt/pi-bg.ts` 拼成模型可见文案。
+ * 再交给 `extensions/prompt/pi-bg.ts` 拼成模型可见文案。
  *
  * 这里只留「格式」与「TUI 专用」的文本；所有模型可见的句子都在 prompt/ 里。
  */
 
-import { ERROR_PREFIX, piBgPrompt } from "../../../prompt/pi-bg.ts";
+import { ERROR_PREFIX, piBgPrompt } from "../../prompt/pi-bg.ts";
 import { type BgJob, type BgStatus, originLabel } from "./jobs.ts";
 
 /** 完成消息的空输出占位，对齐内置 bash 的 `(no output)`。 */

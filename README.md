@@ -107,7 +107,7 @@ node --test 'tests/herdr.test.ts' 'tests/pi-btw.test.ts' 'tests/session-snapshot
 - 后台任务受**自己的** `AbortController` 约束。发起它的 tool call 被 Esc 中断不会连坐杀掉后台任务。
 - **前台自动转后台**：模型直接调用 `bash` / `codemode` 时，超过等待预算还没结束，就把执行中的命令/脚本转成后台任务、立刻把控制权交还模型，进程/沙箱**不重启**。返回 `bash promoted to bg_job b3f1a2c4 after 5m00s. Still running, last output 1m42s ago.`，之后按后台任务同一套回传。为什么可以覆盖内置工具、以及这条能力的退场条件，见 [ADR-0010](docs/adr/0010-foreground-budget-promotes-to-bg.md)。
   - 只发生在模型直接调用那一层：脚本里的 `tools.bash`、`bash_bg` 的委托都是嵌套调用，永不转后台，返回形状与内置逐字一致。
-  - 模型显式给了 `timeout` 时不转：到点就按超时失败，不在背后继续跑。
+  - 模型显式给的 `timeout` 照旧透传给内置实现：到点仍然失败，只是不再让整轮陪它卡住。
   - 晋升不受并发上限限制；`bash_bg` / `codemode_bg` 仍受 64 上限。
   - 晋升后父轮 Esc 不再连坐（与后台任务一致）。
   - 等待预算 = `settings.json` 的 `pi-bg.promoteAfterSeconds`（默认 `300`，`<= 0` 关闭；关闭时连覆盖版都不注册）。
@@ -116,7 +116,7 @@ node --test 'tests/herdr.test.ts' 'tests/pi-btw.test.ts' 'tests/session-snapshot
 - `bg_job wait` 的 `timeout`（秒）是**等候**的上限，不是任务的超时：到点只返回各任务当前状态，任务继续跑、结果仍作为消息回传；省略则一直等到结束。`wait` 在任务**完成前**发起时结果直接进 tool result、不再作为消息回传；任务**已经回传过**时只给状态，不重复输出（模型必须先拿到 id 才能 wait，两次调用必然跳轮，所以后者是常态）。父轮 Esc 取消的只是「等」这个动作，同样是任务照跑、结果仍会到达。
 - **与内置工具的启用状态联动**：三个工具都在 `session_start` 里注册，注册前读 `getActiveTools()`。`bash` 未启用就根本不注册 `bash_bg`，`codemode` 未启用就不注册 `codemode_bg`，两个都未启用就连 `bg_job` 也不注册。schema 直接复用 `getAllTools()` 里内置工具的那一份，所以 pi 给内置工具加参数时这里不用跟。`prepareLoadout` 只兜「会话中途被 `setActiveTools` 关掉」这条快照覆盖不到的路径。
 - **存续域与会话绑定**：`/new`、`/reload`、`/resume`、`/fork`、退出都会触发 `session_shutdown`，一律中止全部在跑任务；`/new` 与 `/reload` 还会重建扩展实例，任务表随之清空。已完成但未回传的结果随会话一起消失，与 pi-cron 同一取舍（[ADR-0001](docs/adr/0001-cron-tasks-are-process-scoped.md)）。
-- **文案**：给模型的文字全部在 `prompt/pi-bg.ts`，规则见 `prompt/README.md`。「长命令用后台工具」这条跨调用的规则写在 `bash_bg` / `codemode_bg` 的 `promptGuidelines` 里（工具被隐藏时规则自动消失），不写进返回值。
+- **文案**：给模型的文字全部在 `extensions/prompt/pi-bg.ts`，规则见 `extensions/prompt/README.md`。「长命令用后台工具」这条跨调用的规则写在 `bash_bg` / `codemode_bg` 的 `promptGuidelines` 里（工具被隐藏时规则自动消失），不写进返回值。
 - **缓存稳定性**：三个工具在首次 `session_start` 注册一次（幂等守卫挡住 `rebindCurrentSession` 的二次触发），`description` / `promptSnippet` / `parameters` 全部确定，`prepareLoadout` 是纯函数，所以一局会话内系统提示词、工具列表与顺序都不变。`session_shutdown` 不区分 reason，五种理由都是「离开这个会话」。
 - **Windows + Git Bash 的不保证项**：pi 的 `killProcessTree` 在 Windows 上用 `taskkill /F /T <pid>`，而 MSYS 子进程（`sleep`、`grep` 这类）在 Windows 记录的父进程并不是 bash，所以中止后可能残留孤儿进程。对前台 `bash` 调用按 Esc 是**完全一样**的行为，不是 pi-bg 引入的。所以 `/new` 与 `bg_job kill` 保证的是「本次会话不再回传、内置执行已收到 abort」，**不是**「进程一定被杀死」——这个保证在 Windows + MSYS 上是弱的。
 
@@ -200,7 +200,7 @@ pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式�
 | `lib/cron/presentation.ts` | 排期的人类可读化与触发 prompt 包装 |
 | `lib/bg/jobs.ts` | 后台任务表：上限、淘汰、id 分配（纯函数） |
 | `lib/bg/format.ts` | 后台任务的格式片段（耗时、状态行）与 TUI 专用文本 |
-| `prompt/` | 全部模型可见文案，按扩展一文件；规则见 `prompt/README.md` |
+| `extensions/prompt/` | 全部模型可见文案，按扩展一文件；规则见 `extensions/prompt/README.md` |
 | `lib/balance/providers.ts` | Provider 凭据、请求与响应归一化 |
 | `lib/balance/render.ts` | `/balance` 结果排版 |
 | `lib/json.ts` | Agent 数据目录 JSON 的容错读取与原子写入 |

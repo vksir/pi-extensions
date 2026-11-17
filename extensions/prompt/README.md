@@ -15,12 +15,12 @@
 
 ## 放在哪
 
-按扩展一文件，文件名与扩展同名：
+按扩展一文件，放在 `extensions/prompt/`，文件名与扩展同名：
 
 ```
-prompt/pi-bg.ts
-prompt/pi-cron.ts
-prompt/pi-herdr-agent.ts
+extensions/prompt/pi-bg.ts
+extensions/prompt/pi-cron.ts
+extensions/prompt/pi-herdr-agent.ts
 ```
 
 每个文件导出**一个**对象，四段固定顺序：
@@ -72,7 +72,7 @@ export const piBgPrompt = {
 
 新增或修改模型可见文案时：
 
-- [ ] 在 `prompt/<扩展>.ts` 里改，不在扩展代码里内联
+- [ ] 在 `extensions/prompt/<扩展>.ts` 里改，不在扩展代码里内联
 - [ ] 有呈现场景注释
 - [ ] 英文，且符合上面 7 条
 - [ ] 这条信息是否已在 `promptGuidelines` 或参数描述里存在（避免重复常驻）
