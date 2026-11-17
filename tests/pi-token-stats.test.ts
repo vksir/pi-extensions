@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { initTheme, type ExtensionContext, type ReadonlyFooterDataProvider, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import { createRateFooter, formatRate, insertRate, outputRate, shrinkPadding } from "../extensions/lib/footer-rate.ts";
+import { createFirstTokenTimer, createRateFooter, formatFirstToken, formatRate, insertRate, outputRate, shrinkPadding } from "../extensions/lib/footer-rate.ts";
 
 // 内置 FooterComponent 渲染时会取当前主题的颜色。
 initTheme("dark");
@@ -51,7 +52,41 @@ test("formatRate：两位数取整，个位数保留一位小数", () => {
 	assert.equal(formatRate(3.44), "3.4t/s");
 });
 
-test("insertRate 落在用量段与缓存命中率之间", () => {	assert.equal(
+test("formatFirstToken：一秒以内用毫秒，再长用秒", () => {
+	assert.equal(formatFirstToken(850), "850ms");
+	assert.equal(formatFirstToken(1234), "1.2s");
+});
+
+test("createFirstTokenTimer：从请求开始到第一个内容块", () => {
+	let now = 1_000;
+	const timer = createFirstTokenTimer(() => now);
+	const message = { timestamp: 400 } as AssistantMessage;
+
+	// 响应头（start）到达还不算首字
+	timer.record(message, { type: "start" });
+	assert.equal(timer.firstTokenMs(400), undefined);
+
+	now = 1_150;
+	timer.record(message, { type: "thinking_start" });
+	assert.equal(timer.firstTokenMs(400), 750);
+
+	// 同一个响应的后续事件不覆盖第一次测量
+	now = 9_999;
+	timer.record(message, { type: "text_delta" });
+	assert.equal(timer.firstTokenMs(400), 750);
+
+	// 时间戳对不上的消息（老会话、别的会话）不显示，免得张冠李戴
+	assert.equal(timer.firstTokenMs(999), undefined);
+
+	// 下一次请求重新计时
+	now = 2_000;
+	timer.record({ timestamp: 1_900 } as AssistantMessage, { type: "text_start" });
+	assert.equal(timer.firstTokenMs(1_900), 100);
+	assert.equal(timer.firstTokenMs(400), undefined);
+});
+
+test("insertRate 落在用量段与缓存命中率之间", () => {
+	assert.equal(
 		insertRate("↑225k ↓42k R1.5M CH97.1% $0.090 7.1%/1.0M (auto)", "42t/s"),
 		"↑225k ↓42k R1.5M 42t/s CH97.1% $0.090 7.1%/1.0M (auto)",
 	);
@@ -99,14 +134,17 @@ function fakeContext(entries: SessionEntry[]) {
 	return { ctx, footerData, calls };
 }
 
-test("createRateFooter：内置状态行里多一段速率", () => {
+test("createRateFooter：内置状态行里多一段首字时间与速率", () => {
 	const { ctx, footerData, calls } = fakeContext([assistant(2000, 2000)]);
-	const footer = createRateFooter(ctx, footerData, { isAutoCompactEnabled: () => true });
+	const footer = createRateFooter(ctx, footerData, {
+		isAutoCompactEnabled: () => true,
+		firstTokenMs: () => 850,
+	});
 	const lines = footer.render(120);
 
 	assert.equal(lines.length, 2);
 	assert.match(lines[0], /pi-extensions \(main\)/);
-	assert.match(lines[1], /R[\d.]+k? 1000t\/s CH/);
+	assert.match(lines[1], /R[\d.]+k? 850ms 1000t\/s CH/);
 	// 内置 footer 的其它段原样保留
 	assert.match(lines[1], /CH\d+(?:\.\d+)?%/);
 	assert.match(lines[1], /deepseek-flash/);
@@ -116,6 +154,14 @@ test("createRateFooter：内置状态行里多一段速率", () => {
 	const before = calls.entries;
 	footer.render(120);
 	assert.equal(calls.entries, before + 1);
+});
+
+test("createRateFooter：没测到首字时间时只显示速率", () => {
+	const { ctx, footerData } = fakeContext([assistant(2000, 2000)]);
+	const footer = createRateFooter(ctx, footerData, { isAutoCompactEnabled: () => true });
+	const line = footer.render(120)[1];
+	assert.match(line, / 1000t\/s CH/);
+	assert.doesNotMatch(line, /\b\d+ms\b|\b\d+\.\ds\b/);
 });
 
 test("createRateFooter：拿不到速率时保留内置状态行", () => {

@@ -10,7 +10,7 @@
  *   /token 3d          — 近 3 天（Nd 任意天数）
  *   /token out         — 显示 Output 柱状图（可与天数组合，如 /token 7d Out）
  *
- * footer 状态行里插入最近一次响应的输出速率（如 `R1.5M 42t/s CH97.1%`），
+ * footer 状态行里插入最近一次响应的首字时间与输出速率（如 `R1.5M 0.9s 42t/s CH97.1%`），
  * 由 lib/footer-rate.ts 包一层内置 footer 实现。
  *
  * 持久化在 lib/json.ts，entry 渲染在 lib/render.ts；本模块负责采集、聚合与命令。
@@ -20,7 +20,7 @@ import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
-import { createRateFooter } from "./lib/footer-rate.ts";
+import { createFirstTokenTimer, createRateFooter } from "./lib/footer-rate.ts";
 import { readJsonFile, writeJsonFileAtomic } from "./lib/json.ts";
 import { renderDimLines } from "./lib/render.ts";
 
@@ -290,18 +290,28 @@ const TOKEN_ARGS: AutocompleteItem[] = [
 // ─── 扩展 ───
 
 export default function (pi: ExtensionAPI) {
+	// 首字时间只能在流式过程中测：消息落盘后只剩耗时（durationMs），没有首字点。
+	const firstToken = createFirstTokenTimer();
+
 	pi.registerEntryRenderer<TokenStatsEntry>("token-stats", (entry, _options, theme) =>
 		renderDimLines(theme, entry.data?.lines ?? ["(no data)"]),
 	);
 
-	// footer 只在交互模式下可换：默认 footer 原样保留，多一段输出速率。
+	// footer 只在交互模式下可换：默认 footer 原样保留，多一段首字时间与输出速率。
 	pi.on("session_start", (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
 		ctx.ui.setFooter((_tui, _theme, footerData) =>
 			createRateFooter(ctx, footerData, {
 				isAutoCompactEnabled: () => pi.getSettings().compaction?.enabled ?? true,
+				firstTokenMs: (requestTimestamp) => firstToken.firstTokenMs(requestTimestamp),
 			}),
 		);
+	});
+
+	// 第一个内容块到达即为首字，用 assistant 消息的 timestamp（请求开始时刻）作起点。
+	pi.on("message_update", (event, _ctx) => {
+		if (event.message.role !== "assistant") return;
+		firstToken.record(event.message, event.assistantMessageEvent);
 	});
 
 	// turn_end: 从事件中直接取 usage，锁保护写缓存
