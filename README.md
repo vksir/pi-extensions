@@ -22,7 +22,7 @@ node --test tests/*.test.ts
 | [pi-balance](extensions/pi-balance.ts) | 查询 AI 模型提供商余额/额度（支持 DeepSeek、Moonshot、OpenRouter、OpenAI Codex、OpenCode Go、智谱 GLM）；`/balance` 列支持的 Provider，`/balance all` 查全部，`/balance <provider>` 查单个 |
 | [pi-notify](extensions/pi-notify.ts) | 任务完成后发送桌面通知（支持 iTerm2、Kitty、Ghostty、WezTerm、Windows Terminal）；需 Pi ≥ 1.3.0 |
 | [pi-title](extensions/pi-title.ts) | Agent 运行时在窗口标题显示旋转动画，结束后恢复原标题；herdr 环境（两代）不修改窗口标题，`/name` 更名与会话启动（resume / `/reload` / 切换会话）时同步重命名所在标签（旧 herdr 经 CLI 直接寻址，herdr app 经 herdr-app CLI ls 寻址）；进程内子 agent 会话（ctx.mode 非 "tui"）不参与标题与标签管理 |
-| [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 用量，支持 `/token` 命令；footer 状态行里插入最近一次响应的首字时间与输出速率（`R1.5M 0.9s 42t/s CH97.1%`） |
+| [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 用量（`/token`），按天/模型出图并在报告末尾按会话列出平均首字与平均输出速率；footer 状态行里插入最近一次响应的首字时间与输出速率（`R1.5M 0.9s 42t/s CH97.1%`） |
 | [pi-context](extensions/pi-context.ts) | `/context` 触发一次空转请求，导出这次请求的系统提示词与工具声明（含 codemode 动态描述），两者同源 |
 | [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron [间隔] [once] <prompt>`（省略间隔按 `15m`）、`/cron list`、`/cron delete [id]` |
 | [pi-btw](extensions/pi-btw.ts) | 顺带分派：仅在 herdr / herdr app 环境注册 `/btw <消息>`，新开一个标签，fork 当前会话启动 pi 并把消息作为首条消息递交；本轮还在跑时先把 fork 源截到上一个完整轮次，避免新会话继承半截 turn（见 [ADR-0008](docs/adr/0008-btw-forks-at-turn-boundary.md)） |
@@ -40,6 +40,14 @@ footer 状态行里多一段首字时间与输出速率，位置在缓存读取�
 - 两段都取自同一条 assistant 消息；消息没带耗时（比如老会话）时，首字时间也一并隐身，避免张冠李戴。
 
 pi 没有给 footer 留插槽，`setFooter` 只能整体替换，所以 `lib/footer-rate.ts` 用内置 `FooterComponent` 渲染原状态行，只往里面插一段首字时间与速率：路径、用量、命中率、上下文占比、模型右对齐、扩展状态行仍由 pi 自己管。插入多出的宽度从模型名前的留白里扣回，窄终端上留白不够才截断。代价是扩展上下文拿不到的几段不显示：虚拟模型的路由结果（`→ 物理模型`）与订阅标记（`(sub)`）。
+
+### 会话粒度统计
+
+`/token` 报告末尾按最近活动倒序列出会话：最近活动时间、会话名（没命名过用 id 短前缀）、轮次、输出 token、平均首字、平均速率。默认最多列 8 个；`/token sessions` 只看这张表且不限条数，可与其他参数组合（如 `/token 30d sessions`、`/token all sessions`）。落在近 N 天里看的是会话最近一次活动的日期——静了几天又续聊的会计算在新的那天。
+
+- 每次 `turn_end` 把响应并入会话记录（`lib/session-usage.ts`）：轮次、用量、有耗时响应的输出之和与耗时之和、测到的首字时间。会话记录和按天统计一起写进 `token-stats.json`（v2 起多了 `sessions` 段，读旧文件时按空表补齐）。
+- 平均输出速率 = 该会话有耗时的响应输出 token 之和 ÷ 这些响应的耗时之和，按 token 加权，不是逐次速率的算术平均：短响应里排一次队就能把算术平均拉垮。
+- 平均首字 = 测到首字的响应之和 ÷ 样本数。首字只能在流式过程中测，所以续聊、重启、老会话里的响应没有样本，可能少于响应数；一次都没测到的会话这一列显示 `-`。
 
 回归测试（Node.js 24+）：
 

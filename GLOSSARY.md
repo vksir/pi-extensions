@@ -14,6 +14,18 @@ _Avoid_: 速度、生成速度、tokens per second、TPS
 扩展上下文里能取到的那部分会话数据，用来驱动内置 `FooterComponent` 渲染——因为 `setFooter` 只能整体替换 footer。
 _Avoid_: 假 session、mock session
 
+**会话记录 (Session Record)**：
+token-stats 里按会话累计的用量与计时，key 是会话 id。每次 `turn_end` 并入一笔响应：轮次、用量、有耗时响应的输出与耗时、测到的首字时间。
+_Avoid_: 会话统计条目、session stats
+
+**平均首字 (Average TTFT)**：
+会话里测到首字的响应之和除以样本数。首字只能在流式过程中测，样本数可能少于响应数；一次都没测到过的会话显示 `-`。
+_Avoid_: 平均延迟、平均耗时
+
+**会话平均速率 (Session Average Output Rate)**：
+该会话有耗时的响应输出 token 之和除以这些响应的耗时之和，单位 token/秒。按 token 加权，不是逐次速率的算术平均。
+_Avoid_: 平均速度、平均 TPS
+
 ### 定时调度（pi-cron）
 
 **cron job**：
