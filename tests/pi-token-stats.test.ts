@@ -239,7 +239,7 @@ test("averageFirstTokenMs：只平均测到的样本", () => {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-/** 只有会话表的缓存：byDate 留空，走 sessionsOnly 视图不涉及柱状图。 */
+/** 只关心会话区块的缓存：byDate 留空，柱状图走「暂无数据」分支。 */
 function sessionCache(entries: { id: string; name?: string; at: number; output: number; durationMs: number; firstTokenMs?: number }[]): GlobalCache {
 	const cache: GlobalCache = { version: 2, byDate: {}, sessions: {} };
 	for (const entry of entries) {
@@ -254,62 +254,49 @@ function sessionCache(entries: { id: string; name?: string; at: number; output: 
 	return cache;
 }
 
-test("renderStats(sessionsOnly)：列出会话的平均首字与平均速率，按最近活动倒序", () => {
+test("renderStats：会话速率只显示当前会话，与天数参数无关", () => {
 	const now = Date.now();
 	const cache = sessionCache([
-		{ id: "aaaaaaaa-1111", name: "修复 token 统计", at: now - 60_000, output: 600, durationMs: 12_000, firstTokenMs: 1_200 },
-		{ id: "bbbbbbbb-2222", name: "老会话", at: now - 40 * DAY_MS, output: 100, durationMs: 1_000 },
-		{ id: "cccccccc-3333", at: now - 30_000, output: 300, durationMs: 1_000 },
+		// 当前会话：很久以前就开始，仍应显示它的累计平均
+		{ id: "current-session", name: "当前会话", at: now - 40 * DAY_MS, output: 600, durationMs: 12_000, firstTokenMs: 1_200 },
+		// 别的会话：不出现在报告里
+		{ id: "other-session", name: "别人的会话", at: now - 60_000, output: 300, durationMs: 1_000, firstTokenMs: 500 },
 	]);
 
-	const text = renderStats(cache, 7, false, true).join("\n");
-	assert.match(text, /会话统计 \(近 7 天\)/);
-	assert.match(text, /修复 token 统计/);
-	// 未命名会话显示 id 短前缀
-	assert.match(text, /cccccccc/);
-	assert.match(text, /50t\/s/);
-	assert.match(text, /1\.2s/);
-	// 没测到首字的会话只留占位，不编造数值
-	assert.match(text, /首字\s+-/);
-	// 40 天前的会话不在近 7 天里
-	assert.doesNotMatch(text, /老会话/);
-	assert.match(text, /共 2 个会话/);
-	// 最近的排最前
-	assert.ok(text.indexOf("cccccccc") < text.indexOf("修复 token 统计"));
-
-	// all / 0d：全部历史
-	assert.match(renderStats(cache, 0, false, true).join("\n"), /老会话/);
+	const text = renderStats(cache, 7, false, "current-session").join("\n");
+	assert.match(text, /当前会话/);
+	assert.match(text, /1 轮 · Out 600 · 平均首字 1\.2s · 平均速率 50t\/s/);
+	// 历史会话不参与展示
+	assert.doesNotMatch(text, /别人的会话/);
+	assert.doesNotMatch(text, /300/);
+	// 天数参数只管柱状图：7 天内没有按天数据，40 天前的会话照样显示自己的平均
+	assert.match(text, /Token 用量趋势 \(近 7 天\)/);
+	assert.match(text, /（暂无数据）/);
+	assert.match(text, /当前会话[\s\S]*Out 600/);
+	const all = renderStats(cache, 0, false, "current-session").join("\n");
+	assert.match(all, /1 轮 · Out 600 · 平均首字 1\.2s · 平均速率 50t\/s/);
 });
 
-test("renderStats：默认报告在柱状图之后附会话表，最多列最近 8 个", () => {
-	const now = Date.now();
-	const entries = Array.from({ length: 10 }, (_, index) => ({
-		id: `session-${index}`,
-		name: `会话 ${index}`,
-		at: now - index * 1_000,
-		output: (index + 1) * 100,
-		durationMs: 1_000,
-		firstTokenMs: 500,
-	}));
-	const text = renderStats(sessionCache(entries), 7).join("\n");
-	assert.match(text, /Token 用量趋势/);
-	assert.match(text, /会话（按最近活动排序）/);
-	assert.match(text, /会话 7/);
-	assert.doesNotMatch(text, /会话 8/);
-	assert.match(text, /…另有 2 个会话/);
-	assert.match(text, /共 10 个会话/);
+test("renderStats：当前会话没测到首字时显示占位，缺记录时写明暂无", () => {
+	const cache = sessionCache([{ id: "current-session", at: Date.now(), output: 100, durationMs: 1_000 }]);
+	const text = renderStats(cache, 7, false, "current-session").join("\n");
+	assert.match(text, /平均首字 -/);
+	assert.match(text, /平均速率 100t\/s/);
+
+	const missing = renderStats(cache, 7, false, "unknown-session").join("\n");
+	assert.match(missing, /当前会话\s+（本会话暂无记录）/);
 });
 
 test("tokenArgumentCompletions：补全保留已写好的参数", () => {
 	const values = (prefix: string) => (tokenArgumentCompletions(prefix) ?? []).map((item) => item.value);
 
-	// 空参数：全部候选
+	// 空参数：全部候选，没有已删除的 Sessions
 	assert.ok(values("").includes("7d"));
-	assert.ok(values("").includes("Sessions"));
+	assert.ok(!values("").includes("Sessions"));
 	// 单个参数：按前缀过滤
-	assert.deepEqual(values("sess"), ["Sessions"]);
+	assert.deepEqual(values("o"), ["Out"]);
 	// 多参数：补全项带上前面的参数（pi 补全会整段替换参数文本）
-	assert.deepEqual(values("all s"), ["all Sessions"]);
+	assert.deepEqual(values("all o"), ["all Out"]);
 	assert.deepEqual(values("7d out"), ["7d Out"]);
 	// 已写过的参数不再出现在下一条候选里
 	assert.ok(!values("all ").includes("all"));

@@ -4,31 +4,31 @@
  * 全局 Token 用量统计。每次 turn_end 从事件中提取 usage，
  * 增量写入 Pi agent dir 下的 token-stats.json。不做任何 session 文件扫描。
  *
- * 同时按会话记录：每次响应并入会话（lib/session-usage.ts）的累计量、有耗时的输出与耗时、
- * 测到的首字时间，报告里给出每个会话的平均首字与平均输出速率（按 token 加权）。
+ * 同时按会话记录：每次响应并入所属会话（lib/session-usage.ts）的累计量、有耗时的输出与
+ * 耗时、测到的首字时间。报告末尾只列**当前会话**的平均首字与平均输出速率（按 token 加权），
+ * 历史会话只留在数据文件里，不参与展示。
  *
  * 命令：
- *   /token             — 近 7 天统计 + Input 柱状图 + 会话表（默认）
+ *   /token             — 近 7 天统计 + Input 柱状图 + 当前会话速率（默认）
  *   /token all         — 全部历史统计（/token 0d 亦可）
  *   /token 3d          — 近 3 天（Nd 任意天数）
  *   /token out         — 显示 Output 柱状图（可与天数组合，如 /token 7d Out）
- *   /token sessions    — 只看会话粒度统计（可与天数组合，如 /token 30d sessions）
  *
  * footer 状态行里插入最近一次响应的首字时间与输出速率（如 `R1.5M 0.9s 42t/s CH97.1%`），
  * 由 lib/footer-rate.ts 包一层内置 footer 实现。
  *
- * 持久化在 lib/json.ts，entry 渲染在 lib/render.ts；本模块负责采集、聚合与命令。
+ * 持久化在 lib/json.ts（整文件读-改-写在缓存锁内，见 updateJsonFile），entry 渲染在 lib/render.ts；
+ * 本模块负责采集、聚合与命令。
  */
 
 import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth, type AutocompleteItem } from "@earendil-works/pi-tui";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { createFirstTokenTimer, createRateFooter, formatFirstToken, formatRate } from "./lib/footer-rate.ts";
-import { readJsonFile, writeJsonFileAtomic } from "./lib/json.ts";
+import { readJsonFile, updateJsonFile } from "./lib/json.ts";
 import { renderDimLines } from "./lib/render.ts";
 import { averageFirstTokenMs, averageOutputRate, recordSessionTurn, type SessionRecord } from "./lib/session-usage.ts";
-import { truncate } from "./lib/text.ts";
 
 // ─── 类型 ───
 
@@ -66,13 +66,13 @@ function cachePath(): string {
 	return join(getAgentDir(), "token-stats.json");
 }
 
-function loadCache(): GlobalCache {
-	const raw = readJsonFile<Partial<GlobalCache>>(cachePath(), {});
+/** v1 文件没有 sessions；读取时统一补齐，写回时自然升到 v2。 */
+function normalizeCache(raw: Partial<GlobalCache>): GlobalCache {
 	return { version: CACHE_VERSION, byDate: raw.byDate ?? {}, sessions: raw.sessions ?? {} };
 }
 
-function saveCache(cache: GlobalCache): void {
-	writeJsonFileAtomic(cachePath(), cache);
+function loadCache(): GlobalCache {
+	return normalizeCache(readJsonFile<Partial<GlobalCache>>(cachePath(), {}));
 }
 
 // ─── usage 聚合 ───
@@ -268,79 +268,32 @@ function appendModelSummary(lines: string[], cache: GlobalCache, dates: string[]
 	lines.push("");
 }
 
-// ─── 会话表 ───
+// ─── 当前会话 ───
 
-/** 默认报告里最多列几个会话；`/token sessions` 不受限。 */
-const SESSION_ROWS = 8;
-
-interface SessionRow {
-	at: number;
-	label: string;
-	turns: number;
-	output: number;
-	rate?: number;
-	firstTokenMs?: number;
-}
-
-function clockLabel(at: number): string {
-	const d = new Date(at);
-	const pad = (n: number) => String(n).padStart(2, "0");
-	return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-/** 会话按最近活动倒序；日期过滤看最近活动日期，静了几天又续聊的会话算在新的那天。 */
-function sessionRows(cache: GlobalCache, days: number): SessionRow[] {
-	const from = cutoffDate(days);
-	const rows: SessionRow[] = [];
-	for (const [id, record] of Object.entries(cache.sessions)) {
-		if (from !== undefined && shortDate(new Date(record.lastActiveAt)) < from) continue;
-		rows.push({
-			at: record.lastActiveAt,
-			// 没命名过的会话用 id 短前缀；名字过长按显示宽度截断，别把整行顶爆
-			label: truncateToWidth(truncate(record.name ?? id.slice(0, 8), 24), 20, "…"),
-			turns: record.turns,
-			output: record.usage.output,
-			rate: averageOutputRate(record),
-			firstTokenMs: averageFirstTokenMs(record),
-		});
+/** 只列当前会话：历史会话的记录保留在数据文件里，不参与展示。 */
+function appendCurrentSession(lines: string[], record: SessionRecord | undefined): void {
+	lines.push("  当前会话");
+	if (!record) {
+		lines.push("  （本会话暂无记录）", "");
+		return;
 	}
-	return rows.sort((a, b) => b.at - a.at);
-}
-
-function appendSessionTable(lines: string[], rows: SessionRow[], limit = Number.POSITIVE_INFINITY): void {
-	if (rows.length === 0) return;
-	const shown = rows.slice(0, limit);
-	const labelWidth = Math.max(...shown.map((row) => visibleWidth(row.label)));
-	lines.push("  会话（按最近活动排序）");
-	for (const row of shown) {
-		const rate = row.rate === undefined ? "-" : formatRate(row.rate);
-		const first = row.firstTokenMs === undefined ? "-" : formatFirstToken(row.firstTokenMs);
-		lines.push(
-			`  ${clockLabel(row.at)}  ${row.label}${" ".repeat(labelWidth - visibleWidth(row.label))}  ${String(row.turns).padStart(3)} 轮` +
-				`  Out ${fmt(row.output).padStart(7)}  首字 ${first.padStart(6)}  ${rate.padStart(7)}`,
-		);
-	}
-	if (rows.length > shown.length) {
-		lines.push(`  …另有 ${rows.length - shown.length} 个会话（/token sessions 看全部）`);
-	}
-	const turns = rows.reduce((sum, row) => sum + row.turns, 0);
-	const output = rows.reduce((sum, row) => sum + row.output, 0);
-	lines.push(`  共 ${rows.length} 个会话 · ${turns} 轮 · Output ${fmt(output)}`);
+	const rate = averageOutputRate(record);
+	const first = averageFirstTokenMs(record);
+	const rateText = rate === undefined ? "-" : formatRate(rate);
+	const firstText = first === undefined ? "-" : formatFirstToken(first);
+	lines.push(`  ${record.turns} 轮 · Out ${fmt(record.usage.output)} · 平均首字 ${firstText} · 平均速率 ${rateText}`);
 	lines.push("  平均首字只统计流式中测到的响应；平均速率 = 有耗时响应的输出 token ÷ 耗时之和");
 	lines.push("");
 }
 
-export function renderStats(cache: GlobalCache, days: number, showOutput = false, sessionsOnly = false): string[] {
+/** 会话速率永远只针对当前会话，与天数参数无关：记录本身没有按天的拆分。 */
+export function renderStats(
+	cache: GlobalCache,
+	days: number,
+	showOutput = false,
+	currentSessionId?: string,
+): string[] {
 	const label = days === 0 ? "全部" : `近 ${days} 天`;
-	const sessions = sessionRows(cache, days);
-
-	if (sessionsOnly) {
-		const sessionLines: string[] = [`  📊 会话统计 (${label})`, ""];
-		if (sessions.length === 0) sessionLines.push("  （暂无数据）");
-		else appendSessionTable(sessionLines, sessions);
-		return sessionLines;
-	}
-
 	const lines: string[] = [`  📊 Token 用量趋势 (${label})`, ""];
 	const dates = datesInRange(cache, days);
 	if (dates.length === 0) {
@@ -358,7 +311,7 @@ export function renderStats(cache: GlobalCache, days: number, showOutput = false
 		appendModelSummary(lines, cache, dates);
 	}
 
-	appendSessionTable(lines, sessions, SESSION_ROWS);
+	appendCurrentSession(lines, currentSessionId === undefined ? undefined : cache.sessions[currentSessionId]);
 	return lines;
 }
 
@@ -372,12 +325,11 @@ const TOKEN_ARGS: AutocompleteItem[] = [
 	{ value: "90d", label: "90d", description: "近 90 天" },
 	{ value: "all", label: "all", description: "全部历史" },
 	{ value: "Out", label: "Out", description: "改看 Output 柱状图" },
-	{ value: "Sessions", label: "Sessions", description: "只看会话统计（平均首字 / 平均速率）" },
 ];
 
 /**
  * 只补正在输入的最后一个参数，并排除已写过的。补全项的 `value` 带上前面已写好的参数：
- * pi 的参数补全会整段替换参数文本，不带上的话 `/token all s` 补完会变成 `/token Sessions`，
+ * pi 的参数补全会整段替换参数文本，不带上的话 `/token all o` 补完会变成 `/token Out`，
  * 天数被吃掉。
  */
 export function tokenArgumentCompletions(prefix: string): AutocompleteItem[] | null {
@@ -436,25 +388,30 @@ export default function (pi: ExtensionAPI) {
 				cacheWrite: usage.cacheWrite ?? 0,
 				cost: usage.cost?.total ?? 0,
 			};
-			const cache = loadCache();
-			addDailyUsage(cache, shortDate(), model, recorded);
 			// 首字时间只在流式过程中测得到，必须当场落盘，否则重启后无从补算。
 			const sessionId = ctx.sessionManager.getSessionId();
-			cache.sessions[sessionId] = recordSessionTurn(cache.sessions[sessionId], {
-				at: Date.now(),
-				name: ctx.sessionManager.getSessionName(),
-				usage: recorded,
-				durationMs: msg.durationMs,
-				firstTokenMs: firstToken.firstTokenMs(msg.timestamp),
+			const name = ctx.sessionManager.getSessionName();
+			const firstTokenMs = firstToken.firstTokenMs(msg.timestamp);
+			// 读-改-写在锁内完成：多个 pi 进程同时收尾时，不会互相覆盖增量。
+			updateJsonFile<Partial<GlobalCache>>(cachePath(), {}, (raw) => {
+				const cache = normalizeCache(raw);
+				addDailyUsage(cache, shortDate(), model, recorded);
+				cache.sessions[sessionId] = recordSessionTurn(cache.sessions[sessionId], {
+					at: Date.now(),
+					name,
+					usage: recorded,
+					durationMs: msg.durationMs,
+					firstTokenMs,
+				});
+				return cache;
 			});
-			saveCache(cache);
 		} catch {
 			/* ignore */
 		}
 	});
 
 	pi.registerCommand("token", {
-		description: "Token 用量统计。默认近7天。参数: all/Nd(天数) / Output|Out / Sessions",
+		description: "Token 用量统计。默认近7天。参数: all/Nd(天数) / Output|Out",
 		getArgumentCompletions: (prefix) => tokenArgumentCompletions(prefix),
 		handler: async (args, ctx) => {
 			try {
@@ -462,18 +419,16 @@ export default function (pi: ExtensionAPI) {
 				// 默认近 7 天；all / 0d 表示全部历史
 				let days = 7;
 				let showOutput = false;
-				let sessionsOnly = false;
 				for (const part of parts) {
 					const token = part.toLowerCase();
 					const match = token.match(/^(\d+)d$/);
 					if (match) days = parseInt(match[1], 10);
 					else if (token === "all") days = 0;
 					else if (token === "output" || token === "out") showOutput = true;
-					else if (token === "sessions" || token === "session" || token === "s") sessionsOnly = true;
 				}
 
 				pi.appendEntry<TokenStatsEntry>("token-stats", {
-					lines: renderStats(loadCache(), days, showOutput, sessionsOnly),
+					lines: renderStats(loadCache(), days, showOutput, ctx.sessionManager.getSessionId()),
 				});
 			} catch (e) {
 				ctx.ui.notify(`[error] ${(e as Error).message}`, "error");

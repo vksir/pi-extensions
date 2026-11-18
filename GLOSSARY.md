@@ -15,7 +15,7 @@ _Avoid_: 速度、生成速度、tokens per second、TPS
 _Avoid_: 假 session、mock session
 
 **会话记录 (Session Record)**：
-token-stats 里按会话累计的用量与计时，key 是会话 id。每次 `turn_end` 并入一笔响应：轮次、用量、有耗时响应的输出与耗时、测到的首字时间。
+token-stats 里按会话累计的用量与计时，key 是会话 id。每次 `turn_end` 并入一笔响应：轮次、用量、有耗时响应的输出与耗时、测到的首字时间。`/token` 只展示当前会话，历史会话仅留存。
 _Avoid_: 会话统计条目、session stats
 
 **平均首字 (Average TTFT)**：
@@ -25,6 +25,10 @@ _Avoid_: 平均延迟、平均耗时
 **会话平均速率 (Session Average Output Rate)**：
 该会话有耗时的响应输出 token 之和除以这些响应的耗时之和，单位 token/秒。按 token 加权，不是逐次速率的算术平均。
 _Avoid_: 平均速度、平均 TPS
+
+**缓存锁 (Cache Lock)**：
+`token-stats.json` 旁边的 `.lock` 文件，让多个 pi 进程的整文件读-改-写串行化。独占创建、超时重试，持有者崩溃留下的锁按 mtime 过期回收。
+_Avoid_: 文件锁、mutex、flock
 
 ### 定时调度（pi-cron）
 
