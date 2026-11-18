@@ -15,7 +15,7 @@ _Avoid_: 速度、生成速度、tokens per second、TPS
 _Avoid_: 假 session、mock session
 
 **会话记录 (Session Record)**：
-token-stats 里按会话累计的用量与计时，key 是会话 id。每次 `turn_end` 并入一笔响应：轮次、用量、有耗时响应的输出与耗时、测到的首字时间。`/token` 只展示当前会话，历史会话仅留存。
+token-stats 里按会话累计的用量与计时，key 是会话 id。每次 `turn_end` 并入一笔响应：轮次、用量、有耗时响应的输出与耗时、测到的首字时间。存在 SQLite 的 `session` 表；`/token` 只展示当前会话，历史会话仅留存。
 _Avoid_: 会话统计条目、session stats
 
 **平均首字 (Average TTFT)**：
@@ -26,9 +26,21 @@ _Avoid_: 平均延迟、平均耗时
 该会话有耗时的响应输出 token 之和除以这些响应的耗时之和，单位 token/秒。按 token 加权，不是逐次速率的算术平均。
 _Avoid_: 平均速度、平均 TPS
 
-**缓存锁 (Cache Lock)**：
-`token-stats.json` 旁边的 `.lock` 文件，让多个 pi 进程的整文件读-改-写串行化。独占创建、超时重试，持有者崩溃留下的锁按 mtime 过期回收。
-_Avoid_: 文件锁、mutex、flock
+**明细行 (Turn Record)**：
+SQLite 里 `turn` 表的一行，对应一次 assistant 响应。新数据一轮一行，旧 JSON 里没有明细，迁移后只有汇总。
+_Avoid_: 事件、日志行、raw event
+
+**日汇总 (Day Rollup)**：
+`day_model` 表里按天 × 模型累计的用量，柱状图与模型汇总读它。旧 JSON 的按天数据迁移到这里。
+_Avoid_: 日聚合、daily stats
+
+**会话汇总 (Session Rollup)**：
+`session` 表里按会话累计的用量与计时，报告只查当前会话。旧 JSON 的 `sessions` 段迁移到这里。
+_Avoid_: 会话记录表、session row
+
+**静默迁移 (Silent Migration)**：
+数据库第一次打开时把旧版 `token-stats.json` 导入 SQLite，不提示、不改动旧文件，靠 `meta.legacy_json_imported` 保证只做一次。临时代码，下个版本删除。
+_Avoid_: 数据升级、导入向导、backfill
 
 ### 定时调度（pi-cron）
 

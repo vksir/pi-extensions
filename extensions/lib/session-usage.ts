@@ -20,7 +20,7 @@ export interface SessionUsageTotals {
 	cost: number;
 }
 
-/** 一个会话的累计记录，存在 token-stats.json 的 `sessions` 下。 */
+/** 一个会话的累计记录，存在 SQLite 的 `session` 表里。 */
 export interface SessionRecord {
 	/** 会话名；改过名就跟着最近一次响应更新，没名字时缺省 */
 	name?: string;

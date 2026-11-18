@@ -22,7 +22,7 @@ node --test tests/*.test.ts
 | [pi-balance](extensions/pi-balance.ts) | 查询 AI 模型提供商余额/额度（支持 DeepSeek、Moonshot、OpenRouter、OpenAI Codex、OpenCode Go、智谱 GLM）；`/balance` 列支持的 Provider，`/balance all` 查全部，`/balance <provider>` 查单个 |
 | [pi-notify](extensions/pi-notify.ts) | 任务完成后发送桌面通知（支持 iTerm2、Kitty、Ghostty、WezTerm、Windows Terminal）；需 Pi ≥ 1.3.0 |
 | [pi-title](extensions/pi-title.ts) | Agent 运行时在窗口标题显示旋转动画，结束后恢复原标题；herdr 环境（两代）不修改窗口标题，`/name` 更名与会话启动（resume / `/reload` / 切换会话）时同步重命名所在标签（旧 herdr 经 CLI 直接寻址，herdr app 经 herdr-app CLI ls 寻址）；进程内子 agent 会话（ctx.mode 非 "tui"）不参与标题与标签管理 |
-| [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 用量（`/token`），按天/模型出图，并在报告末尾给出当前会话的平均首字与平均输出速率；footer 状态行里插入最近一次响应的首字时间与输出速率（`R1.5M 0.9s 42t/s CH97.1%`） |
+| [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 用量（`/token`），写入 SQLite，按天/模型出图并给出当前会话的平均首字与平均输出速率；footer 状态行里插入最近一次响应的首字时间与输出速率（`R1.5M 0.9s 42t/s CH97.1%`） |
 | [pi-context](extensions/pi-context.ts) | `/context` 触发一次空转请求，导出这次请求的系统提示词与工具声明（含 codemode 动态描述），两者同源 |
 | [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron [间隔] [once] <prompt>`（省略间隔按 `15m`）、`/cron list`、`/cron delete [id]` |
 | [pi-btw](extensions/pi-btw.ts) | 顺带分派：仅在 herdr / herdr app 环境注册 `/btw <消息>`，新开一个标签，fork 当前会话启动 pi 并把消息作为首条消息递交；本轮还在跑时先把 fork 源截到上一个完整轮次，避免新会话继承半截 turn（见 [ADR-0008](docs/adr/0008-btw-forks-at-turn-boundary.md)） |
@@ -41,25 +41,31 @@ footer 状态行里多一段首字时间与输出速率，位置在缓存读取�
 
 pi 没有给 footer 留插槽，`setFooter` 只能整体替换，所以 `lib/footer-rate.ts` 用内置 `FooterComponent` 渲染原状态行，只往里面插一段首字时间与速率：路径、用量、命中率、上下文占比、模型右对齐、扩展状态行仍由 pi 自己管。插入多出的宽度从模型名前的留白里扣回，窄终端上留白不够才截断。代价是扩展上下文拿不到的几段不显示：虚拟模型的路由结果（`→ 物理模型`）与订阅标记（`(sub)`）。
 
-### 当前会话速率与并发写入
+### 当前会话速率与 SQLite 存储
 
-`/token` 报告末尾只列**当前会话**：轮次、输出 token、平均首字、平均速率。历史会话的记录留在数据文件里，不参与展示；这一块与天数参数无关——会话记录本身没有按天拆分。
+`/token` 报告末尾只列**当前会话**：轮次、输出 token、平均首字、平均速率。历史会话留在库里，不参与展示；这一块与天数参数无关——会话汇总没有按天拆分。
 
-- 每次 `turn_end` 把响应并入会话记录（`lib/session-usage.ts`）：轮次、用量、有耗时响应的输出之和与耗时之和、测到的首字时间。会话记录和按天统计一起写进 `token-stats.json`（v2 起多了 `sessions` 段，读旧文件时按空表补齐）。
 - 平均输出速率 = 当前会话有耗时的响应输出 token 之和 ÷ 这些响应的耗时之和，按 token 加权，不是逐次速率的算术平均：短响应里排一次队就能把算术平均拉垮。
 - 平均首字 = 测到首字的响应之和 ÷ 样本数。首字只能在流式过程中测，所以续聊、重启、老会话里的响应没有样本，可能少于响应数；一次都没测到的会话显示 `-`。
 
-多个 pi 进程（herdr 里的各个 agent、fork 出来的子会话）共用同一份 `~/.pi/agent/token-stats.json`。`lib/json.ts` 的 `updateJsonFile` 在整文件读-改-写期间持有同名 `.lock`：
+数据落在 `~/.pi/agent/pi-token-stats/token-stats.db`，每次 `turn_end` 在同一个事务里写三处：
 
-- `wx` 独占创建锁文件，拿到才读文件、改、原子替换；拿不到就 20ms 后重试，等锁上限 5 秒。
-- 锁内容是持锁进程写的 token；释放时只有 token 对得上才删，避免把已被回收后别人新建的锁删掉。
-- 持有者崩溃留下的锁按 mtime 判断，超过 10 秒视为过期并回收；正常持锁只有毫秒级。
-- 原子 rename 只保证文件不撕裂，锁保证增量不互相覆盖。限制：依赖本地文件系统（NFS 等不适用），且所有写进程都要跑新版本——旧版本写文件时不拿锁。
+- `turn`：原始明细，一轮一行（时间、会话、模型、用量、耗时、首字），留作以后做更细的查询。
+- `day_model`：按天 × 模型的累计，柱状图与模型汇总读它。
+- `session`：按会话的累计，当前会话的平均首字/速率读它。
+
+多个 pi 进程（herdr 里的各个 agent、fork 出来的子会话）共用同一个库。并发写靠 SQLite 自己保证，不再手写锁文件：
+
+- 建库时一次性切 WAL（写在库头里，后续打开不用再设置）；连接开 `busy_timeout=5000`。
+- 每个 turn 用 `BEGIN IMMEDIATE` 事务，后写的事务在 SQLite 里排队等前一个提交，不会丢增量。
+- 多个进程同时首次打开时，切 WAL 那个 PRAGMA 要短暂独占，代码里自带重试；始终抢不到就退回默认日志模式，功能不受影响。
+
+旧版 `~/.pi/agent/token-stats.json` 会在数据库第一次打开时**静默迁移**一次（按天汇总 + 会话汇总），旧文件保持原样、不删除也不改写；数据库 `meta.legacy_json_imported` 记下已迁移，重开不会重复累加。迁移代码是临时的，集中在 `lib/token-stats-legacy.ts`，**下个版本连同 `pi-token-stats.ts` 里的唯一调用一起删除**。
 
 回归测试（Node.js 24+）：
 
 ```bash
-node --test 'tests/pi-token-stats.test.ts' 'tests/json.test.ts'
+node --test 'tests/pi-token-stats.test.ts' 'tests/token-stats-db.test.ts'
 ```
 
 ### 上下文快照

@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { initTheme, type ExtensionContext, type ReadonlyFooterDataProvider, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { createFirstTokenTimer, createRateFooter, formatFirstToken, formatRate, insertRate, outputRate, shrinkPadding } from "../extensions/lib/footer-rate.ts";
 import { averageFirstTokenMs, averageOutputRate, recordSessionTurn, type SessionTurn } from "../extensions/lib/session-usage.ts";
-import { renderStats, tokenArgumentCompletions, type GlobalCache } from "../extensions/pi-token-stats.ts";
+import { openTokenStatsStore, type TokenStatsStore } from "../extensions/lib/token-stats-db.ts";
+import { renderStats, tokenArgumentCompletions } from "../extensions/pi-token-stats.ts";
 
 // 内置 FooterComponent 渲染时会取当前主题的颜色。
 initTheme("dark");
@@ -239,52 +243,69 @@ test("averageFirstTokenMs：只平均测到的样本", () => {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-/** 只关心会话区块的缓存：byDate 留空，柱状图走「暂无数据」分支。 */
-function sessionCache(entries: { id: string; name?: string; at: number; output: number; durationMs: number; firstTokenMs?: number }[]): GlobalCache {
-	const cache: GlobalCache = { version: 2, byDate: {}, sessions: {} };
-	for (const entry of entries) {
-		cache.sessions[entry.id] = recordSessionTurn(cache.sessions[entry.id], {
-			at: entry.at,
-			name: entry.name,
-			usage: { input: 100, output: entry.output, cacheRead: 900, cacheWrite: 0, cost: 0.01 },
-			durationMs: entry.durationMs,
-			firstTokenMs: entry.firstTokenMs,
-		});
-	}
-	return cache;
+function localDate(date: Date): string {
+	return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+/** 报告测试用真库：临时目录 + 一个 store，用完删除。 */
+function tempStore(): { store: TokenStatsStore; dir: string; done: () => void } {
+	const dir = mkdtempSync(join(tmpdir(), "pi-token-stats-"));
+	const store = openTokenStatsStore(join(dir, "pi-token-stats", "token-stats.db"));
+	return { store, dir, done: () => { store.close(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
 test("renderStats：会话速率只显示当前会话，与天数参数无关", () => {
-	const now = Date.now();
-	const cache = sessionCache([
-		// 当前会话：很久以前就开始，仍应显示它的累计平均
-		{ id: "current-session", name: "当前会话", at: now - 40 * DAY_MS, output: 600, durationMs: 12_000, firstTokenMs: 1_200 },
-		// 别的会话：不出现在报告里
-		{ id: "other-session", name: "别人的会话", at: now - 60_000, output: 300, durationMs: 1_000, firstTokenMs: 500 },
-	]);
+	const { store, done } = tempStore();
+	try {
+		const old = new Date(Date.now() - 40 * DAY_MS);
+		store.recordTurn({
+			date: localDate(old),
+			at: old.getTime(),
+			sessionId: "current-session",
+			sessionName: "当前会话",
+			provider: "deepseek",
+			model: "deepseek/deepseek-chat",
+			usage: { input: 100, output: 600, cacheRead: 900, cacheWrite: 0, cost: 0.01 },
+			durationMs: 12_000,
+			firstTokenMs: 1_200,
+		});
 
-	const text = renderStats(cache, 7, false, "current-session").join("\n");
-	assert.match(text, /当前会话/);
-	assert.match(text, /1 轮 · Out 600 · 平均首字 1\.2s · 平均速率 50t\/s/);
-	// 历史会话不参与展示
-	assert.doesNotMatch(text, /别人的会话/);
-	assert.doesNotMatch(text, /300/);
-	// 天数参数只管柱状图：7 天内没有按天数据，40 天前的会话照样显示自己的平均
-	assert.match(text, /Token 用量趋势 \(近 7 天\)/);
-	assert.match(text, /（暂无数据）/);
-	assert.match(text, /当前会话[\s\S]*Out 600/);
-	const all = renderStats(cache, 0, false, "current-session").join("\n");
-	assert.match(all, /1 轮 · Out 600 · 平均首字 1\.2s · 平均速率 50t\/s/);
+		const text = renderStats(store, 7, false, "current-session").join("\n");
+		assert.match(text, /当前会话/);
+		assert.match(text, /1 轮 · Out 600 · 平均首字 1\.2s · 平均速率 50t\/s/);
+		// 天数参数只管柱状图：40 天前的按天数据不在近 7 天里，会话速率照样显示
+		assert.match(text, /Token 用量趋势 \(近 7 天\)/);
+		assert.match(text, /（暂无数据）/);
+		assert.match(text, /当前会话[\s\S]*Out 600/);
+
+		const all = renderStats(store, 0, false, "current-session").join("\n");
+		assert.match(all, /Tokens per Day \(Input\)/);
+		assert.match(all, /1 轮 · Out 600/);
+		// 会话区块只认当前 id：换一个 id 就查不到
+		assert.match(renderStats(store, 0, false, "other-session").join("\n"), /本会话暂无记录/);
+	} finally {
+		done();
+	}
 });
 
-test("renderStats：当前会话没测到首字时显示占位，缺记录时写明暂无", () => {
-	const cache = sessionCache([{ id: "current-session", at: Date.now(), output: 100, durationMs: 1_000 }]);
-	const text = renderStats(cache, 7, false, "current-session").join("\n");
-	assert.match(text, /平均首字 -/);
-	assert.match(text, /平均速率 100t\/s/);
-
-	const missing = renderStats(cache, 7, false, "unknown-session").join("\n");
-	assert.match(missing, /当前会话\s+（本会话暂无记录）/);
+test("renderStats：当前会话没测到首字时显示占位", () => {
+	const { store, done } = tempStore();
+	try {
+		store.recordTurn({
+			date: localDate(new Date()),
+			at: Date.now(),
+			sessionId: "current-session",
+			provider: "deepseek",
+			model: "deepseek/deepseek-chat",
+			usage: { input: 100, output: 100, cacheRead: 0, cacheWrite: 0, cost: 0 },
+			durationMs: 1_000,
+		});
+		const text = renderStats(store, 7, false, "current-session").join("\n");
+		assert.match(text, /平均首字 -/);
+		assert.match(text, /平均速率 100t\/s/);
+	} finally {
+		done();
+	}
 });
 
 test("tokenArgumentCompletions：补全保留已写好的参数", () => {
