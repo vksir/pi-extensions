@@ -17,7 +17,8 @@
  * footer 状态行里插入最近一次响应的首字时间与输出速率（如 `R1.5M 0.9s 42t/s CH97.1%`），
  * 由 lib/footer-rate.ts 包一层内置 footer 实现。
  *
- * 数据库在 `~/.pi/agent/pi-token-stats/token-stats.db`；旧 JSON 的静默迁移是临时代码，
+ * 数据库在 `~/.pi/agent/pi-token-stats/token-stats.db`；读写都交给 lib/token-stats-worker.ts
+ * 的 worker 线程，主线程只收发消息，不碰 SQLite。旧 JSON 的静默迁移是临时代码，
  * 见 lib/token-stats-legacy.ts，下个版本删除。entry 渲染在 lib/render.ts。
  */
 
@@ -28,8 +29,8 @@ import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { createFirstTokenTimer, createRateFooter, formatFirstToken, formatRate } from "./lib/footer-rate.ts";
 import { renderDimLines } from "./lib/render.ts";
 import { averageFirstTokenMs, averageOutputRate, type SessionRecord, type SessionUsageTotals } from "./lib/session-usage.ts";
-import { openTokenStatsStore, type DayModelRow, type TokenStatsStore } from "./lib/token-stats-db.ts";
-import { importLegacyCache } from "./lib/token-stats-legacy.ts";
+import { openTokenStatsClient, type TokenStatsClient } from "./lib/token-stats-client.ts";
+import type { DayModelRow } from "./lib/token-stats-db.ts";
 
 // ─── 存储 ───
 
@@ -40,16 +41,21 @@ function tokenStatsDir(): string {
 	return join(getAgentDir(), "pi-token-stats");
 }
 
-let store: TokenStatsStore | undefined;
+let client: TokenStatsClient | undefined;
 
-/** 懒开库：首次用到时才建目录、建库、跑一次静默迁移。 */
-function statsStore(): TokenStatsStore {
-	if (!store) {
-		store = openTokenStatsStore(join(tokenStatsDir(), "token-stats.db"));
-		// 临时：把旧版 token-stats.json 静默导入，下个版本删除本行
-		importLegacyCache(store, join(getAgentDir(), LEGACY_CACHE_FILE));
+/**
+ * 懒启动写线程：建库、静默迁移、写入、查询都在 worker 里排队，
+ * 主线程只收发消息，不碰 SQLite。
+ */
+function statsClient(): TokenStatsClient {
+	if (!client) {
+		client = openTokenStatsClient({
+			dbPath: join(tokenStatsDir(), "token-stats.db"),
+			// 临时：旧版 JSON 的静默迁移，下个版本连同 lib/token-stats-legacy.ts 一起删除
+			legacyPath: join(getAgentDir(), LEGACY_CACHE_FILE),
+		});
 	}
-	return store;
+	return client;
 }
 
 // ─── usage 聚合 ───
@@ -246,16 +252,18 @@ function appendCurrentSession(lines: string[], record: SessionRecord | undefined
 	lines.push("");
 }
 
-/** 会话速率永远只针对当前会话，与天数参数无关：会话记录没有按天的拆分。 */
+/**
+ * 只负责排版：按天数据已按天数过滤好，会话记录永远是当前会话。
+ * 查询在 worker 里做，这里保持纯函数，方便单测。
+ */
 export function renderStats(
-	store: TokenStatsStore,
+	dayRows: DayModelRow[],
+	session: SessionRecord | undefined,
 	days: number,
 	showOutput = false,
-	currentSessionId?: string,
 ): string[] {
 	const label = days === 0 ? "全部" : `近 ${days} 天`;
 	const lines: string[] = [`  📊 Token 用量趋势 (${label})`, ""];
-	const dayRows = store.dayRows(cutoffDate(days));
 	if (dayRows.length === 0) {
 		lines.push("  （暂无数据）", "");
 	} else {
@@ -271,7 +279,7 @@ export function renderStats(
 		appendModelSummary(lines, dayRows);
 	}
 
-	appendCurrentSession(lines, currentSessionId === undefined ? undefined : store.sessionRecord(currentSessionId));
+	appendCurrentSession(lines, session);
 	return lines;
 }
 
@@ -342,7 +350,7 @@ export default function (pi: ExtensionAPI) {
 			const usage = msg.usage;
 			const model = msg.provider && msg.model ? `${msg.provider}/${msg.model}` : msg.model || "unknown";
 			// 首字时间只在流式过程中测得到，必须当场落盘，否则重启后无从补算。
-			statsStore().recordTurn({
+			statsClient().recordTurn({
 				date: shortDate(),
 				at: Date.now(),
 				sessionId: ctx.sessionManager.getSessionId(),
@@ -381,9 +389,12 @@ export default function (pi: ExtensionAPI) {
 					else if (token === "output" || token === "out") showOutput = true;
 				}
 
-				pi.appendEntry<TokenStatsEntry>("token-stats", {
-					lines: renderStats(statsStore(), days, showOutput, ctx.sessionManager.getSessionId()),
-				});
+				// 查询走写线程：按 FIFO 一定看得到之前所有已提交的 turn，主线程不被 SQLite 阻塞
+				const [dayRows, session] = await Promise.all([
+					statsClient().dayRows(cutoffDate(days)),
+					statsClient().sessionRecord(ctx.sessionManager.getSessionId()),
+				]);
+				pi.appendEntry<TokenStatsEntry>("token-stats", { lines: renderStats(dayRows, session, days, showOutput) });
 			} catch (e) {
 				ctx.ui.notify(`[error] ${(e as Error).message}`, "error");
 			}

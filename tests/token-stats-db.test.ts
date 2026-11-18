@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -82,10 +82,8 @@ test("recordTurn：一轮同时写明细、按天汇总与会话汇总", () => {
 test("importLegacyCache：v2 旧 JSON 静默导入，重复打开不重复累加", () => {
 	const dir = tempDir();
 	const legacyPath = join(dir, "token-stats.json");
-	writeFileSync(
-		legacyPath,
-		JSON.stringify({
-			version: 2,
+	const legacyText = JSON.stringify({
+		version: 2,
 			byDate: {
 				"2026-11-18": {
 					models: {
@@ -106,13 +104,17 @@ test("importLegacyCache：v2 旧 JSON 静默导入，重复打开不重复累加
 					firstTokenSamples: 4,
 				},
 			},
-		}),
+		},
 	);
+	writeFileSync(legacyPath, legacyText);
 
 	const store = openTokenStatsStore(dbPath(dir));
 	try {
 		importLegacyCache(store, legacyPath);
 		assert.equal(store.hasMeta("legacy_json_imported"), true);
+		// 迁移前先备份，旧文件本身保持原样
+		assert.equal(readFileSync(`${legacyPath}.bak`, "utf-8"), legacyText);
+		assert.equal(readFileSync(legacyPath, "utf-8"), legacyText);
 		assert.deepEqual(store.dayRows(), [
 			{ date: "2026-11-18", model: "deepseek/deepseek-chat", input: 5000, output: 4200, cacheRead: 95000, cacheWrite: 0, cost: 0.09 },
 		]);

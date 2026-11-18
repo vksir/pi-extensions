@@ -54,18 +54,20 @@ pi 没有给 footer 留插槽，`setFooter` 只能整体替换，所以 `lib/foo
 - `day_model`：按天 × 模型的累计，柱状图与模型汇总读它。
 - `session`：按会话的累计，当前会话的平均首字/速率读它。
 
+写库在 **worker 线程**里（`lib/token-stats-worker.ts`）：`turn_end` 只 `postMessage` 一轮响应就返回，建库、迁移、SQLite 事务都在 worker 里按顺序执行；多进程抢写时 `busy_timeout` 的等待也不会卡住 TUI 的事件循环。`/token` 的查询同样走这个 worker（消息 FIFO，查询前投递的 turn 一定已提交），主线程不碰 SQLite。
+
 多个 pi 进程（herdr 里的各个 agent、fork 出来的子会话）共用同一个库。并发写靠 SQLite 自己保证，不再手写锁文件：
 
 - 建库时一次性切 WAL（写在库头里，后续打开不用再设置）；连接开 `busy_timeout=5000`。
 - 每个 turn 用 `BEGIN IMMEDIATE` 事务，后写的事务在 SQLite 里排队等前一个提交，不会丢增量。
 - 多个进程同时首次打开时，切 WAL 那个 PRAGMA 要短暂独占，代码里自带重试；始终抢不到就退回默认日志模式，功能不受影响。
 
-旧版 `~/.pi/agent/token-stats.json` 会在数据库第一次打开时**静默迁移**一次（按天汇总 + 会话汇总），旧文件保持原样、不删除也不改写；数据库 `meta.legacy_json_imported` 记下已迁移，重开不会重复累加。迁移代码是临时的，集中在 `lib/token-stats-legacy.ts`，**下个版本连同 `pi-token-stats.ts` 里的唯一调用一起删除**。
+旧版 `~/.pi/agent/token-stats.json` 会在数据库第一次打开时**静默迁移**一次（按天汇总 + 会话汇总）：动手前先复制成 `token-stats.json.bak` 备份，旧文件本身保持原样、不删除也不改写；数据库 `meta.legacy_json_imported` 记下已迁移，重开不会重复累加。迁移代码是临时的，集中在 `lib/token-stats-legacy.ts`，**下个版本连同 `pi-token-stats.ts` 里的唯一调用一起删除**。
 
 回归测试（Node.js 24+）：
 
 ```bash
-node --test 'tests/pi-token-stats.test.ts' 'tests/token-stats-db.test.ts'
+node --test 'tests/pi-token-stats.test.ts' 'tests/token-stats-db.test.ts' 'tests/token-stats-client.test.ts'
 ```
 
 ### 上下文快照

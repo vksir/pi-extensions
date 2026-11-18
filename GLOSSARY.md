@@ -39,8 +39,12 @@ _Avoid_: 日聚合、daily stats
 _Avoid_: 会话记录表、session row
 
 **静默迁移 (Silent Migration)**：
-数据库第一次打开时把旧版 `token-stats.json` 导入 SQLite，不提示、不改动旧文件，靠 `meta.legacy_json_imported` 保证只做一次。临时代码，下个版本删除。
+数据库第一次打开时把旧版 `token-stats.json` 导入 SQLite，动手前先复制成 `token-stats.json.bak` 备份；不提示、不改动旧文件，靠 `meta.legacy_json_imported` 保证只做一次。临时代码，下个版本删除。
 _Avoid_: 数据升级、导入向导、backfill
+
+**写线程 (Writer Worker)**：
+token-stats 独占 SQLite 连接的 worker 线程。主线程只 `postMessage` 一轮响应；建库、迁移、写入、查询都按消息顺序在这里执行，不阻塞 TUI 的事件循环。
+_Avoid_: 后台任务、异步队列、db thread
 
 ### 定时调度（pi-cron）
 

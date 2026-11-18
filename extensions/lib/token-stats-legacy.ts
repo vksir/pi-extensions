@@ -2,11 +2,12 @@
  * 临时：把旧版 `token-stats.json` 静默导入 SQLite。
  *
  * 下个版本删除本文件，以及 `pi-token-stats.ts` 里 import 与调用 `importLegacyCache` 的那几行。
- * 迁移只在数据库第一次打开时跑一次：`meta.legacy_json_imported` 已存在就跳过；
- * 旧 JSON 保持原样，不删除也不改写。整个过程不提示、不报错——失败就下次启动再试。
+ * 迁移只在数据库第一次打开时跑一次：`meta.legacy_json_imported` 已存在就跳过。
+ * 动手前先把旧文件复制成 `token-stats.json.bak`（防意外），旧 JSON 本身不删除也不改写。
+ * 整个过程不提示、不报错——失败就下次启动再试。
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync } from "node:fs";
 import type { SessionRecord } from "./session-usage.ts";
 import type { TokenStatsStore } from "./token-stats-db.ts";
 
@@ -72,6 +73,12 @@ function normalizeSession(raw: LegacySession): SessionRecord {
  */
 export function importLegacyCache(store: TokenStatsStore, legacyPath: string): void {
 	if (store.hasMeta(LEGACY_IMPORTED_KEY) || !existsSync(legacyPath)) return;
+	// 备份是保险，不是前置条件：复制失败也继续（迁移只读 JSON，不会改它）
+	try {
+		copyFileSync(legacyPath, `${legacyPath}.bak`);
+	} catch {
+		/* 备份失败也继续 */
+	}
 	let legacy: LegacyCache;
 	try {
 		legacy = JSON.parse(readFileSync(legacyPath, "utf-8")) as LegacyCache;
