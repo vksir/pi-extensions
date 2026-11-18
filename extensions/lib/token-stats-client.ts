@@ -29,6 +29,10 @@ export interface TokenStatsClientOptions extends WorkerStartData {}
 export function openTokenStatsClient(options: TokenStatsClientOptions): TokenStatsClient {
 	const worker = new Worker(new URL("./token-stats-worker.ts", import.meta.url), {
 		workerData: options,
+		// Node 22/23 的 node:sqlite 会打 ExperimentalWarning，pi 会把它画到 TUI 里。
+		// 只传这一个 flag：显式 execArgv 会绕过 worker 对父进程 V8 flag 的过滤
+		// （node --test 下 process.execArgv 里就有 worker 不收的 flag）。
+		execArgv: ["--disable-warning=ExperimentalWarning"],
 	});
 	const waiters = new Map<number, Waiter>();
 	let nextId = 1;

@@ -54,7 +54,7 @@ pi 没有给 footer 留插槽，`setFooter` 只能整体替换，所以 `lib/foo
 - `day_model`：按天 × 模型的累计，柱状图与模型汇总读它。
 - `session`：按会话的累计，当前会话的平均首字/速率读它。
 
-写库在 **worker 线程**里（`lib/token-stats-worker.ts`）：`turn_end` 只 `postMessage` 一轮响应就返回，建库、迁移、SQLite 事务都在 worker 里按顺序执行；多进程抢写时 `busy_timeout` 的等待也不会卡住 TUI 的事件循环。`/token` 的查询同样走这个 worker（消息 FIFO，查询前投递的 turn 一定已提交），主线程不碰 SQLite。
+写库在 **worker 线程**里（`lib/token-stats-worker.ts`）：`turn_end` 只 `postMessage` 一轮响应就返回，建库、迁移、SQLite 事务都在 worker 里按顺序执行；多进程抢写时 `busy_timeout` 的等待也不会卡住 TUI 的事件循环。worker 启动时用 `--disable-warning=ExperimentalWarning` 屏蔽 Node 22/23 的 SQLite 实验性警告，否则那行提示会被 pi 画进 TUI。`/token` 的查询同样走这个 worker（消息 FIFO，查询前投递的 turn 一定已提交），主线程不碰 SQLite。
 
 多个 pi 进程（herdr 里的各个 agent、fork 出来的子会话）共用同一个库。并发写靠 SQLite 自己保证，不再手写锁文件：
 
