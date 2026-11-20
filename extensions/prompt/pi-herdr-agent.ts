@@ -4,7 +4,8 @@
  * 呈现场景见每条注释。规则见 ./README.md。
  * 本文件不 import 任何扩展代码：只收已格式化的原始值。
  *
- * 去重口径（2026-02）：`agent` 的描述不再复述 `name` / `model` / `thinking` / `resume` 的规则；
+ * 去重口径（2026-02）：`agent` 的描述不再复述 `name` / `model` / `thinking` / `resume` /
+ * `destroyAfterSeconds` 的规则；
  * `agent_job` 的动作枚举只出现在 snippet（索引）与 `action` 枚举（语义）两处，
  * 「忙是错误」「答案作为消息到达」「只能杀自己的后代」各只留一份。
  */
@@ -26,7 +27,9 @@ export const piHerdrAgentPrompt = {
 				model: "Model as provider/id or a fuzzy name. Defaults to your current model.",
 				thinking: "Thinking level. Defaults to yours.",
 				resume:
-					"Agent id whose exited session to continue instead of starting a new one. Model and thinking must match the session.",
+					"Agent id whose exited session to continue instead of starting a new one. Model and thinking must match the session. A destroyed agent can be resumed by its id.",
+				destroyAfterSeconds:
+					"Seconds of idleness before the agent's terminal is destroyed. Default 180. 0 never destroys it.",
 			},
 		},
 		agentJob: {
@@ -34,8 +37,8 @@ export const piHerdrAgentPrompt = {
 			description: "Manage the sub-agents you started. Only your own descendants can be killed.",
 			parameters: {
 				action:
-					"list: running agents. wait: block until one stops working. kill: end one of your own descendants. ask: send a request to an idle agent; busy is an error and the answer arrives as a message. steer: insert a message into a working agent.",
-				id: "Agent id. Required for every action except list.",
+					"list: running agents. wait: block until a sub-agent stops working; takes an id, 'any', or 'all'. kill: end one of your own descendants. ask: send a request to an idle agent; busy is an error and the answer arrives as a message. steer: insert a message into a working agent.",
+				id: "Agent id, or 'any' (next to stop) / 'all' (every one) for wait.",
 				message: "Message for ask and steer.",
 				timeout: "wait only: max seconds before returning. A timeout is a check-in, not a failure.",
 			},
@@ -49,6 +52,13 @@ export const piHerdrAgentPrompt = {
 			agent: "Start a sub-agent that reports back by message",
 			// 动作名与 action 的枚举值逐字一致，避免模型在两套词之间做映射。
 			agentJob: "List, wait, kill, ask, or steer sub-agents",
+		},
+		/**
+		 * 常驻·系统提示词：Guidelines 段的规则。挂在 `agent_job` 上——工具被
+		 * prepareLoadout 隐藏时规则自动消失。只防 sleep；any / all 的含义在 id 参数描述里。
+		 */
+		guidelines: {
+			agentJob: "Use agent_job wait instead of sleeping.",
 		},
 	},
 
@@ -71,6 +81,15 @@ export const piHerdrAgentPrompt = {
 			`${label}: still running (${status}, turn ${turn}).`,
 		waitExited: (label: string, code: string) => `${label}: exited (code ${code}).`,
 		waitStatus: (label: string, status: string, turn: number) => `${label}: ${status} (turn ${turn}).`,
+		/** 每次调用。`agent_job wait` 没有在 working 的子 agent。 */
+		noAgentWorking: () => "No agent is working.",
+		/** 每次调用。`agent_job wait` 超时；`waited` 是已格式化的「 after 5s」，未知时为空串。 */
+		waitTimedOut: (waited: string, refs: string) =>
+			`agent_job wait timed out${waited}. Still running: ${refs}.`,
+		/** 每次调用。父轮 Esc 打断了「等」。 */
+		waitAborted: () => "wait aborted. The agent keeps running.",
+		/** 每次调用。等待被一条与子 agent 无关的消息打断。 */
+		waitMessage: () => "wait ended by an incoming message.",
 
 		/** 每次调用。`agent_job kill` 成功。 */
 		killed: (id: string) => `Killed agent ${id}.`,

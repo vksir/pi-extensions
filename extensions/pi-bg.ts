@@ -55,6 +55,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { registerBusyProbe } from "./lib/activity.ts";
 import { ERROR_PREFIX, piBgPrompt } from "./prompt/pi-bg.ts";
 import {
 	type BgJob,
@@ -192,6 +193,9 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 	/** 晋升那一行的原始 partial 结果，只给 TUI 渲染用，不进 transcript。 */
 	const promotedRows = new Map<string, AgentToolResult<any>>();
 
+	// 让 pi-herdr-agent 的空闲销毁看到本进程还有在跑的后台任务：销毁进程等于把它们一起扔掉。
+	registerBusyProbe("pi-bg", () => runningJobs(jobs).length > 0);
+
 	// 嵌套判定：`tool_call` 的 parentToolCallId 是权威来源，id 形状是兜底。
 	pi.on("tool_call", (event) => {
 		if (event.parentToolCallId) nestedCalls.add(event.toolCallId);
@@ -296,6 +300,65 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 				resolve();
 			};
 			job.waiters.push(onFinished);
+			if (signal?.aborted) onAbort();
+			else {
+				signal?.addEventListener("abort", onAbort, { once: true });
+				if (timeoutMs !== undefined) timer = setTimeout(onTimeout, timeoutMs);
+			}
+		});
+	}
+
+	/**
+	 * 等一组任务里**第一个**结束的；超时返回 null。
+	 * 返回前摘掉其余等待者——留着它们会让那些任务结束时以为「结果已被 wait 接过」而不回传。
+	 */
+	function waitFirst(
+		group: readonly LiveJob[],
+		signal: AbortSignal | undefined,
+		timeoutMs?: number,
+	): Promise<LiveJob | null> {
+		if (group.length === 0) return Promise.resolve(null);
+		return new Promise<LiveJob | null>((resolve, reject) => {
+			// 取快照后到挂等待者之间结束的任务：它已按无等待者回传，直接把它交回去（只报状态）
+			const already = group.find((job) => job.status !== "running");
+			if (already) {
+				resolve(already);
+				return;
+			}
+
+			let settled = false;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const callbacks = new Map<LiveJob, () => void>();
+			const detach = (): void => {
+				signal?.removeEventListener("abort", onAbort);
+				if (timer !== undefined) clearTimeout(timer);
+				for (const [job, callback] of callbacks) {
+					const index = job.waiters.indexOf(callback);
+					if (index >= 0) job.waiters.splice(index, 1);
+				}
+			};
+			const onAbort = (): void => {
+				if (settled) return;
+				settled = true;
+				detach();
+				reject(new Error("wait aborted"));
+			};
+			const onTimeout = (): void => {
+				if (settled) return;
+				settled = true;
+				detach();
+				resolve(null);
+			};
+			for (const job of group) {
+				const callback = (): void => {
+					if (settled) return;
+					settled = true;
+					detach();
+					resolve(job);
+				};
+				callbacks.set(job, callback);
+				job.waiters.push(callback);
+			}
 			if (signal?.aborted) onAbort();
 			else {
 				signal?.addEventListener("abort", onAbort, { once: true });
@@ -593,6 +656,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 			label: "Background jobs",
 			description: piBgPrompt.declarations.bgJob.description,
 			promptSnippet: piBgPrompt.system.snippets.bgJob,
+			promptGuidelines: [piBgPrompt.system.guidelines.bgJob],
 			parameters: Type.Object({
 				action: StringEnum(["list", "show", "kill", "wait"] as const, {
 					description: piBgPrompt.declarations.bgJob.parameters.action,
@@ -640,23 +704,62 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 				}
 
 				if (params.action === "wait") {
+					if (!params.id) return fail("wait", piBgPrompt.results.idRequired("wait"));
 					const timeoutMs =
 						params.timeout === undefined || !Number.isFinite(params.timeout)
 							? undefined
 							: Math.max(0, params.timeout) * 1000;
-					const targets: LiveJob[] = [];
-					if (params.id) {
-						const job = findJob(jobs, params.id);
-						if (!job) return fail("wait", piBgPrompt.results.unknownJob(params.id));
-						targets.push(job);
-					} else {
-						targets.push(...runningJobs(jobs));
-						if (targets.length === 0) {
+
+					if (params.id === "any") {
+						const running = runningJobs(jobs);
+						if (running.length === 0) {
 							return {
 								content: [{ type: "text" as const, text: piBgPrompt.results.waitNoJob() }],
 								details: { action: "wait" as const },
 							};
 						}
+
+						let first: LiveJob | null;
+						try {
+							first = await waitFirst(running, signal, timeoutMs);
+						} catch {
+							return fail("wait", piBgPrompt.results.waitAborted());
+						}
+
+						if (!first) {
+							const still = runningJobs(jobs);
+							return {
+								content: [{ type: "text" as const, text: waitTimeoutText(still, elapsedText(timeoutMs ?? 0)) }],
+								details: { action: "wait" as const, jobs: still.map(snapshot) },
+							};
+						}
+						// 只接过第一个结束的那份输出；其余任务继续跑、之后仍以消息回传。
+						if (first.delivered) {
+							return {
+								content: [{ type: "text" as const, text: piBgPrompt.results.alreadyDelivered(first.id) }],
+								details: { action: "wait" as const, jobs: [snapshot(first)] },
+							};
+						}
+						first.delivered = true;
+						return {
+							content: [{ type: "text" as const, text: deliveryContent(first) }],
+							details: { action: "wait" as const, jobs: [snapshot(first)] },
+						};
+					}
+
+					const targets: LiveJob[] = [];
+					if (params.id === "all") {
+						targets.push(...runningJobs(jobs));
+					} else {
+						const job = findJob(jobs, params.id);
+						if (!job) return fail("wait", piBgPrompt.results.unknownJob(params.id));
+						targets.push(job);
+					}
+					if (targets.length === 0) {
+						return {
+							content: [{ type: "text" as const, text: piBgPrompt.results.waitNoJob() }],
+							details: { action: "wait" as const },
+						};
 					}
 
 					try {

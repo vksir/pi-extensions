@@ -14,7 +14,8 @@
  *   `/new`、`/resume`、`/fork` 后会话 id 变了就重写 label。label 写不进去时退回 hc 地址。
  * - `name` 是 hc 终端名（herdr-app 侧边栏显示的那个），创建时固定，只作显示；寻址一律用 id。
  * - 拉起时注入 `PI_AGENT_ID` / `PI_AGENT_NAME` / `PI_AGENT_PARENT` / `PI_AGENT_ROOT` /
- *   `PI_AGENT_DEPTH`，子进程的扩展据此知道自己是谁、在树里的哪一层。
+ *   `PI_AGENT_DEPTH`，子进程的扩展据此知道自己是谁、在树里的哪一层；另外注入
+ *   `PI_AGENT_DESTROY_AFTER`（空闲销毁秒数，0 = 不销毁）。
  *
  * 消息：
  * - `ask` 只发给 idle（或 done）的 agent，忙则报错；`steer` 只发给 working 的 agent。
@@ -28,6 +29,12 @@
  * 生命周期：`session_shutdown(reason=quit)` 时杀掉自己的直接子 agent（递归由各自的
  * shutdown 完成）。子终端的程序就是 pi 本身，所以子进程硬死时 hc 原生级联会接管；
  * 只有 root 那层（前台是 shell）需要显式处理。
+ *
+ * 空闲销毁：子 agent 在 settle 之后进入倒计时（`destroyAfterSeconds`，默认 180 秒，
+ * 0 = 永不），满钟后自己 `ctx.shutdown()`，pi 退出即由 hc 删掉终端；会话文件仍在磁盘上，
+ * 可以按 id resume 回来。倒计时只在「安静」时走：还有活的子终端、后台任务、进程内
+ * 子 agent 或 cron job 就不计时（后两者经 lib/activity.ts 的忙探测登记表汇总），任何新
+ * 入站都立即清零。30 秒一拍检查，销毁最多迟到一拍。
  *
  * 状态：pi 内置 reporter 在 settle 时硬写 OSC 7501 `state=done`；子 agent 在 stdout 层
  * 把这条报告改写成 `state=idle`，所以 hc 只看到 working → idle，不会留下 done。
@@ -56,6 +63,7 @@ import {
 	truncateTail,
 	validateAgentName,
 } from "./lib/agent-protocol.ts";
+import { hasBusyActivity } from "./lib/activity.ts";
 import { errorMessage } from "./lib/errors.ts";
 import { ERROR_PREFIX, piHerdrAgentPrompt } from "./prompt/pi-herdr-agent.ts";
 import {
@@ -67,6 +75,7 @@ import {
 	type HcWaitResult,
 } from "./lib/hc.ts";
 import { writeOutputFile } from "./lib/output-file.ts";
+import { hasRunningSubagents } from "./lib/subagents.ts";
 import { basename } from "./lib/text.ts";
 
 // ─── 常量 ───
@@ -77,7 +86,24 @@ const MAX_DEPTH = 2;
 /** 子 pi 就绪等待：一轮 60s，最多两轮。 */
 const READY_TIMEOUT_S = 60;
 
+/** 空闲销毁的默认时长（秒）。 */
+const DEFAULT_DESTROY_AFTER_S = 180;
+
+/** 空闲销毁的检查节拍（秒）：销毁最多迟到一拍。 */
+const DESTROY_TICK_S = 30;
+
+/** 子进程从 env 读自己的空闲销毁秒数；0 或缺省表示不销毁。 */
+const DESTROY_ENV = "PI_AGENT_DESTROY_AFTER";
+
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+/**
+ * 整个等待的默认时长（秒）：与 hc 的 `terminal.wait` 默认一致，只为了让超时文案能报出等了多久。
+ */
+const WAIT_TIMEOUT_S = 180;
+
+/** 结果消息到达后、等子 agent 状态落地的最长时间（秒）。 */
+const SETTLE_TIMEOUT_S = 5;
 
 /** 可以向它发 ask 的状态：idle 与 done（「结束但还没被看」）都表示可以接活。 */
 const ASKABLE = new Set(["idle", "done"]);
@@ -120,6 +146,7 @@ interface AgentParams {
 	model?: string;
 	thinking?: (typeof THINKING_LEVELS)[number];
 	resume?: string;
+	destroyAfterSeconds?: number;
 }
 
 interface AgentJobParams {
@@ -154,6 +181,10 @@ export interface HerdrAgentOptions {
 	sessionDir?: string;
 	/** 超长结果全文落地（测试可替换）；默认写系统临时目录。 */
 	spill?: (text: string) => Promise<string>;
+	/** 空闲销毁的时钟（测试可替换）；默认 Date.now。 */
+	now?: () => number;
+	/** 空闲销毁的调度：每 ms 毫秒回调一次、返回取消函数；默认 setInterval。 */
+	schedule?: (tick: () => void, ms: number) => () => void;
 }
 
 // ─── 扩展入口 ───
@@ -172,7 +203,14 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	const injectedId = env.PI_AGENT_ID?.trim();
 	let myId = injectedId || self;
 	let myRoot = env.PI_AGENT_ROOT?.trim() || myId;
+	// 刚拉起/刚问过、还没看到它进入 working 的子 agent。没人在 working 时靠它区分「马上要开跑」
+	// 与「真的没活」——hc 的 children 等待把「已投递但还没开跑」的子当作在 working。
+	const pendingStarts = new Set<string>();
 	const myDepth = Number.parseInt(env.PI_AGENT_DEPTH ?? "0", 10) || 0;
+	// 空闲销毁：根 agent 没有这个 env（0 = 不销毁），子 agent 的秒数由拉起者按参数注入。
+	const destroyAfterSeconds = parseDestroyAfter(env[DESTROY_ENV]);
+	const now = options.now ?? (() => Date.now());
+	const schedule = options.schedule ?? defaultSchedule;
 
 	/**
 	 * 根 agent 的短 id：会话 id 末尾 6 位字母数字（uuidv7 的尾段就是随机 hex；
@@ -252,9 +290,14 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 
 	// ─── 入站消息 ───
 
+	// 有新活就不销毁：不管是 ask / steer 还是人直接打字，都发生在 agent_start 之前。
 	pi.on("input", (event, ctx) => {
+		stopDestroyCountdown();
+
 		const envelope = parseAgentEnvelope(event.text);
 		if (!envelope) return;
+
+		if (envelope.kind === "result") pendingStarts.delete(envelope.from);
 
 		if (envelope.kind === "ask") {
 			if (pendingAsker) {
@@ -285,15 +328,26 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		blockedNotified = false;
 		const answer = lastAnswer;
 		lastAnswer = undefined;
-		if (!asker) return;
 
-		const body = event.aborted
-			? `${agentSourceLine(myId, displayName(ctx))}\n${piHerdrAgentPrompt.reports.runAborted()}`
-			: await resultBody(answer, ctx);
-		await sendReport(asker, ctx, body);
+		if (asker) {
+			const body = event.aborted
+				? `${agentSourceLine(myId, displayName(ctx))}\n${piHerdrAgentPrompt.reports.runAborted()}`
+				: await resultBody(answer, ctx);
+			await sendReport(asker, ctx, body);
+		}
+
+		// 先回发再武装：asker 的结果不被倒计时的探测拖慢。
+		await armDestroyCountdown(ctx);
+	});
+
+	// 不论因为什么起了一轮（cron 投递、人打字、ask），倒计时都作废。
+	pi.on("agent_start", () => {
+		stopDestroyCountdown();
 	});
 
 	pi.on("ui_prompt_start", async (event, ctx) => {
+		// 弹窗等人回答：这一轮还没结束，先把倒计时停掉（settle 后会重新武装）。
+		stopDestroyCountdown();
 		if (!pendingAsker || blockedNotified) return;
 		blockedNotified = true;
 		const detail = event.title ? ` (${event.title})` : "";
@@ -309,6 +363,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	});
 
 	pi.on("session_shutdown", async (event) => {
+		stopDestroyCountdown();
 		// 只有真正退出（quit）才收尸；/reload、/new、/resume、/fork 不动子 agent。
 		if (event.reason !== "quit") return;
 		try {
@@ -319,6 +374,71 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			// 退出路径尽力而为：清理失败不能盖住正常退出。
 		}
 	});
+
+	// ─── 空闲销毁 ───
+
+	/** 倒计时代数：取消与重开都 +1，让在飞的检查作废。 */
+	let destroyGeneration = 0;
+	let destroyTimer: (() => void) | undefined;
+	let destroyQuietSince: number | undefined;
+	let destroyChecking = false;
+
+	/**
+	 * 安静 = 本 agent 空闲 + 进程内没有后台任务 / cron job / 进程内子 agent + 没有活的子
+	 * 终端。子终端也算：销毁会级联杀掉子 agent，它有活就先让着它（它自己也有同一套规则）。
+	 * `hc.list` 失败时不知道有没有子 agent，按「忙」处理。
+	 */
+	const isQuiet = async (ctx: ExtensionContext): Promise<boolean> => {
+		if (!ctx.isIdle()) return false;
+		if (hasBusyActivity() || hasRunningSubagents()) return false;
+		try {
+			const terminals = await hc.list();
+			return !terminals.some((terminal) => terminal.parent === self && terminal.state === "live");
+		} catch {
+			return false;
+		}
+	};
+
+	const stopDestroyCountdown = (): void => {
+		destroyGeneration += 1;
+		destroyTimer?.();
+		destroyTimer = undefined;
+		destroyQuietSince = undefined;
+	};
+
+	const checkDestroy = async (generation: number, ctx: ExtensionContext): Promise<void> => {
+		if (generation !== destroyGeneration || destroyChecking) return;
+		destroyChecking = true;
+		try {
+			const quiet = await isQuiet(ctx);
+			if (generation !== destroyGeneration) return;
+			if (!quiet) {
+				// 从「忙」回到「安静」的开始时刻才起算：子树 / 任务刚结束还要再等满一整钟。
+				destroyQuietSince = undefined;
+				return;
+			}
+
+			const stamp = now();
+			if (destroyQuietSince === undefined) destroyQuietSince = stamp;
+			if (stamp - destroyQuietSince < destroyAfterSeconds * 1000) return;
+
+			stopDestroyCountdown();
+			ctx.shutdown();
+		} finally {
+			destroyChecking = false;
+		}
+	};
+
+	/** settle 之后武装倒计时；根 agent（env 缺省）与 `0` 都不做任何事。 */
+	const armDestroyCountdown = async (ctx: ExtensionContext): Promise<void> => {
+		if (destroyAfterSeconds <= 0) return;
+		stopDestroyCountdown();
+		const generation = destroyGeneration;
+		destroyQuietSince = (await isQuiet(ctx)) ? now() : undefined;
+		// await 期间又 settle / 来了新输入：这一代已经作废。
+		if (generation !== destroyGeneration) return;
+		destroyTimer = schedule(() => void checkDestroy(generation, ctx), DESTROY_TICK_S * 1000);
+	};
 
 	// ─── 结果整形 ───
 
@@ -356,6 +476,9 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 				resume: Type.Optional(
 					Type.String({ description: piHerdrAgentPrompt.declarations.agent.parameters.resume }),
 				),
+				destroyAfterSeconds: Type.Optional(
+					Type.Number({ description: piHerdrAgentPrompt.declarations.agent.parameters.destroyAfterSeconds }),
+				),
 			}),
 
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -388,7 +511,17 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		const model = params.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
 		const thinking = params.thinking ?? ctx.thinkingLevel;
 
-		await launch({ id, name, cwd: ctx.cwd || process.cwd(), model, thinking, prompt: params.prompt, ctx });
+		await launch({
+			id,
+			name,
+			cwd: ctx.cwd || process.cwd(),
+			model,
+			thinking,
+			prompt: params.prompt,
+			ctx,
+			destroyAfterSeconds: normalizeDestroyAfter(params.destroyAfterSeconds),
+		});
+		pendingStarts.add(id);
 		return ok(`Started agent ${id} as '${name}'. Its final answer will arrive as a message.`, {
 			action: "start",
 			id,
@@ -446,7 +579,9 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			thinking: params.thinking,
 			prompt: params.prompt,
 			ctx,
+			destroyAfterSeconds: normalizeDestroyAfter(params.destroyAfterSeconds),
 		});
+		pendingStarts.add(id);
 		return ok(piHerdrAgentPrompt.results.resumedAgent(id, name), {
 			action: "resume",
 			id,
@@ -462,10 +597,12 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		thinking?: string;
 		prompt: string;
 		ctx: ExtensionContext;
+		/** 空闲销毁秒数；0 = 永不。 */
+		destroyAfterSeconds: number;
 	}
 
 	const launch = async (launchOptions: LaunchOptions): Promise<void> => {
-		const { id, name, cwd, model, thinking, prompt, ctx } = launchOptions;
+		const { id, name, cwd, model, thinking, prompt, ctx, destroyAfterSeconds } = launchOptions;
 		const argv = ["pi", "--session-id", `pi-${id}`, "--name", name];
 		if (model) argv.push("--model", model);
 		if (thinking) argv.push("--thinking", thinking);
@@ -484,6 +621,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 					PI_AGENT_PARENT: myId,
 					PI_AGENT_ROOT: myRoot,
 					PI_AGENT_DEPTH: String(myDepth + 1),
+					[DESTROY_ENV]: String(destroyAfterSeconds),
 				},
 				no_notify: true,
 				rm: true,
@@ -560,6 +698,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			label: "Agent jobs",
 			description: piHerdrAgentPrompt.declarations.agentJob.description,
 			promptSnippet: piHerdrAgentPrompt.system.snippets.agentJob,
+			promptGuidelines: [piHerdrAgentPrompt.system.guidelines.agentJob],
 			parameters: Type.Object({
 				action: StringEnum(["list", "wait", "kill", "ask", "steer"] as const, {
 					description: piHerdrAgentPrompt.declarations.agentJob.parameters.action,
@@ -573,7 +712,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 				),
 			}),
 
-			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 				const typed = params as AgentJobParams;
 				try {
 					switch (typed.action) {
@@ -583,7 +722,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 							return ok(formatRows(rows), { action: "list", agents: rows });
 						}
 						case "wait":
-							return await waitJob(typed, ctx);
+							return await waitJob(typed, ctx, signal);
 						case "kill":
 							return await killJob(typed);
 						case "ask":
@@ -598,15 +737,17 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		});
 	};
 
-	const waitJob = async (params: AgentJobParams, _ctx: ExtensionContext) => {
+	const waitJob = async (params: AgentJobParams, _ctx: ExtensionContext, signal?: AbortSignal) => {
 		if (!params.id) return fail(piHerdrAgentPrompt.results.errors.idRequired("wait"), "wait");
-		if (params.id === myId) return fail(piHerdrAgentPrompt.results.errors.cannotActOnSelf("wait on"), "wait", params.id);
-		const target = await requireTarget(params.id);
 		const timeout =
 			params.timeout !== undefined && Number.isFinite(params.timeout)
 				? Math.max(0, params.timeout)
 				: undefined;
-		const wait = await hc.wait({ terminal: target.terminal.address, timeout, caller: self });
+		if (params.id === "any" || params.id === "all") return await waitChildren(params.id, timeout, signal);
+		if (params.id === myId) return fail(piHerdrAgentPrompt.results.errors.cannotActOnSelf("wait on"), "wait", params.id);
+		const target = await requireTarget(params.id);
+		const wait = await waitOrAbort({ terminal: target.terminal.address, timeout }, signal);
+		if (!wait) return fail(piHerdrAgentPrompt.results.waitAborted(), "wait", target.row.id);
 		const label = `${target.row.id} (${target.row.name})`;
 
 		if (!wait.ended) {
@@ -625,6 +766,126 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			action: "wait",
 			id: target.row.id,
 		});
+	};
+
+	/** hc 的「等」；父轮 Esc 中止的只是这次等，agent 照跑。 */
+	const waitOrAbort = async (
+		params: { terminal: string; children?: "any" | "all"; timeout?: number },
+		signal?: AbortSignal,
+	): Promise<HcWaitResult | undefined> => {
+		try {
+			return await hc.wait({ ...params, caller: self }, signal);
+		} catch (error) {
+			if (error instanceof HcError && error.kind === "aborted") return undefined;
+			throw error;
+		}
+	};
+
+	/**
+	 * `any` / `all`：只看**直接子 agent**（hc 的 parent 关系），先自己判空再去等。
+	 * 子都闲着时 hc 的 `any` 会一路挂到 timeout（它只等新动静），所以判空不能省。
+	 */
+	const waitChildren = async (mode: "any" | "all", timeout: number | undefined, signal?: AbortSignal) => {
+		const listChildren = async () => {
+			const terminals = await hc.list();
+			return terminals
+				.filter((terminal) => terminal.state === "live" && terminal.parent === self)
+				.map((terminal) => ({
+					address: terminal.address,
+					id: agentIdOf(terminal),
+					name: terminal.name ?? terminal.address,
+					status: terminal.status?.state ?? "unknown",
+					turn: terminal.turn,
+				}))
+				.filter((child): child is { address: string; id: string; name: string; status: string; turn: number } =>
+					Boolean(child.id),
+				);
+		};
+
+		const watched = await listChildren();
+		if (watched.length === 0) return ok(piHerdrAgentPrompt.results.noAgentWorking(), { action: "wait" });
+
+		const labelOf = (address: string): string | undefined => {
+			const child = watched.find((candidate) => candidate.address === address);
+			return child ? `${child.id} (${child.name})` : undefined;
+		};
+
+		const linesFrom = (list: { id: string; name: string; status: string; turn: number }[]) =>
+			list.map((child) =>
+				piHerdrAgentPrompt.results.waitStatus(`${child.id} (${child.name})`, child.status, child.turn),
+			);
+
+		const timeoutText = (refs: string[]) => {
+			const waited = timeout === undefined ? ` after ${secondsText(WAIT_TIMEOUT_S)}` : ` after ${secondsText(timeout)}`;
+			return ok(piHerdrAgentPrompt.results.waitTimedOut(waited, refs.join(", ")), { action: "wait" });
+		};
+
+		const stillRunning = (wait: HcWaitResult): string[] => {
+			const labels = (wait.children ?? [])
+				.filter((child) => child.reason === "running")
+				.map((child) => labelOf(child.terminal))
+				.filter((label): label is string => Boolean(label));
+			return labels.length > 0 ? labels : watched.map((child) => `${child.id} (${child.name})`);
+		};
+
+		/** 子 agent 发来的结果消息：等它的状态落地（消息到达与状态切换之间有毫秒级竞态）。 */
+		const settle = async (address: string | null): Promise<void> => {
+			if (!address || !labelOf(address)) return;
+			await waitOrAbort({ terminal: address, timeout: SETTLE_TIMEOUT_S }, signal);
+		};
+
+		// 子都闲着时 hc 的 `any` 会一路挂到 timeout，所以先自己判空；但「刚拉起、还没转 working」
+		// 的子不能算闲着（已投递但还没开跑的轮在 hc 眼里也是在 working），所以看 pendingStarts。
+		const liveIds = new Set(watched.map((child) => child.id));
+		for (const id of pendingStarts) if (!liveIds.has(id)) pendingStarts.delete(id);
+		const starting = watched.some((child) => pendingStarts.has(child.id));
+		if (!watched.some((child) => child.status === "working") && !starting) {
+			return ok(piHerdrAgentPrompt.results.noAgentWorking(), { action: "wait" });
+		}
+
+		const deadline = timeout === undefined ? undefined : Date.now() + timeout * 1000;
+		const remaining = (): number | undefined =>
+			deadline === undefined ? undefined : Math.max(0, (deadline - Date.now()) / 1000);
+
+		while (true) {
+			const wait = await waitOrAbort({ terminal: self, children: mode, timeout: remaining() }, signal);
+			if (!wait) return fail(piHerdrAgentPrompt.results.waitAborted(), "wait");
+			if (!wait.ended) return timeoutText(stillRunning(wait));
+
+			if (wait.reason === "message") {
+				// 子 agent 把结果发过来时 hc 会以 reason=message 结束等待（children 是空的）。
+				await settle(wait.from);
+				// `all`：消息只是提前叫醒等待，还有子在干活就继续等剩下的。
+				if (mode === "all" && (await listChildren()).some((child) => child.status === "working")) continue;
+
+				const label = wait.from ? labelOf(wait.from) : undefined;
+				const fresh = wait.from ? (await listChildren()).find((child) => child.address === wait.from) : undefined;
+				if (mode === "any" && label && fresh) {
+					return ok(piHerdrAgentPrompt.results.waitStatus(label, fresh.status, fresh.turn), { action: "wait" });
+				}
+				if (mode === "any") return ok(piHerdrAgentPrompt.results.waitMessage(), { action: "wait" });
+				// `all`：消息结束且没人在干活，用最新状态报。
+				const finalLines = linesFrom(await listChildren());
+				return ok(finalLines.length > 0 ? finalLines.join("\n") : piHerdrAgentPrompt.results.noAgentWorking(), {
+					action: "wait",
+				});
+			}
+
+			// hc 的 `all` 会把早已消失的历史子终端也列进来（agent 终端是 rm 的）：只报调用时
+			// 还在的那一批，地址映射不回 id 的一律丢弃。
+			const lines = (wait.children ?? [])
+				.map((child) => ({ child, label: labelOf(child.terminal) }))
+				.filter((entry): entry is { child: HcWaitResult; label: string } => Boolean(entry.label))
+				.map(({ child, label }) =>
+					child.reason === "exit"
+						? piHerdrAgentPrompt.results.waitExited(label, String(child.exit_code ?? "?"))
+						: piHerdrAgentPrompt.results.waitStatus(label, child.status ?? child.reason, child.turn),
+				);
+
+			return ok(lines.length > 0 ? lines.join("\n") : piHerdrAgentPrompt.results.noAgentWorking(), {
+				action: "wait",
+			});
+		}
 	};
 
 	const killJob = async (params: AgentJobParams) => {
@@ -668,6 +929,8 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			// done 是「结束但还没被看」，hc 的 if 只认 idle/working，所以那一档不带 if。
 			if: status === "idle" ? "idle" : undefined,
 		});
+		// 还没进入 working 的 ask 也要算「马上要开跑」，否则紧接着的 wait 会误判成没活。
+		if (sent.started === false) pendingStarts.add(target.row.id);
 		const pending = sent.started === false ? piHerdrAgentPrompt.results.askPending() : "";
 		return ok(piHerdrAgentPrompt.results.asked(target.row.id, target.row.name, pending), {
 			action: "ask",
@@ -766,6 +1029,27 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 }
 
 // ─── 纯函数 ───
+
+/**
+ * 工具参数 → 实际秒数：小数向下取整，非法值 / 负数回到默认；`0` 保留为「永不销毁」。
+ */
+export function normalizeDestroyAfter(value: number | undefined): number {
+	if (value === undefined || !Number.isFinite(value) || value < 0) return DEFAULT_DESTROY_AFTER_S;
+	return Math.floor(value);
+}
+
+/** 子 agent 从 env 读自己的空闲销毁秒数；缺省 / 非法 / `<= 0` 都是 `0`（不销毁）。 */
+export function parseDestroyAfter(raw: string | undefined): number {
+	if (raw === undefined) return 0;
+	const value = Number.parseInt(raw.trim(), 10);
+	return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/** 默认调度器：`setInterval`，返回取消函数。 */
+function defaultSchedule(tick: () => void, ms: number): () => void {
+	const handle = setInterval(tick, ms);
+	return () => clearInterval(handle);
+}
 
 const DONE_STATUS_PREFIX = "\x1b]7501;state=done";
 const STDOUT_PATCHED = Symbol.for("pi-herdr-agent:done-to-idle");
@@ -1216,6 +1500,13 @@ function resolveModel(ctx: ExtensionContext, reference: string): { provider: str
 			model.id.toLowerCase().includes(wanted) || (model.name ?? "").toLowerCase().includes(wanted),
 	);
 	return fuzzy.length === 1 ? { provider: fuzzy[0].provider, id: fuzzy[0].id } : undefined;
+}
+
+/** 秒 → `5s` / `1m03s`；只用于 `agent_job wait` 的超时文案。 */
+function secondsText(seconds: number): string {
+	const total = Math.max(0, Math.round(seconds));
+	if (total < 60) return `${total}s`;
+	return `${Math.floor(total / 60)}m${String(total % 60).padStart(2, "0")}s`;
 }
 
 /** core 错误码翻成人话。 */

@@ -21,6 +21,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { registerBusyProbe } from "./lib/activity.ts";
 import { ERROR_PREFIX, piCronPrompt } from "./prompt/pi-cron.ts";
 import {
 	cronToHuman,
@@ -62,7 +63,7 @@ export type { CronConversion, CronFields } from "./lib/cron/schedule.ts";
 const MAX_JOBS = 64;
 /** setTimeout 的安全分块：2^31-1 ms ≈ 24.8 天，取 6 小时留足余量 */
 const TICK_CHUNK_MS = 6 * 60 * 60 * 1000;
-const STORE_KEY = Symbol.for("vkzha.pi-cron.jobs");
+const STORE_KEY = Symbol.for("vksir.pi-cron.jobs");
 const CUSTOM_TYPE = "pi-cron";
 const INFO_TYPE = "pi-cron-info";
 const PROMPT_PREVIEW = 80;
@@ -162,6 +163,9 @@ function jobLines(job: CronJob, now: number): CronInfoLine[] {
 // ─── 扩展 ───
 
 export default function (pi: ExtensionAPI) {
+	// cron job 活在本进程里，销毁进程等于丢掉排期：登记成忙探测，供 pi-herdr-agent 的空闲销毁使用。
+	registerBusyProbe("pi-cron", () => store().jobs.length > 0);
+
 	// ─── 调度器 ───
 
 	let timer: ReturnType<typeof setTimeout> | null = null;

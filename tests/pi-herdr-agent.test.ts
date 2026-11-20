@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import {
 	agentSourceLine,
@@ -8,6 +10,7 @@ import {
 	truncateTail,
 	validateAgentName,
 } from "../extensions/lib/agent-protocol.ts";
+import { hasBusyActivity, registerBusyProbe } from "../extensions/lib/activity.ts";
 import {
 	buildRows,
 	currentTree,
@@ -15,6 +18,8 @@ import {
 	formatRows,
 	isDescendant,
 	lastAssistantText,
+	normalizeDestroyAfter,
+	parseDestroyAfter,
 	readSessionFacts,
 	rewriteDoneStatus,
 	rootIdOf,
@@ -174,6 +179,8 @@ interface FakeCtx {
 	sessionManager: { getSessionName: () => string | undefined; getSessionId: () => string };
 	modelRegistry: { getAll: () => { provider: string; id: string; name?: string }[] };
 	ui: { notify: (message: string, type?: string) => void };
+	isIdle: () => boolean;
+	shutdown: () => void;
 }
 
 function context(overrides: Partial<FakeCtx> = {}): FakeCtx {
@@ -187,13 +194,23 @@ function context(overrides: Partial<FakeCtx> = {}): FakeCtx {
 		},
 		modelRegistry: { getAll: () => [{ provider: "p", id: "m", name: "M" }] },
 		ui: { notify: () => undefined },
+		isIdle: () => true,
+		shutdown: () => undefined,
 		...overrides,
 	};
 }
 
 let moduleSeq = 0;
 
-async function setup(options: { env?: Record<string, string>; hc?: FakeHc } = {}) {
+async function setup(
+	options: {
+		env?: Record<string, string>;
+		hc?: FakeHc;
+		sessionDir?: string;
+		now?: () => number;
+		schedule?: (tick: () => void, ms: number) => () => void;
+	} = {},
+) {
 	const { default: extension } = await import(`../extensions/pi-herdr-agent.ts?run=${moduleSeq++}`);
 	const pi = createFakePi();
 	const hc = options.hc ?? new FakeHc();
@@ -204,6 +221,9 @@ async function setup(options: { env?: Record<string, string>; hc?: FakeHc } = {}
 			HC_TERMINAL_SOCKET: "\\\\.\\pipe\\test",
 			...options.env,
 		} as NodeJS.ProcessEnv,
+		sessionDir: options.sessionDir,
+		now: options.now,
+		schedule: options.schedule,
 		spill: async (text: string) => `/tmp/spill-${text.length}.log`,
 	});
 	return { pi, hc };
@@ -263,6 +283,7 @@ test("agent launches pi with identity env, labels and ask envelope", async () =>
 		PI_AGENT_PARENT: "t4m",
 		PI_AGENT_ROOT: "t4m",
 		PI_AGENT_DEPTH: "1",
+		PI_AGENT_DESTROY_AFTER: "180",
 	});
 	assert.ok(argv.includes("--model") && argv.includes("p/m2"));
 	assert.ok(argv.includes("--thinking") && argv.includes("low"));
@@ -413,12 +434,217 @@ test("wait requires an id and never treats a timeout as an error", async () => {
 	assert.match(toolResultText(missing), /id is required for wait/);
 
 	const originalWait = hc.wait.bind(hc);
-	hc.wait = async (params) => {
+	hc.wait = async (params: HcWaitParams, _signal?: AbortSignal) => {
 		hc.record("wait", params);
 		return waitResult({ ended: false, reason: "timeout", status: "working", terminal: "t10" });
 	};
 	const result = await pi.tools.get("agent_job")!.execute("call", { action: "wait", id: "aaaa", timeout: 5 }, undefined, undefined, context());
 	assert.match(toolResultText(result), /still running \(working, turn 0\)/);
+	hc.wait = originalWait;
+});
+
+/** 本终端 + 两个直接子 agent（状态可分别指定）。 */
+function childAgents(status: "working" | "idle" = "working"): HcTerminal[] {
+	return [
+		terminal({ address: "t4m", labels: { "pi.agent.root": "root" }, status: { app: "pi", state: "working" } }),
+		terminal({
+			address: "t10",
+			parent: "t4m",
+			name: "reviewer",
+			labels: { "pi.agent": "aaaa" },
+			status: { app: "pi", state: status },
+		}),
+		terminal({
+			address: "t11",
+			parent: "t4m",
+			name: "coder",
+			labels: { "pi.agent": "bbbb" },
+			status: { app: "pi", state: status },
+		}),
+	];
+}
+
+test("wait any 在子 agent 都不在 working 时直接报没人在干活", async () => {
+	const hc = new FakeHc();
+	hc.terminals = childAgents("idle");
+	const { pi } = await setup({ hc });
+
+	const originalWait = hc.wait.bind(hc);
+	const result = await pi.tools.get("agent_job")!.execute(
+		"call",
+		{ action: "wait", id: "any" },
+		undefined,
+		undefined,
+		context(),
+	);
+	assert.equal(toolResultText(result), "No agent is working.");
+	assert.equal(hc.callsOf("wait").length, 0, "不该去挂 hc 的长等");
+	hc.wait = originalWait;
+});
+
+test("wait any 对一个刚拉起、还没转 working 的子 agent 也真等", async () => {
+	const hc = new FakeHc();
+	hc.terminals = [terminal({ address: "t4m", labels: { "pi.agent.root": "root" } })];
+	hc.runResult = {
+		...terminal({
+			address: "t10",
+			parent: "t4m",
+			name: "reviewer",
+			labels: { "pi.agent": "aaaa" },
+			status: { app: "pi", state: "idle" },
+		}),
+		output: "",
+		wait: waitResult(),
+	};
+	hc.sendResult = { started: false, status: "idle", turn: 0, wait: null };
+	const { pi } = await setup({ hc });
+
+	// 拉起之后：子 agent 已经在列表里，但还没进入 working。
+	const started = await pi.tools.get("agent")!.execute(
+		"call",
+		{ name: "reviewer", prompt: "do the thing" },
+		undefined,
+		undefined,
+		context(),
+	);
+	const id = String((started.details as { id?: string }).id);
+	hc.terminals = [
+		terminal({ address: "t4m", labels: { "pi.agent.root": "root" } }),
+		terminal({
+			address: "t10",
+			parent: "t4m",
+			name: "reviewer",
+			labels: { "pi.agent": id },
+			status: { app: "pi", state: "idle" },
+		}),
+	];
+	hc.wait = async () => ({
+		...waitResult({ terminal: "t4m", reason: "children", status: null }),
+		children: [waitResult({ terminal: "t10", reason: "status", status: "idle", turn: 1 })],
+	});
+
+	const result = await pi.tools.get("agent_job")!.execute(
+		"call",
+		{ action: "wait", id: "any", timeout: 30 },
+		undefined,
+		undefined,
+		context(),
+	);
+	assert.equal(toolResultText(result), `${id} (reviewer): idle (turn 1).`);
+});
+
+test("wait any 用 hc 的 children 等，只报停下那一批的 id 与 name", async () => {
+	const hc = new FakeHc();
+	hc.terminals = childAgents();
+	const { pi } = await setup({ hc });
+
+	const originalWait = hc.wait.bind(hc);
+	hc.wait = async (params: HcWaitParams) => {
+		hc.record("wait", params);
+		return {
+			...waitResult({ terminal: "t4m", reason: "children", status: null }),
+			children: [
+				waitResult({ terminal: "t10", reason: "status", status: "idle", turn: 3 }),
+				waitResult({ terminal: "t11", reason: "exit", status: null, exit_code: 0, turn: 0 }),
+			],
+		};
+	};
+
+	const result = await pi.tools.get("agent_job")!.execute(
+		"call",
+		{ action: "wait", id: "any", timeout: 5 },
+		undefined,
+		undefined,
+		context(),
+	);
+	assert.equal(
+		toolResultText(result),
+		"aaaa (reviewer): idle (turn 3).\nbbbb (coder): exited (code 0).",
+	);
+	assert.deepEqual(hc.callsOf("wait")[0]!.params, {
+		terminal: "t4m",
+		children: "any",
+		caller: "t4m",
+		timeout: 5,
+	});
+	hc.wait = originalWait;
+});
+
+test("wait any 被子 agent 的结果消息唤醒时报它的状态，而不是没人在干活", async () => {
+	const hc = new FakeHc();
+	hc.terminals = childAgents();
+	const { pi } = await setup({ hc });
+
+	hc.wait = async () => {
+		// 结果消息到达时子已经停下
+		hc.terminals = childAgents("idle");
+		return {
+			...waitResult({ terminal: "t4m", reason: "message", status: null, from: "t10" }),
+			children: [],
+		};
+	};
+
+	const result = await pi.tools.get("agent_job")!.execute(
+		"call",
+		{ action: "wait", id: "any", timeout: 30 },
+		undefined,
+		undefined,
+		context(),
+	);
+	assert.equal(toolResultText(result), "aaaa (reviewer): idle (turn 0).");
+});
+
+test("wait all 超时只报还在 working 的子 agent", async () => {
+	const hc = new FakeHc();
+	hc.terminals = childAgents();
+	const { pi } = await setup({ hc });
+
+	const originalWait = hc.wait.bind(hc);
+	hc.wait = async (params: HcWaitParams) => {
+		hc.record("wait", params);
+		return {
+			...waitResult({ terminal: "t4m", ended: false, reason: "timeout", status: null }),
+			children: [
+				waitResult({ terminal: "t10", ended: false, reason: "running", status: null }),
+				waitResult({ terminal: "t11", ended: false, reason: "running", status: null }),
+			],
+		};
+	};
+
+	const result = await pi.tools.get("agent_job")!.execute(
+		"call",
+		{ action: "wait", id: "all", timeout: 5 },
+		undefined,
+		undefined,
+		context(),
+	);
+	assert.equal(
+		toolResultText(result),
+		"agent_job wait timed out after 5s. Still running: aaaa (reviewer), bbbb (coder).",
+	);
+	hc.wait = originalWait;
+});
+
+test("wait 被父轮 Esc 中止时只报事实，agent 照跑", async () => {
+	const hc = new FakeHc();
+	hc.terminals = childAgents();
+	const { pi } = await setup({ hc });
+
+	const originalWait = hc.wait.bind(hc);
+	hc.wait = (_params: HcWaitParams, signal?: AbortSignal) =>
+		new Promise<HcWaitResult>((_resolve, reject) => {
+			signal?.addEventListener("abort", () => reject(new HcError("aborted", "aborted")), { once: true });
+		});
+
+	const parent = new AbortController();
+	const waiting = pi.tools
+		.get("agent_job")!
+		.execute("call", { action: "wait", id: "aaaa" }, parent.signal, undefined, context());
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	parent.abort();
+
+	const result = await waiting;
+	assert.match(toolResultText(result), /^Error: wait aborted\. The agent keeps running\./);
 	hc.wait = originalWait;
 });
 
@@ -521,6 +747,224 @@ test("only quit tears down direct children", async () => {
 
 	await pi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
 	assert.deepEqual(hc.callsOf("kill").map((call) => call.params.terminal), ["t10"]);
+});
+
+// ─── 空闲销毁 ───
+
+/** 手动调度器：把扩展注册的每一拍收起来，由测试决定何时走一拍。 */
+function manualSchedule() {
+	const ticks: (() => void)[] = [];
+	let cancels = 0;
+	return {
+		ticks,
+		get cancels() {
+			return cancels;
+		},
+		schedule: (tick: () => void): (() => void) => {
+			ticks.push(tick);
+			return () => {
+				cancels += 1;
+			};
+		},
+	};
+}
+
+/** 走一拍并等它内部的异步探测跑完。 */
+async function tickOnce(tick: (() => void) | undefined): Promise<void> {
+	tick?.();
+	await new Promise((resolve) => setImmediate(resolve));
+}
+
+function childEnv(destroyAfterSeconds: string): Record<string, string> {
+	return { PI_AGENT_ID: "abcd", PI_AGENT_DEPTH: "1", PI_AGENT_DESTROY_AFTER: destroyAfterSeconds };
+}
+
+test("a quiet child shuts itself down after destroyAfterSeconds", async () => {
+	const hc = new FakeHc();
+	const clock = { value: 0 };
+	const scheduler = manualSchedule();
+	const { pi } = await setup({
+		hc,
+		env: childEnv("180"),
+		now: () => clock.value,
+		schedule: scheduler.schedule,
+	});
+	const shutdowns: number[] = [];
+	const ctx = context({ shutdown: () => shutdowns.push(clock.value) });
+
+	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, ctx);
+	assert.equal(scheduler.ticks.length, 1);
+
+	clock.value = 179_000;
+	await tickOnce(scheduler.ticks[0]);
+	assert.deepEqual(shutdowns, []);
+
+	clock.value = 180_000;
+	await tickOnce(scheduler.ticks[0]);
+	assert.deepEqual(shutdowns, [180_000]);
+	assert.equal(scheduler.cancels, 1);
+});
+
+test("the countdown only starts once no live child terminal is left", async () => {
+	const hc = new FakeHc();
+	hc.terminals = [terminal({ address: "t20", parent: "t4m", labels: { "pi.agent": "eeee" } })];
+	const clock = { value: 0 };
+	const scheduler = manualSchedule();
+	const { pi } = await setup({
+		hc,
+		env: childEnv("180"),
+		now: () => clock.value,
+		schedule: scheduler.schedule,
+	});
+	const shutdowns: number[] = [];
+	const ctx = context({ shutdown: () => shutdowns.push(clock.value) });
+
+	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, ctx);
+	clock.value = 100_000;
+	await tickOnce(scheduler.ticks[0]);
+	assert.deepEqual(shutdowns, []);
+
+	// 子 agent 已销毁（finished 不再算活的子终端）：安静从这一刻起算。
+	hc.terminals = [terminal({ address: "t20", parent: "t4m", state: "finished", labels: { "pi.agent": "eeee" } })];
+	clock.value = 130_000;
+	await tickOnce(scheduler.ticks[0]);
+	clock.value = 309_000;
+	await tickOnce(scheduler.ticks[0]);
+	assert.deepEqual(shutdowns, []);
+
+	clock.value = 310_000;
+	await tickOnce(scheduler.ticks[0]);
+	assert.deepEqual(shutdowns, [310_000]);
+});
+
+test("background activity from other extensions pauses the countdown", async () => {
+	let busy = true;
+	registerBusyProbe("test-activity", () => busy);
+
+	const hc = new FakeHc();
+	const clock = { value: 0 };
+	const scheduler = manualSchedule();
+	const { pi } = await setup({
+		hc,
+		env: childEnv("180"),
+		now: () => clock.value,
+		schedule: scheduler.schedule,
+	});
+	const shutdowns: number[] = [];
+	const ctx = context({ shutdown: () => shutdowns.push(clock.value) });
+
+	try {
+		await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, ctx);
+		clock.value = 200_000;
+		await tickOnce(scheduler.ticks[0]);
+		assert.deepEqual(shutdowns, []);
+
+		// 忙的一直不算；从「忙」回到「安静」的那一刻才起算。
+		busy = false;
+		clock.value = 230_000;
+		await tickOnce(scheduler.ticks[0]);
+		clock.value = 409_000;
+		await tickOnce(scheduler.ticks[0]);
+		assert.deepEqual(shutdowns, []);
+
+		clock.value = 410_000;
+		await tickOnce(scheduler.ticks[0]);
+		assert.deepEqual(shutdowns, [410_000]);
+	} finally {
+		registerBusyProbe("test-activity", () => false);
+	}
+});
+
+test("new input cancels the pending countdown", async () => {
+	const clock = { value: 0 };
+	const scheduler = manualSchedule();
+	const { pi } = await setup({
+		env: childEnv("180"),
+		now: () => clock.value,
+		schedule: scheduler.schedule,
+	});
+	const shutdowns: number[] = [];
+	const ctx = context({ shutdown: () => shutdowns.push(clock.value) });
+
+	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, ctx);
+	await pi.emit("input", { type: "input", text: "keep working" });
+	assert.equal(scheduler.cancels, 1);
+
+	// 陈旧的一拍即使被调到，也不能再生效。
+	clock.value = 1_000_000;
+	await tickOnce(scheduler.ticks[0]);
+	assert.deepEqual(shutdowns, []);
+});
+
+test("destroyAfterSeconds 0 and a missing env disable the countdown", async () => {
+	const scheduler = manualSchedule();
+	const zero = await setup({ env: childEnv("0"), now: () => 0, schedule: scheduler.schedule });
+	await zero.pi.emit("agent_settled", { type: "agent_settled", aborted: false }, context());
+
+	const root = await setup({ now: () => 0, schedule: scheduler.schedule });
+	await root.pi.emit("agent_settled", { type: "agent_settled", aborted: false }, context());
+
+	assert.equal(scheduler.ticks.length, 0);
+});
+
+test("an unreadable terminal list keeps the agent alive", async () => {
+	const hc = new FakeHc();
+	hc.list = async () => {
+		throw new HcError("not_found", "core restarted");
+	};
+	const clock = { value: 0 };
+	const scheduler = manualSchedule();
+	const { pi } = await setup({
+		hc,
+		env: childEnv("180"),
+		now: () => clock.value,
+		schedule: scheduler.schedule,
+	});
+	const shutdowns: number[] = [];
+	const ctx = context({ shutdown: () => shutdowns.push(clock.value) });
+
+	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, ctx);
+	clock.value = 1_000_000;
+	await tickOnce(scheduler.ticks[0]);
+	assert.deepEqual(shutdowns, []);
+});
+
+test("destroyAfterSeconds is normalized and injected into the child env", async () => {
+	const hc = new FakeHc();
+	const { pi } = await setup({ hc });
+	const tool = pi.tools.get("agent")!;
+
+	await tool.execute("call", { prompt: "x", destroyAfterSeconds: 0 }, undefined, undefined, context());
+	await tool.execute("call", { prompt: "x", destroyAfterSeconds: 42.9 }, undefined, undefined, context());
+	await tool.execute("call", { prompt: "x", destroyAfterSeconds: -5 }, undefined, undefined, context());
+
+	assert.deepEqual(
+		hc.callsOf("run").map((call) => call.params.env.PI_AGENT_DESTROY_AFTER),
+		["0", "42", "180"],
+	);
+});
+
+test("resume applies destroyAfterSeconds from the call, not from the session", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-herdr-agent-"));
+	const file = join(dir, "2026-01-01T00-00-00-000Z_pi-aaaa.jsonl");
+	const lines = [
+		{ type: "session", id: "pi-aaaa", cwd: "D:\\repo", timestamp: "2026-01-01T00:00:00.000Z" },
+		{ type: "model_change", provider: "p", modelId: "m" },
+		{ type: "thinking_level_change", thinkingLevel: "high" },
+	];
+	writeFileSync(file, lines.map((line) => JSON.stringify(line)).join("\n"));
+
+	try {
+		const hc = new FakeHc();
+		const { pi } = await setup({ hc, sessionDir: dir });
+		const result = await pi.tools
+			.get("agent")!
+			.execute("call", { prompt: "again", resume: "aaaa", destroyAfterSeconds: 0 }, undefined, undefined, context());
+		assert.match(toolResultText(result), /^Resumed agent aaaa/);
+		assert.equal(hc.callsOf("run")[0].params.env.PI_AGENT_DESTROY_AFTER, "0");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 // ─── 纯函数 ───
@@ -855,4 +1299,28 @@ test("subagent done OSC is rewritten to idle", () => {
 	);
 	assert.equal(rewriteDoneStatus("\x1b]7501;state=idle:app=pi\x1b\\"), "\x1b]7501;state=idle:app=pi\x1b\\");
 	assert.equal(rewriteDoneStatus("hello"), "hello");
+});
+
+test("destroyAfterSeconds normalizes tool input and parses the child env", () => {
+	assert.equal(normalizeDestroyAfter(undefined), 180);
+	assert.equal(normalizeDestroyAfter(0), 0);
+	assert.equal(normalizeDestroyAfter(42.9), 42);
+	assert.equal(normalizeDestroyAfter(-1), 180);
+	assert.equal(normalizeDestroyAfter(Number.NaN), 180);
+
+	assert.equal(parseDestroyAfter(undefined), 0);
+	assert.equal(parseDestroyAfter("0"), 0);
+	assert.equal(parseDestroyAfter(" 90 "), 90);
+	assert.equal(parseDestroyAfter("-5"), 0);
+	assert.equal(parseDestroyAfter("abc"), 0);
+});
+
+test("busy probes are keyed by name and swallow failures", () => {
+	registerBusyProbe("probe-runs", () => true);
+	assert.equal(hasBusyActivity(), true);
+	registerBusyProbe("probe-runs", () => false);
+	registerBusyProbe("probe-throws", () => {
+		throw new Error("boom");
+	});
+	assert.equal(hasBusyActivity(), false);
 });

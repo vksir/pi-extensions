@@ -157,7 +157,7 @@ _Avoid_: 通知、回调、推送、notify
 _Avoid_: 消费、去重、已读
 
 **等候 (bg wait)**：
-`bg_job wait [id] [timeout]` 阻塞到任务结束、直接把原样输出放进 tool result 的动作；省略 id 则等全部在跑任务，`timeout`（秒）到点只报状态、任务继续跑。父轮 Esc 或超时取消的只是「等」，任务照跑、结果仍会回传。
+`bg_job wait <id|any|all> [timeout]` 阻塞到任务结束、把原样输出放进 tool result 的动作。id 只接受真实任务 id、`any`（等下一个结束的）或 `all`（等在跑的全部），不写直接报错；`any` 只接过第一个结束的那份输出，其余任务照跑、之后仍以消息回传。`timeout`（秒）到点只报状态、任务继续跑；父轮 Esc 或超时取消的只是「等」，任务照跑、结果仍会回传。
 _Avoid_: 轮询、poll、join、同步等待
 
 **启用联动 (availability)**：
@@ -201,6 +201,14 @@ _Avoid_: 调用方、owner、requester、父 agent（归属关系与当轮发起
 **结果回发 (result delivery)**：
 子 agent 一轮结束（settle）时把最终 assistant 文本发给当轮 asker 的动作；没有 asker 的轮（人直接打字、收到 result、单纯 steer）不回发。
 _Avoid_: 通知、回调、completion、汇报
+
+**等候 (agent wait)**：
+`agent_job wait <id|any|all> [timeout]` 阻塞到 agent 不再 working 的动作。id 只接受真实 agent id、`any`（等下一个停下的）或 `all`（等在跑的全部），不写直接报错；`any` / `all` 只覆盖**直接子 agent**，孙与树外 agent 仍用 id 点名。停下含一轮结束、blocked、error 与进程退出，不等于产出了结果——结果照旧以消息回发。没有子 agent 在 working 时立刻返回。
+_Avoid_: 轮询、poll、join、同步等待、等任务完成
+
+**销毁倒计时 (destroy countdown)**：
+子 agent 空闲满 `destroyAfterSeconds`（默认 180 秒）后自行退出、由 hc 删掉终端的机制；`0` 表示永不销毁。只有「安静」时才计时——还有活着的子终端、运行中的后台任务、进程内子 agent 或 cron job 都不算，任何新入站立即清零。销毁只回收终端与进程，会话文件仍在磁盘上，可按 id resume。
+_Avoid_: TTL、超时、idle timeout、GC、回收
 
 **信封 (agent envelope)**：
 消息首行的一行标签 `<pi-agent from="…" addr="…" name="…" kind="ask|steer|result">`；接收方扩展在 `input` 事件里剥掉它，模型只看到正文。`kind=result` 的入站消息不设 asker，避免回环。

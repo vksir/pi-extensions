@@ -30,9 +30,9 @@ export const piBgPrompt = {
 			parameters: {
 				// 常驻·工具声明。
 				action:
-					"list: all jobs. show: one job's command or script, status, and output. kill: stop a running job. wait: block until a job finishes.",
+					"list: all jobs. show: one job's command or script, status, and output. kill: stop a running job. wait: block until a job finishes; takes an id, 'any', or 'all'.",
 				// 常驻·工具声明。
-				id: "Background job id. Required for show, kill, and wait (wait without id waits for all running jobs).",
+				id: "Background job id, or 'any' (next to finish) / 'all' (every one) for wait.",
 				// 常驻·工具声明。
 				timeout: "wait only: max seconds to block before returning. On timeout the job keeps running.",
 			},
@@ -58,6 +58,7 @@ export const piBgPrompt = {
 				`Use bash_bg for commands that may take over ${threshold}, unless their result blocks the next step.`,
 			codemodeBg: (threshold: string) =>
 				`Use codemode_bg for scripts that may take over ${threshold}, unless their result blocks the next step.`,
+			bgJob: "Use bg_job wait instead of sleeping.",
 		},
 	},
 

@@ -29,3 +29,24 @@
 - `blocked` 只覆盖扩展 UI 弹窗（`ui_prompt_start`）；pi 内置的其他等待不会自动通知 asker，需 `agent_job list` / `wait` 发现。
 - root 的终端前台是 shell，hc 原生的「子随父程序结束」不覆盖 root：正常退出靠扩展显式清理，硬崩溃会留下孤儿，`list` 标记 `orphan`，没有看门狗。
 - resume 依赖会话文件仍在磁盘；agent 的终端被销毁不影响 resume。
+
+## 增补：空闲销毁与忙探测（2026-02）
+
+长期驻留的终端会随扇出累积，每个都是完整 pi 进程。`agent` 因此增加 `destroyAfterSeconds`：子 agent 在 settle 之后自己退出，`rm: true` 顺手删掉终端；会话文件留在磁盘上，按 id `resume` 仍然成立。
+
+- **默认 180 秒，`0` 关闭**：策略随每次拉起 / resume 的调用传入，注入 `PI_AGENT_DESTROY_AFTER`，不落会话——生命周期是运行策略，不是会话内容。根 agent 没有这个 env，保持原生行为。
+- **只在「安静」时计时**：有活的子终端、运行中的后台任务、进程内子 agent 或 cron job 都不算安静。后两者由 `lib/activity.ts` 在 globalThis 上登记忙探测（pi-bg 看运行中任务，pi-cron 看 job 表），探测不到一律按「不忙」处理。
+- **新入站清零，30 秒一拍**：任何 `ask` / `steer` / 人打字 / cron 投递都重置计时；销毁最多迟到一拍；`hc.list` 失败按「忙」处理（不知道该不该杀就先不杀）。
+- **发起点在子 agent 自己**，不在拉起者：省掉「我拉起过谁」的登记表，asker 先退出也照样收尸，resume 拉起的新进程天然按本次参数重新决定生死。
+
+### 被否决的选项（增补）
+
+- **settle 后立即销毁**：一轮结束就杀，等于砍掉 `ask` / `steer` 的续聊窗口，而这是 asker 最常用的路径。
+- **父 agent 收到结果后回来 `hc.kill`**：需要在拉起者维护登记表，与「id 与终端靠推导、不落表」的决策冲突；子 agent 自己退出还能直接复用 hc 的 `rm: true`。
+- **把 `destroyAfterSeconds` 写进会话**：会话会在下次 resume 时悄悄改变运行策略，与会话文件「只记对话」的定位冲突。
+
+### 后果（增补）
+
+- 一个 `destroyAfterSeconds: 0` 的子 agent 会永久钉住父 agent（父永远有子）；同理循环 cron 会永久钉住它的 agent。要收尾只能 `kill` 或删 cron。
+- 忙探测只覆盖**本进程**：别的 pi 进程里的任务不算，这与「销毁只影响自己这棵子树」一致。
+- 倒计时期间 agent 仍是 `idle`：`ask` 照常可用，`list` / `wait` 也看不出它即将消失。

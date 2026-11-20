@@ -157,7 +157,7 @@ node --test 'tests/pi-bg.test.ts'
 
 两个工具：
 
-- `agent { prompt, name?, model?, thinking?, resume? }`：拉起子 agent，等 pi 就绪且 prompt 送达后返回 id / name，不等结果。`name` 是 hc 终端名（侧边栏显示），1–32 位 `[a-z0-9._-]`、活终端间唯一，非法或重名直接报错；省略用 agent id。`model` / `thinking` 省略时继承父 agent 当前值。结果作为消息回到当轮 asker（拉起也算一次 ask）。
+- `agent { prompt, name?, model?, thinking?, resume?, destroyAfterSeconds? }`：拉起子 agent，等 pi 就绪且 prompt 送达后返回 id / name，不等结果。`name` 是 hc 终端名（侧边栏显示），1–32 位 `[a-z0-9._-]`、活终端间唯一，非法或重名直接报错；省略用 agent id。`model` / `thinking` 省略时继承父 agent 当前值。结果作为消息回到当轮 asker（拉起也算一次 ask）。`destroyAfterSeconds` 控制空闲销毁（见下文），默认 180 秒，`0` 表示永不销毁。
 - `agent_job { action, id?, message?, timeout? }`：`list`（本 hc session 所有活 agent，带 relation / parent / depth / status）、`wait`（id 必填，只回状态，超时是 check-in）、`kill`（仅自己的后代）、`ask`（目标必须 idle，忙则报错）、`steer`（目标必须 working）。
 
 人工入口：`/agent list` 以**卡片式森林**渲染当前 hc session 的 agent 树——每棵独立的树一块（`▌` 引导），名字在前、id 在后，状态右对齐（不显示 cwd）；根显示 pi 会话名（无会话名时 `(root)`）；`●` 自己、`↑` 父 agent，父终端已消失的 agent 标「失联」。
@@ -166,10 +166,13 @@ node --test 'tests/pi-bg.test.ts'
 
 - 子 agent id 是拉起时生成的 6 位十六进制短码，pi 会话 id 推导为 `pi-<id>`；resume 按 id 找会话文件重新拉起，不需要登记表。根 agent（人启动的 pi）的 id 是它的 hc 地址。
 - `name` 只作显示；asker、会话路径等可变语义不进 hc label。发现靠创建时写入的 label `pi.agent=<id>`。
-- 拉起时注入 `PI_AGENT_ID` / `PI_AGENT_NAME` / `PI_AGENT_PARENT` / `PI_AGENT_ROOT` / `PI_AGENT_DEPTH`，子进程的扩展据此知道自己是谁、在树里的哪一层。
+- 拉起时注入 `PI_AGENT_ID` / `PI_AGENT_NAME` / `PI_AGENT_PARENT` / `PI_AGENT_ROOT` / `PI_AGENT_DEPTH`，子进程的扩展据此知道自己是谁、在树里的哪一层；另外注入 `PI_AGENT_DESTROY_AFTER`（空闲销毁秒数）。
 
 约束：
 
+- **空闲销毁**：子 agent 在 settle 之后开始计时，安静满 `destroyAfterSeconds`（默认 180 秒）就自己 `ctx.shutdown()`，pi 退出后 hc 按 `rm: true` 删掉终端；会话文件仍在磁盘上，按 id `resume` 就能回来。`0` 表示永不销毁。
+- 只有「安静」才计时：还有活的子终端、运行中的后台任务（pi-bg）、进程内子 agent（pi-subagents）或 cron job（pi-cron）都不算；后两者经 `lib/activity.ts` 的忙探测登记表汇总，没加载的扩展按「不忙」处理。任何新入站（`ask` / `steer` / 人打字 / cron 投递）立即清零。
+- 每 30 秒一拍检查，销毁最多迟到一拍；`hc.list` 读不到时按「忙」处理。一个 `destroyAfterSeconds: 0` 的子 agent 会永久钉住父 agent（父永远有子），要收尾就用 `kill` 或删 cron。
 - 树深最多三层（root → 子 → 孙），深度 2 的 agent 不再注册 `agent`。
 - resume 不允许换模型 / 思考级别：传了与会话记录不一致的值直接报错（避免缓存整体未命中）。
 - 结果正文超过 2000 行 / 50 KB 时按 bash 同款尾部截断，全文写 `pi-herdr-agent-*.log`，由 asker 自己读。
@@ -221,6 +224,7 @@ pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式�
 | `lib/agent-protocol.ts` | 子 agent 的消息信封、名称校验、结果截断（纯函数） |
 | `lib/output-file.ts` | 超长结果落临时文件（与 pi 内置输出文件同套约定） |
 | `lib/subagents.ts` | pi-subagents 注册表的子 agent 存活探测 |
+| `lib/activity.ts` | 进程级忙探测登记表：pi-bg / pi-cron 各自登记，pi-herdr-agent 汇总 |
 | `lib/cron/schedule.ts` | cron 表达式解析、下次触发、间隔换算（纯函数） |
 | `lib/cron/presentation.ts` | 排期的人类可读化与触发 prompt 包装 |
 | `lib/bg/jobs.ts` | 后台任务表：上限、淘汰、id 分配（纯函数） |

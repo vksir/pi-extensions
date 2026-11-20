@@ -97,6 +97,8 @@ export interface HcSendParams {
 export interface HcWaitParams {
 	terminal: string;
 	caller?: string;
+	/** 等这些子终端：`any` = 下一个停下的，`all` = 等到没有子在 working。 */
+	children?: "any" | "all";
 	/** 秒；超时是 check-in，不是错误。 */
 	timeout?: number;
 }
@@ -110,7 +112,8 @@ export interface HcLabelParams {
 export interface HcClient {
 	run(params: HcRunParams): Promise<HcRunResult>;
 	send(params: HcSendParams): Promise<HcSendResult>;
-	wait(params: HcWaitParams): Promise<HcWaitResult>;
+	/** `signal` 中止的是「等」本身（关掉这条连接），与 core 里的等待目标无关。 */
+	wait(params: HcWaitParams, signal?: AbortSignal): Promise<HcWaitResult>;
 	get(terminal: string): Promise<HcTerminal>;
 	list(): Promise<HcTerminal[]>;
 	label(params: HcLabelParams): Promise<HcTerminal>;
@@ -136,15 +139,21 @@ export function inHcEnv(env: NodeJS.ProcessEnv = process.env): boolean {
 /** 单次请求的兜底超时：远大于 `terminal.wait` 能给出的等待上限，只用于防 core 无响应。 */
 const REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
 
-type RawRpc = (method: string, params: unknown) => Promise<unknown>;
+type RawRpc = (method: string, params: unknown, signal?: AbortSignal) => Promise<unknown>;
 
 /**
  * 一次调用一条连接：`hello`（protocol generation 1）之后才是业务方法。
  * 响应按行切分；先到的 `error` 直接抛 HcError，其余以 hello 为界判断阶段。
  */
 function createSocketRpc(socketPath: string): RawRpc {
-	return (method, params) =>
+	return (method, params, signal) =>
 		new Promise((resolve, reject) => {
+			// 已中止就根本不发请求：`terminal.wait` 一挂上就是几分钟。
+			if (signal?.aborted) {
+				reject(new HcError("aborted", `hc ${method} aborted`));
+				return;
+			}
+
 			const socket = net.createConnection(socketPath);
 			let buffer = "";
 			let helloDone = false;
@@ -158,10 +167,17 @@ function createSocketRpc(socketPath: string): RawRpc {
 				if (settled) return;
 				settled = true;
 				clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
 				socket.destroy();
 				if (error) reject(error);
 				else resolve(result);
 			};
+
+			function onAbort(): void {
+				finish(new HcError("aborted", `hc ${method} aborted`));
+			}
+
+			signal?.addEventListener("abort", onAbort, { once: true });
 
 			const write = (name: string, payload: unknown): void => {
 				const message = {
@@ -222,8 +238,8 @@ export function createHcClient(socketPath: string): HcClient {
 		async send(params) {
 			return (await rpc("terminal.send", params)) as HcSendResult;
 		},
-		async wait(params) {
-			return (await rpc("terminal.wait", params)) as HcWaitResult;
+		async wait(params, signal) {
+			return (await rpc("terminal.wait", params, signal)) as HcWaitResult;
 		},
 		async get(terminal) {
 			return (await rpc("terminal.get", { terminal })) as HcTerminal;

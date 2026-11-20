@@ -189,6 +189,7 @@ test("列表：英文表头 + 在跑在前，已完成新到旧", () => {
 
 // ─── 扩展接线：注册、委托、回传、终止 ───
 
+import { hasBusyActivity } from "../extensions/lib/activity.ts";
 import { captureCodemodeTool, registerPiBg } from "../extensions/pi-bg.ts";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
@@ -582,7 +583,7 @@ test("bg_job wait 带 timeout：超时返回状态，任务继续跑且结果仍
 	assert.match(sent[0]!.message.content, /late output$/);
 });
 
-test("bg_job wait 省略 id 时等全部在跑任务", async () => {
+test("bg_job wait all 等全部在跑任务", async () => {
 	const { tools } = setup();
 	const resolvers: Array<(value: unknown) => void> = [];
 	const ctx = {
@@ -594,13 +595,53 @@ test("bg_job wait 省略 id 时等全部在跑任务", async () => {
 	await tools.get("bash_bg").execute("call-1", { command: "a" }, undefined, undefined, ctx);
 	await tools.get("bash_bg").execute("call-2", { command: "b" }, undefined, undefined, ctx);
 
-	const waiting = tools.get("bg_job").execute("call-3", { action: "wait" }, undefined);
+	const waiting = tools.get("bg_job").execute("call-3", { action: "wait", id: "all" }, undefined);
 	await new Promise((resolve) => setTimeout(resolve, 10));
 	for (const resolve of resolvers) resolve(outcome("bash", "ok", { exit_code: 0 }));
 
 	const result = await waiting;
 	assert.equal(result.details.jobs.length, 2);
 	assert.match(result.content[0].text, /ok/);
+});
+
+test("bg_job wait 不带 id 报错，不把省略当成 all", async () => {
+	const { tools, sent } = setup();
+	const ctx = {
+		executeTool: () => new Promise<any>(() => undefined),
+	};
+	await tools.get("bash_bg").execute("call-1", { command: "a" }, undefined, undefined, ctx);
+
+	const result = await tools.get("bg_job").execute("call-2", { action: "wait" }, undefined);
+	assert.match(result.content[0].text, /^Error: id is required for wait\./);
+	assert.equal(sent.length, 0, "报错不该交付任何东西");
+});
+
+test("bg_job wait any 只交付第一个结束的任务，其余仍回传", async () => {
+	const { tools, sent } = setup();
+	const resolvers: Array<(value: unknown) => void> = [];
+	const ctx = {
+		executeTool: () =>
+			new Promise<any>((resolve) => {
+				resolvers.push(resolve);
+			}),
+	};
+	await tools.get("bash_bg").execute("call-1", { command: "a" }, undefined, undefined, ctx);
+	await tools.get("bash_bg").execute("call-2", { command: "b" }, undefined, undefined, ctx);
+
+	const waiting = tools.get("bg_job").execute("call-3", { action: "wait", id: "any" }, undefined);
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	resolvers[0]!(outcome("bash", "first!", { exit_code: 0 }));
+
+	const result = await waiting;
+	assert.equal(result.details.jobs.length, 1);
+	assert.match(result.content[0].text, /first!/);
+
+	// 第二个任务没被这次 wait 吞掉：结束后照常以消息回传
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(sent.length, 0);
+	resolvers[1]!(outcome("bash", "second!", { exit_code: 0 }));
+	await until(() => sent.length === 1);
+	assert.match(sent[0]!.message.content, /second!/);
 });
 
 test("bg_job wait 被中止时任务继续跑，结果仍回传", async () => {
@@ -830,4 +871,17 @@ test("长命令用后台工具的规则随预算走，关闭时退回默认 5 �
 	assert.deepEqual(on.tools.get("bash_bg").promptGuidelines, [
 		"Use bash_bg for commands that may take over 90 seconds, unless their result blocks the next step.",
 	]);
+});
+
+test("running background jobs register as process activity", async () => {
+	const { tools } = setup();
+	// 永不结束的委托：任务会一直停在 running。
+	const ctx = { executeTool: () => new Promise(() => undefined) };
+
+	const started = await tools.get("bash_bg")!.execute("call-1", { command: "sleep 60" }, undefined, undefined, ctx);
+	const id = started.details.jobs[0].id;
+	assert.equal(hasBusyActivity(), true);
+
+	await tools.get("bg_job")!.execute("call-2", { action: "kill", id }, undefined, undefined, ctx);
+	assert.equal(hasBusyActivity(), false);
 });
