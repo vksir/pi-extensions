@@ -850,7 +850,11 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		while (true) {
 			const wait = await waitOrAbort({ terminal: self, children: mode, timeout: remaining() }, signal);
 			if (!wait) return fail(piHerdrAgentPrompt.results.waitAborted(), "wait");
-			if (!wait.ended) return timeoutText(stillRunning(wait));
+
+			// 消息也会以 `ended:false` 结束等待（与 timeout 的区别只在 reason），必须先看 reason。
+			if (wait.reason !== "message") {
+				if (!wait.ended) return timeoutText(stillRunning(wait));
+			}
 
 			if (wait.reason === "message") {
 				// 子 agent 把结果发过来时 hc 会以 reason=message 结束等待（children 是空的）。

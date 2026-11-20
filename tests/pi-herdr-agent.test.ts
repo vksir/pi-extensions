@@ -576,10 +576,10 @@ test("wait any 被子 agent 的结果消息唤醒时报它的状态，而不是�
 	const { pi } = await setup({ hc });
 
 	hc.wait = async () => {
-		// 结果消息到达时子已经停下
+		// 结果消息到达时子已经停下；hc 对消息给的是 ended:false（与 timeout 只差 reason）
 		hc.terminals = childAgents("idle");
 		return {
-			...waitResult({ terminal: "t4m", reason: "message", status: null, from: "t10" }),
+			...waitResult({ terminal: "t4m", ended: false, reason: "message", status: null, from: "t10" }),
 			children: [],
 		};
 	};
@@ -592,6 +592,51 @@ test("wait any 被子 agent 的结果消息唤醒时报它的状态，而不是�
 		context(),
 	);
 	assert.equal(toolResultText(result), "aaaa (reviewer): idle (turn 0).");
+});
+
+test("wait all 被消息提前叫醒时接着等，直到没人在干活", async () => {
+	const hc = new FakeHc();
+	hc.terminals = childAgents();
+	const { pi } = await setup({ hc });
+
+	const originalWait = hc.wait.bind(hc);
+	let calls = 0;
+	hc.wait = async (params: HcWaitParams) => {
+		hc.record("wait", params);
+		calls += 1;
+		if (calls === 1) {
+			// 第一个子的结果消息叫醒了等待：另一个还在干活
+			hc.terminals = [
+				...childAgents().filter((terminal) => terminal.address !== "t10"),
+				terminal({
+					address: "t10",
+					parent: "t4m",
+					name: "reviewer",
+					labels: { "pi.agent": "aaaa" },
+					status: { app: "pi", state: "idle" },
+				}),
+			];
+			return {
+				...waitResult({ terminal: "t4m", ended: false, reason: "message", status: null, from: "t10" }),
+				children: [],
+			};
+		}
+		return {
+			...waitResult({ terminal: "t4m", reason: "children", status: null }),
+			children: [waitResult({ terminal: "t11", reason: "status", status: "idle", turn: 2 })],
+		};
+	};
+
+	const result = await pi.tools.get("agent_job")!.execute(
+		"call",
+		{ action: "wait", id: "all", timeout: 30 },
+		undefined,
+		undefined,
+		context(),
+	);
+	assert.equal(calls, 3, "第一次消息结束等待 + settle 一次 + 接着等一次");
+	assert.match(toolResultText(result), /bbbb \(coder\): idle \(turn 2\)\./);
+	hc.wait = originalWait;
 });
 
 test("wait all 超时只报还在 working 的子 agent", async () => {

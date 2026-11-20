@@ -203,7 +203,7 @@ _Avoid_: 调用方、owner、requester、父 agent（归属关系与当轮发起
 _Avoid_: 通知、回调、completion、汇报
 
 **等候 (agent wait)**：
-`agent_job wait <id|any|all> [timeout]` 阻塞到 agent 不再 working 的动作。id 只接受真实 agent id、`any`（等下一个停下的）或 `all`（等在跑的全部），不写直接报错；`any` / `all` 只覆盖**直接子 agent**，孙与树外 agent 仍用 id 点名。停下含一轮结束、blocked、error 与进程退出，不等于产出了结果——结果照旧以消息回发。没有子 agent 在 working 时立刻返回。
+`agent_job wait <id|any|all> [timeout]` 阻塞到 agent 不再 working 的动作。id 只接受真实 agent id、`any`（等下一个停下的）或 `all`（等在跑的全部），不写直接报错；`any` / `all` 只覆盖**直接子 agent**，孙与树外 agent 仍用 id 点名。停下含一轮结束、blocked、error、进程退出与子 agent 发来的结果消息；它不等于「产出了结果」，结果照旧按 asker 回发。没有子 agent 在干活时立刻返回（刚拉起、还没转 working 的算在干活）；`all` 被结果消息提前叫醒时接着等剩下的。
 _Avoid_: 轮询、poll、join、同步等待、等任务完成
 
 **销毁倒计时 (destroy countdown)**：
