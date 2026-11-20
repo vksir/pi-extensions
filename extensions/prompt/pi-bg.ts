@@ -26,15 +26,13 @@ export const piBgPrompt = {
 		bgJob: {
 			// 常驻·工具声明。只讲工具是什么；动作语义在 action 的枚举描述里。
 			description:
-				"List, show, stop, or wait for background jobs started by bash_bg and codemode_bg, or promoted from bash and codemode.",
+				"List, show, or stop background jobs started by bash_bg and codemode_bg, or promoted from bash and codemode.",
 			parameters: {
 				// 常驻·工具声明。
 				action:
-					"list: all jobs. show: one job's command or script, status, and output. kill: stop a running job. wait: block until a job finishes; takes an id, 'any', or 'all'.",
+					"list: all jobs. show: one job's command or script, status, and output. kill: stop a running job.",
 				// 常驻·工具声明。
-				id: "Background job id, or 'any' (next to finish) / 'all' (every one) for wait.",
-				// 常驻·工具声明。
-				timeout: "wait only: max seconds to block before returning. On timeout the job keeps running.",
+				id: "Background job id. Required for show and kill.",
 			},
 		},
 	},
@@ -46,7 +44,7 @@ export const piBgPrompt = {
 		snippets: {
 			bashBg: "Run a bash command in the background",
 			codemodeBg: "Run a codemode script in the background",
-			bgJob: "List, show, stop, or wait for background jobs",
+			bgJob: "List, show, or stop background jobs",
 		},
 		/**
 		 * 常驻·系统提示词：Guidelines 段的规则。
@@ -58,7 +56,10 @@ export const piBgPrompt = {
 				`Use bash_bg for commands that may take over ${threshold}, unless their result blocks the next step.`,
 			codemodeBg: (threshold: string) =>
 				`Use codemode_bg for scripts that may take over ${threshold}, unless their result blocks the next step.`,
-			bgJob: "Use bg_job wait instead of sleeping.",
+			// 结束即回传：这两个规则挡住「起完任务就 sleep 干等」。
+			bashBgDone: "Do not sleep to wait for a bash_bg job; its output arrives as a message when it finishes.",
+			codemodeBgDone:
+				"Do not sleep to wait for a codemode_bg job; its result arrives as a message when it finishes.",
 		},
 	},
 
@@ -87,19 +88,6 @@ export const piBgPrompt = {
 			const noun = count === 1 ? "call" : "calls";
 			return current ? `${count} ${noun} so far, current: ${current}` : `${count} ${noun} so far`;
 		},
-
-		/** 每次调用。`wait` 超时；`refs` 是逗号分隔的 `bg_job <id>` 列表。 */
-		waitTimedOut: (waited: string, refs: string) =>
-			`bg_job wait timed out after ${waited}. Still running: ${refs}.`,
-
-		/** 每次调用。`wait` 时没有在跑的任务。 */
-		waitNoJob: () => "bg_job wait found no running job.",
-
-		/** 每次调用。`wait` 被父轮 Esc 取消。 */
-		waitAborted: () => "wait aborted. The job keeps running.",
-
-		/** 每次调用。`wait` 的目标早已回传过。 */
-		alreadyDelivered: (id: string) => `bg_job ${id} already finished. Its output was delivered as a message.`,
 
 		/** 每次调用。`kill` 成功。 */
 		killed: (id: string) => `bg_job ${id} killed.`,

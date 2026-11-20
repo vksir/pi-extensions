@@ -37,10 +37,9 @@ export const piHerdrAgentPrompt = {
 			description: "Manage the sub-agents you started. Only your own descendants can be killed.",
 			parameters: {
 				action:
-					"list: running agents. wait: block until a sub-agent stops working; takes an id, 'any', or 'all'. kill: end one of your own descendants. ask: send a request to an idle agent; busy is an error and the answer arrives as a message. steer: insert a message into a working agent.",
-				id: "Agent id, or 'any' (next to stop) / 'all' (every one) for wait.",
+					"list: running agents. kill: end one of your own descendants. ask: send a request to an idle agent; busy is an error and the answer arrives as a message. steer: insert a message into a working agent.",
+				id: "Agent id. Required for every action except list.",
 				message: "Message for ask and steer.",
-				timeout: "wait only: max seconds before returning. A timeout is a check-in, not a failure.",
 			},
 		},
 	},
@@ -51,14 +50,14 @@ export const piHerdrAgentPrompt = {
 		snippets: {
 			agent: "Start a sub-agent that reports back by message",
 			// 动作名与 action 的枚举值逐字一致，避免模型在两套词之间做映射。
-			agentJob: "List, wait, kill, ask, or steer sub-agents",
+			agentJob: "List, kill, ask, or steer sub-agents",
 		},
 		/**
-		 * 常驻·系统提示词：Guidelines 段的规则。挂在 `agent_job` 上——工具被
-		 * prepareLoadout 隐藏时规则自动消失。只防 sleep；any / all 的含义在 id 参数描述里。
+		 * 常驻·系统提示词：Guidelines 段的规则。挂在 `agent` 上——agent 不可用时规则一起消失。
+		 * 结果本来就会以消息回发，sleep 只会白占一轮。
 		 */
 		guidelines: {
-			agentJob: "Use agent_job wait instead of sleeping.",
+			agent: "Do not sleep to wait for a sub-agent; its final answer arrives as a message when it finishes.",
 		},
 	},
 
@@ -75,21 +74,6 @@ export const piHerdrAgentPrompt = {
 
 		/** 每次调用。`agent_job list` 没有 agent。 */
 		listEmpty: () => "No agents are running.",
-
-		/** 每次调用。`agent_job wait` 的结果。 */
-		waitStillRunning: (label: string, status: string, turn: number) =>
-			`${label}: still running (${status}, turn ${turn}).`,
-		waitExited: (label: string, code: string) => `${label}: exited (code ${code}).`,
-		waitStatus: (label: string, status: string, turn: number) => `${label}: ${status} (turn ${turn}).`,
-		/** 每次调用。`agent_job wait` 没有在 working 的子 agent。 */
-		noAgentWorking: () => "No agent is working.",
-		/** 每次调用。`agent_job wait` 超时；`waited` 是已格式化的「 after 5s」，未知时为空串。 */
-		waitTimedOut: (waited: string, refs: string) =>
-			`agent_job wait timed out${waited}. Still running: ${refs}.`,
-		/** 每次调用。父轮 Esc 打断了「等」。 */
-		waitAborted: () => "wait aborted. The agent keeps running.",
-		/** 每次调用。等待被一条与子 agent 无关的消息打断。 */
-		waitMessage: () => "wait ended by an incoming message.",
 
 		/** 每次调用。`agent_job kill` 成功。 */
 		killed: (id: string) => `Killed agent ${id}.`,

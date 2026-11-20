@@ -4,7 +4,7 @@
  * 三个工具 + 一个人工入口，全部与内置工具的启用状态联动：
  *   bash_bg {command, timeout?}                    bash 的后台版本
  *   codemode_bg {code}                             codemode 的后台版本
- *   bg_job {action: list | show | kill | wait, id?, timeout?}   查看 / 终止 / 等候
+ *   bg_job {action: list | show | kill, id?}           查看 / 终止
  *   /bg [kill <id>]                                人工入口，0 常驻
  *
  * 任务 id 在一切文本里都写成 `bg_job <id>`（`jobRef`）：裸 8 位十六进制 id 与子 Agent 的
@@ -30,8 +30,8 @@
  *
  * 完成回传走 `pi.sendMessage(..., { deliverAs: "steer", triggerTurn: true })`，
  * 与 Agent 后台模式同一通道：当前 turn 的工具跑完、下次 LLM 调用前投递；agent 空闲时立刻起一轮。
- * 绝不把工具入参的 signal 传给后台任务——父轮 Esc 会连坐。`bg_job wait` 接过结果时不再回传，
- * 避免同一份输出出现两次。
+ * 绝不把工具入参的 signal 传给后台任务——父轮 Esc 会连坐。结果只有一条出口：
+ * 结束后作为 `pi-bg` 消息回传；`bg_job` 不再兼任「等」。
  *
  * 存续域与会话绑定：`/new`、`/reload`、`/resume`、`/fork`、退出都会触发 `session_shutdown`，
  * 一律 abort 在跑任务；`/new` 与 `/reload` 还会重建扩展实例，任务表随之清空。唯一不伴随
@@ -81,7 +81,6 @@ import {
 	splitDelivery,
 	startText,
 	statusText,
-	waitTimeoutText,
 } from "./lib/bg/format.ts";
 import { renderLineBox, type EntryLine } from "./lib/render.ts";
 import { readExtensionSettings } from "./lib/settings.ts";
@@ -107,13 +106,9 @@ interface JobOutcome {
 
 type ToolOutcome = Awaited<ReturnType<ExtensionToolContext["executeTool"]>>;
 
-/** 在跑任务额外握着中止句柄与等待者；`bg_job kill`、`session_shutdown`、`bg_job wait` 都走它们。 */
+/** 在跑任务额外握着中止句柄；`bg_job kill` 与 `session_shutdown` 都走它。 */
 interface LiveJob extends BgJob {
 	controller: AbortController;
-	/** 等这个任务结束的回调；非空时不回传，由等待方直接取结果。 */
-	waiters: Array<() => void>;
-	/** 结果是否已经交给模型（作为自定义消息回传，或被 `bg_job wait` 接过）；避免同一份输出出现两次。 */
-	delivered: boolean;
 }
 
 interface BgMessageDetails {
@@ -134,7 +129,7 @@ type BgJobSnapshot = {
 };
 
 interface BgToolDetails {
-	action: "list" | "show" | "kill" | "wait";
+	action: "list" | "show" | "kill";
 	error?: string;
 	jobs?: BgJobSnapshot[];
 }
@@ -246,7 +241,6 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 
 	function deliver(job: LiveJob): void {
 		if (closed) return;
-		job.delivered = true;
 		pi.sendMessage<BgMessageDetails>(
 			{
 				customType: CUSTOM_TYPE,
@@ -263,108 +257,6 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 			// 与 Agent 后台模式一致：不打断当前 LLM 调用，工具跑完、下次调用前投递；空闲则立刻起一轮
 			{ deliverAs: "steer", triggerTurn: true },
 		);
-	}
-
-	/**
-	 * 等一个任务结束。只受传入的 signal 与 timeout 约束，**不会**中止任务本身：
-	 * 父轮 Esc 或超时取消的只是「等」这个动作，后台任务照跑，结果仍会回传。
-	 */
-	function waitFor(job: LiveJob, signal: AbortSignal | undefined, timeoutMs?: number): Promise<void> {
-		if (job.status !== "running") return Promise.resolve();
-		return new Promise<void>((resolve, reject) => {
-			let settled = false;
-			let timer: ReturnType<typeof setTimeout> | undefined;
-			const detach = (): void => {
-				signal?.removeEventListener("abort", onAbort);
-				if (timer !== undefined) clearTimeout(timer);
-				const index = job.waiters.indexOf(onFinished);
-				if (index >= 0) job.waiters.splice(index, 1);
-			};
-			const onFinished = (): void => {
-				if (settled) return;
-				settled = true;
-				detach();
-				resolve();
-			};
-			const onAbort = (): void => {
-				if (settled) return;
-				settled = true;
-				detach();
-				reject(new Error("wait aborted"));
-			};
-			// 超时也把 waiter 摘掉：任务结束时没有等待者，才会走正常回传，输出不会丢
-			const onTimeout = (): void => {
-				if (settled) return;
-				settled = true;
-				detach();
-				resolve();
-			};
-			job.waiters.push(onFinished);
-			if (signal?.aborted) onAbort();
-			else {
-				signal?.addEventListener("abort", onAbort, { once: true });
-				if (timeoutMs !== undefined) timer = setTimeout(onTimeout, timeoutMs);
-			}
-		});
-	}
-
-	/**
-	 * 等一组任务里**第一个**结束的；超时返回 null。
-	 * 返回前摘掉其余等待者——留着它们会让那些任务结束时以为「结果已被 wait 接过」而不回传。
-	 */
-	function waitFirst(
-		group: readonly LiveJob[],
-		signal: AbortSignal | undefined,
-		timeoutMs?: number,
-	): Promise<LiveJob | null> {
-		if (group.length === 0) return Promise.resolve(null);
-		return new Promise<LiveJob | null>((resolve, reject) => {
-			// 取快照后到挂等待者之间结束的任务：它已按无等待者回传，直接把它交回去（只报状态）
-			const already = group.find((job) => job.status !== "running");
-			if (already) {
-				resolve(already);
-				return;
-			}
-
-			let settled = false;
-			let timer: ReturnType<typeof setTimeout> | undefined;
-			const callbacks = new Map<LiveJob, () => void>();
-			const detach = (): void => {
-				signal?.removeEventListener("abort", onAbort);
-				if (timer !== undefined) clearTimeout(timer);
-				for (const [job, callback] of callbacks) {
-					const index = job.waiters.indexOf(callback);
-					if (index >= 0) job.waiters.splice(index, 1);
-				}
-			};
-			const onAbort = (): void => {
-				if (settled) return;
-				settled = true;
-				detach();
-				reject(new Error("wait aborted"));
-			};
-			const onTimeout = (): void => {
-				if (settled) return;
-				settled = true;
-				detach();
-				resolve(null);
-			};
-			for (const job of group) {
-				const callback = (): void => {
-					if (settled) return;
-					settled = true;
-					detach();
-					resolve(job);
-				};
-				callbacks.set(job, callback);
-				job.waiters.push(callback);
-			}
-			if (signal?.aborted) onAbort();
-			else {
-				signal?.addEventListener("abort", onAbort, { once: true });
-				if (timeoutMs !== undefined) timer = setTimeout(onTimeout, timeoutMs);
-			}
-		});
 	}
 
 	function newJob(
@@ -384,8 +276,6 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 			startedAt,
 			status: "running",
 			controller,
-			waiters: [],
-			delivered: false,
 		};
 		jobs.push(job);
 		pruneFinished(jobs, KEEP_FINISHED);
@@ -408,14 +298,8 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 				job.output = errorMessage(error);
 			} finally {
 				job.durationMs = Date.now() - job.startedAt;
-				const waiters = job.waiters.splice(0);
-				if (waiters.length > 0) {
-					// `bg_job wait` 正在等：结果由它的 tool result 交付，不再回传一遍
-					for (const resolve of waiters) resolve();
-				} else if (job.status === "done" || job.status === "failed") {
-					// 被 kill 的任务不回传：动手的人已经拿到 bg_job kill 的结果
-					deliver(job);
-				}
+				// 被 kill 的任务不回传：动手的人已经拿到 bg_job kill 的结果
+				if (job.status === "done" || job.status === "failed") deliver(job);
 			}
 		})();
 		return job;
@@ -585,7 +469,10 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 				label: "Bash (background)",
 				description: piBgPrompt.declarations.bashBg.description,
 				promptSnippet: piBgPrompt.system.snippets.bashBg,
-				promptGuidelines: [piBgPrompt.system.guidelines.bashBg(guidelineThreshold)],
+				promptGuidelines: [
+					piBgPrompt.system.guidelines.bashBg(guidelineThreshold),
+					piBgPrompt.system.guidelines.bashBgDone,
+				],
 				// 直接复用内置工具的 schema：pi 给 bash 加参数时这里自动跟上
 				parameters: bash.parameters,
 				prepareLoadout: hideWhenUnavailable("bash", "bash_bg"),
@@ -620,7 +507,10 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 				label: "Codemode (background)",
 				description: piBgPrompt.declarations.codemodeBg.description,
 				promptSnippet: piBgPrompt.system.snippets.codemodeBg,
-				promptGuidelines: [piBgPrompt.system.guidelines.codemodeBg(guidelineThreshold)],
+				promptGuidelines: [
+					piBgPrompt.system.guidelines.codemodeBg(guidelineThreshold),
+					piBgPrompt.system.guidelines.codemodeBgDone,
+				],
 				parameters: codemodeBackend.parameters,
 				prepareLoadout: hideWhenUnavailable("codemode", "codemode_bg"),
 
@@ -656,17 +546,15 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 			label: "Background jobs",
 			description: piBgPrompt.declarations.bgJob.description,
 			promptSnippet: piBgPrompt.system.snippets.bgJob,
-			promptGuidelines: [piBgPrompt.system.guidelines.bgJob],
 			parameters: Type.Object({
-				action: StringEnum(["list", "show", "kill", "wait"] as const, {
+				action: StringEnum(["list", "show", "kill"] as const, {
 					description: piBgPrompt.declarations.bgJob.parameters.action,
 				}),
 				id: Type.Optional(Type.String({ description: piBgPrompt.declarations.bgJob.parameters.id })),
-				timeout: Type.Optional(Type.Number({ description: piBgPrompt.declarations.bgJob.parameters.timeout })),
 			}),
 			prepareLoadout: hideWhenUnavailable(["bash", "codemode"], "bg_job", "any"),
 
-			async execute(_toolCallId, params, signal) {
+			async execute(_toolCallId, params, _signal) {
 				if (params.action === "show") {
 					if (!params.id) return fail("show", piBgPrompt.results.idRequired("show"));
 					const job = findJob(jobs, params.id);
@@ -703,94 +591,6 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 					};
 				}
 
-				if (params.action === "wait") {
-					if (!params.id) return fail("wait", piBgPrompt.results.idRequired("wait"));
-					const timeoutMs =
-						params.timeout === undefined || !Number.isFinite(params.timeout)
-							? undefined
-							: Math.max(0, params.timeout) * 1000;
-
-					if (params.id === "any") {
-						const running = runningJobs(jobs);
-						if (running.length === 0) {
-							return {
-								content: [{ type: "text" as const, text: piBgPrompt.results.waitNoJob() }],
-								details: { action: "wait" as const },
-							};
-						}
-
-						let first: LiveJob | null;
-						try {
-							first = await waitFirst(running, signal, timeoutMs);
-						} catch {
-							return fail("wait", piBgPrompt.results.waitAborted());
-						}
-
-						if (!first) {
-							const still = runningJobs(jobs);
-							return {
-								content: [{ type: "text" as const, text: waitTimeoutText(still, elapsedText(timeoutMs ?? 0)) }],
-								details: { action: "wait" as const, jobs: still.map(snapshot) },
-							};
-						}
-						// 只接过第一个结束的那份输出；其余任务继续跑、之后仍以消息回传。
-						if (first.delivered) {
-							return {
-								content: [{ type: "text" as const, text: piBgPrompt.results.alreadyDelivered(first.id) }],
-								details: { action: "wait" as const, jobs: [snapshot(first)] },
-							};
-						}
-						first.delivered = true;
-						return {
-							content: [{ type: "text" as const, text: deliveryContent(first) }],
-							details: { action: "wait" as const, jobs: [snapshot(first)] },
-						};
-					}
-
-					const targets: LiveJob[] = [];
-					if (params.id === "all") {
-						targets.push(...runningJobs(jobs));
-					} else {
-						const job = findJob(jobs, params.id);
-						if (!job) return fail("wait", piBgPrompt.results.unknownJob(params.id));
-						targets.push(job);
-					}
-					if (targets.length === 0) {
-						return {
-							content: [{ type: "text" as const, text: piBgPrompt.results.waitNoJob() }],
-							details: { action: "wait" as const },
-						};
-					}
-
-					try {
-						await Promise.all(targets.map((job) => waitFor(job, signal, timeoutMs)));
-					} catch {
-						// 只有父轮 Esc 会走到这里；任务本身不受影响，结果仍会作为消息到达
-						return fail("wait", piBgPrompt.results.waitAborted());
-					}
-
-					const parts: string[] = [];
-					// 超时结论放前面：它是这次调用的结果
-					const running = targets.filter((job) => job.status === "running");
-					if (running.length > 0) parts.push(waitTimeoutText(running, elapsedText(timeoutMs ?? 0)));
-					for (const job of targets) {
-						if (job.status === "running") continue;
-						// 已经回传过的任务不再输出一遍：模型必须先拿到 id 才能 wait，两次调用必然跨轮，
-						// 任务往往在那之前就完成了，重复输出只会浪费上下文。
-						if (job.delivered) {
-							parts.push(piBgPrompt.results.alreadyDelivered(job.id));
-							continue;
-						}
-						job.delivered = true;
-						parts.push(deliveryContent(job));
-					}
-
-					return {
-						content: [{ type: "text" as const, text: parts.join("\n\n") }],
-						details: { action: "wait" as const, jobs: targets.map(snapshot) },
-					};
-				}
-
 				return {
 					content: [{ type: "text" as const, text: listText(jobs) }],
 					details: { action: "list" as const, jobs: jobs.map(snapshot) },
@@ -800,7 +600,6 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 			renderCall(args, theme) {
 				let text = theme.fg("toolTitle", theme.bold("bg_job ")) + theme.fg("muted", args.action);
 				if (args.id) text += ` ${theme.fg("accent", args.id)}`;
-				if (args.timeout !== undefined) text += theme.fg("muted", ` timeout=${args.timeout}s`);
 				return new Text(text, 0, 0);
 			},
 

@@ -67,11 +67,6 @@ export function promoteText(job: BgJob, ran: string, activity: string): string {
 		: piBgPrompt.results.promotedCodemode(job.id, ran, activity);
 }
 
-/** `wait` 超时的返回：任务还在跑，结果仍会作为消息回传。 */
-export function waitTimeoutText(jobs: readonly BgJob[], waited: string): string {
-	return piBgPrompt.results.waitTimedOut(waited, jobs.map(jobRef).join(", "));
-}
-
 /** 完成消息的正文：头行 + 内置工具的原样输出。 */
 export function deliveryContent(job: BgJob): string {
 	const head = piBgPrompt.messages.deliveryHead(job.id, originLabel(job), job.label, statusText(job));

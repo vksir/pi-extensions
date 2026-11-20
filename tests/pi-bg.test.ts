@@ -21,7 +21,6 @@ import {
 	splitDelivery,
 	startText,
 	statusText,
-	waitTimeoutText,
 } from "../extensions/lib/bg/format.ts";
 
 function job(overrides: Partial<BgJob> = {}): BgJob {
@@ -141,13 +140,6 @@ test("晋升返回先说 bash，再说转成哪个 job", () => {
 	assert.equal(
 		promoteText(job({ kind: "codemode", origin: "promote" }), "5m00s", "7 calls so far, current: bash (2m18s)"),
 		"codemode promoted to bg_job b3f1a2c4 after 5m00s. Still running, 7 calls so far, current: bash (2m18s).",
-	);
-});
-
-test("等候超时：第一个词是超时，后面列出还在跑的任务", () => {
-	assert.equal(
-		waitTimeoutText([job({ id: "a" }), job({ id: "b" })], "30s"),
-		"bg_job wait timed out after 30s. Still running: bg_job a, bg_job b.",
 	);
 });
 
@@ -522,154 +514,6 @@ test("session_start 重入：清掉已完成记录且不重复注册", async () 
 	assert.equal((await tools.get("bg_job").execute("call-3", { action: "list" })).content[0].text, "bg_job list: no jobs.");
 });
 
-// ─── bg_job wait ───
-
-test("bg_job wait 等到结果，且不再回传", async () => {
-	const { tools, sent } = setup();
-	let resolveRun!: (value: unknown) => void;
-	const ctx = {
-		executeTool: () =>
-			new Promise<any>((resolve) => {
-				resolveRun = resolve;
-			}),
-	};
-	const started = await tools.get("bash_bg").execute("call-1", { command: "sleep 1" }, undefined, undefined, ctx);
-	const id = started.details.jobs[0].id;
-
-	const waiting = tools.get("bg_job").execute("call-2", { action: "wait", id }, undefined);
-	// 给 waitFor 一个机会先把 waiter 挂上
-	await new Promise((resolve) => setTimeout(resolve, 10));
-	resolveRun(outcome("bash", "waited!", { exit_code: 0 }));
-
-	const result = await waiting;
-	assert.match(result.content[0].text, /waited!/);
-	assert.match(result.content[0].text, new RegExp(`\\[bg_job ${id}\\]`));
-	await new Promise((resolve) => setTimeout(resolve, 20));
-	assert.equal(sent.length, 0, "wait 接过结果后不该再回传");
-});
-
-test("bg_job wait 对已回传的任务只给状态，不重复输出", async () => {
-	const { tools, sent } = setup();
-	const ctx = { executeTool: async (name: string) => outcome(name, "already-sent", { exit_code: 0 }) };
-	const started = await tools.get("bash_bg").execute("call-1", { command: "true" }, undefined, undefined, ctx);
-	const id = started.details.jobs[0].id;
-	await until(() => sent.length === 1);
-
-	const result = await tools.get("bg_job").execute("call-2", { action: "wait", id }, undefined);
-	assert.match(result.content[0].text, /already finished\. Its output was delivered as a message\./);
-	assert.doesNotMatch(result.content[0].text, /already-sent/);
-	assert.equal(sent.length, 1, "不该再回传一次");
-});
-
-test("bg_job wait 带 timeout：超时返回状态，任务继续跑且结果仍回传", async () => {
-	const { tools, sent } = setup();
-	let resolveRun!: (value: unknown) => void;
-	const ctx = {
-		executeTool: () =>
-			new Promise<any>((resolve) => {
-				resolveRun = resolve;
-			}),
-	};
-	const started = await tools.get("bash_bg").execute("call-1", { command: "sleep 60" }, undefined, undefined, ctx);
-	const id = started.details.jobs[0].id;
-
-	const result = await tools.get("bg_job").execute("call-2", { action: "wait", id, timeout: 0.05 }, undefined);
-	assert.equal(result.content[0].text, `bg_job wait timed out after 0.1s. Still running: bg_job ${id}.`);
-	assert.equal(sent.length, 0, "等待方没拿到结果，任务不该被当成已交付");
-
-	// 任务照跑；结束后因为没有等待者，结果照常以消息回传
-	resolveRun(outcome("bash", "late output", { exit_code: 0 }));
-	await until(() => sent.length === 1);
-	assert.match(sent[0]!.message.content, /late output$/);
-});
-
-test("bg_job wait all 等全部在跑任务", async () => {
-	const { tools } = setup();
-	const resolvers: Array<(value: unknown) => void> = [];
-	const ctx = {
-		executeTool: () =>
-			new Promise<any>((resolve) => {
-				resolvers.push(resolve);
-			}),
-	};
-	await tools.get("bash_bg").execute("call-1", { command: "a" }, undefined, undefined, ctx);
-	await tools.get("bash_bg").execute("call-2", { command: "b" }, undefined, undefined, ctx);
-
-	const waiting = tools.get("bg_job").execute("call-3", { action: "wait", id: "all" }, undefined);
-	await new Promise((resolve) => setTimeout(resolve, 10));
-	for (const resolve of resolvers) resolve(outcome("bash", "ok", { exit_code: 0 }));
-
-	const result = await waiting;
-	assert.equal(result.details.jobs.length, 2);
-	assert.match(result.content[0].text, /ok/);
-});
-
-test("bg_job wait 不带 id 报错，不把省略当成 all", async () => {
-	const { tools, sent } = setup();
-	const ctx = {
-		executeTool: () => new Promise<any>(() => undefined),
-	};
-	await tools.get("bash_bg").execute("call-1", { command: "a" }, undefined, undefined, ctx);
-
-	const result = await tools.get("bg_job").execute("call-2", { action: "wait" }, undefined);
-	assert.match(result.content[0].text, /^Error: id is required for wait\./);
-	assert.equal(sent.length, 0, "报错不该交付任何东西");
-});
-
-test("bg_job wait any 只交付第一个结束的任务，其余仍回传", async () => {
-	const { tools, sent } = setup();
-	const resolvers: Array<(value: unknown) => void> = [];
-	const ctx = {
-		executeTool: () =>
-			new Promise<any>((resolve) => {
-				resolvers.push(resolve);
-			}),
-	};
-	await tools.get("bash_bg").execute("call-1", { command: "a" }, undefined, undefined, ctx);
-	await tools.get("bash_bg").execute("call-2", { command: "b" }, undefined, undefined, ctx);
-
-	const waiting = tools.get("bg_job").execute("call-3", { action: "wait", id: "any" }, undefined);
-	await new Promise((resolve) => setTimeout(resolve, 10));
-	resolvers[0]!(outcome("bash", "first!", { exit_code: 0 }));
-
-	const result = await waiting;
-	assert.equal(result.details.jobs.length, 1);
-	assert.match(result.content[0].text, /first!/);
-
-	// 第二个任务没被这次 wait 吞掉：结束后照常以消息回传
-	await new Promise((resolve) => setTimeout(resolve, 20));
-	assert.equal(sent.length, 0);
-	resolvers[1]!(outcome("bash", "second!", { exit_code: 0 }));
-	await until(() => sent.length === 1);
-	assert.match(sent[0]!.message.content, /second!/);
-});
-
-test("bg_job wait 被中止时任务继续跑，结果仍回传", async () => {
-	const { tools, sent } = setup();
-	let resolveRun!: (value: unknown) => void;
-	const ctx = {
-		executeTool: () =>
-			new Promise<any>((resolve) => {
-				resolveRun = resolve;
-			}),
-	};
-	const started = await tools.get("bash_bg").execute("call-1", { command: "sleep 1" }, undefined, undefined, ctx);
-	const id = started.details.jobs[0].id;
-
-	const parent = new AbortController();
-	const waiting = tools.get("bg_job").execute("call-2", { action: "wait", id }, parent.signal);
-	await new Promise((resolve) => setTimeout(resolve, 10));
-	parent.abort();
-
-	const result = await waiting;
-	assert.match(result.details.error!, /wait aborted/);
-
-	// 取消的只是「等」，任务照跑，结果仍会作为消息到达
-	resolveRun(outcome("bash", "finally!", { exit_code: 0 }));
-	await until(() => sent.length === 1);
-	assert.match(sent[0]!.message.content, /finally!/);
-});
-
 // ─── 前台等待预算：晋升 ───
 
 interface HangingBash {
@@ -858,18 +702,21 @@ test("金样：覆盖目标的 schema 与 outputSchema 仍与内置 bash 一致"
 	]);
 });
 
-test("长命令用后台工具的规则随预算走，关闭时退回默认 5 分钟", () => {
+test("长命令用后台工具的规则随预算走，关闭时退回默认 5 分钟；两条都禁止 sleep 等结果", () => {
 	const off = setup({ promoteAfterSeconds: 0 });
 	assert.deepEqual(off.tools.get("bash_bg").promptGuidelines, [
 		"Use bash_bg for commands that may take over 5 minutes, unless their result blocks the next step.",
+		"Do not sleep to wait for a bash_bg job; its output arrives as a message when it finishes.",
 	]);
 	assert.deepEqual(off.tools.get("codemode_bg").promptGuidelines, [
 		"Use codemode_bg for scripts that may take over 5 minutes, unless their result blocks the next step.",
+		"Do not sleep to wait for a codemode_bg job; its result arrives as a message when it finishes.",
 	]);
 
 	const on = setup({ promoteAfterSeconds: 90 });
 	assert.deepEqual(on.tools.get("bash_bg").promptGuidelines, [
 		"Use bash_bg for commands that may take over 90 seconds, unless their result blocks the next step.",
+		"Do not sleep to wait for a bash_bg job; its output arrives as a message when it finishes.",
 	]);
 });
 

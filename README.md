@@ -26,8 +26,8 @@ node --test tests/*.test.ts
 | [pi-context](extensions/pi-context.ts) | `/context` 触发一次空转请求，导出这次请求的系统提示词与工具声明（含 codemode 动态描述），两者同源 |
 | [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron [间隔] [once] <prompt>`（省略间隔按 `15m`）、`/cron list`、`/cron delete [id]` |
 | [pi-btw](extensions/pi-btw.ts) | 顺带分派：仅在 herdr / herdr app 环境注册 `/btw <消息>`，新开一个标签，fork 当前会话启动 pi 并把消息作为首条消息递交；本轮还在跑时先把 fork 源截到上一个完整轮次，避免新会话继承半截 turn（见 [ADR-0008](docs/adr/0008-btw-forks-at-turn-boundary.md)） |
-| [pi-bg](extensions/pi-bg.ts) | 后台运行：`bash_bg` / `codemode_bg` 立即返回，结束后把结果作为消息回发；前台 `bash` / `codemode` 超过等待预算（默认 5 分钟）自动转成后台任务；`bg_job` 工具（list / show / kill / wait）与 `/bg` 命令查看/终止/等候，并与内置工具的启用状态联动 |
-| [pi-herdr-agent](extensions/pi-herdr-agent.ts) | 用 herdr-core（hc）的终端树跑子 agent：`agent` 拉起、`agent_job` 管理（list / wait / kill / ask / steer），结果按 asker 自动回发；`/agent list` 显示 agent 树；仅 herdr app + hc 环境生效 |
+| [pi-bg](extensions/pi-bg.ts) | 后台运行：`bash_bg` / `codemode_bg` 立即返回，结束后把结果作为消息回发；前台 `bash` / `codemode` 超过等待预算（默认 5 分钟）自动转成后台任务；`bg_job` 工具（list / show / kill）与 `/bg` 命令查看/终止，并与内置工具的启用状态联动 |
+| [pi-herdr-agent](extensions/pi-herdr-agent.ts) | 用 herdr-core（hc）的终端树跑子 agent：`agent` 拉起、`agent_job` 管理（list / kill / ask / steer），结果按 asker 自动回发；`/agent list` 显示 agent 树；仅 herdr app + hc 环境生效 |
 
 `/balance codex` 需要先通过 `/login openai-codex` 登录 ChatGPT Plus/Pro 订阅。`/balance opencode` 查 OpenCode Go 的 5 小时/周/月额度，需要先配置 `opencode-go` 的 API Key。
 
@@ -137,8 +137,8 @@ node --test 'tests/herdr.test.ts' 'tests/pi-btw.test.ts' 'tests/session-snapshot
   - 晋升后父轮 Esc 不再连坐（与后台任务一致）。
   - 等待预算 = `settings.json` 的 `pi-bg.promoteAfterSeconds`（默认 `300`，`<= 0` 关闭；关闭时连覆盖版都不注册）。
 - **任务 id 一律写成 `bg_job <id>`**：启动返回、完成消息、列表、`bg_job kill` 的回显都是 `bg_job a3307cb8 started in background` 这种形式。裸 8 位十六进制 id 与子 Agent 的 id 同形，模型会误调 `get_subagent_result`，所以 id 从不单独出现。
-- `bg_job` 工具与 `/bg` 命令：列出在跑任务与最近 20 条已完成记录；`bg_job show <id>`（或 `/bg show <id>`）打印命令/脚本、状态与输出（在跑任务给已产出的部分）；`bg_job kill <id>`（或 `/bg kill`）中止任务，连带杀掉它的进程树；`bg_job wait [id] [timeout]` 阻塞到任务结束并**直接返回输出**（省略 id 则等全部在跑任务）。`bash_bg` / `codemode_bg` 同时最多 64 个任务，超出直接拒绝（转后台的不占这个名额）。
-- `bg_job wait` 的 `timeout`（秒）是**等候**的上限，不是任务的超时：到点只返回各任务当前状态，任务继续跑、结果仍作为消息回传；省略则一直等到结束。`wait` 在任务**完成前**发起时结果直接进 tool result、不再作为消息回传；任务**已经回传过**时只给状态，不重复输出（模型必须先拿到 id 才能 wait，两次调用必然跳轮，所以后者是常态）。父轮 Esc 取消的只是「等」这个动作，同样是任务照跑、结果仍会到达。
+- `bg_job` 工具与 `/bg` 命令：列出在跑任务与最近 20 条已完成记录；`bg_job show <id>`（或 `/bg show <id>`）打印命令/脚本、状态与输出（在跑任务给已产出的部分）；`bg_job kill <id>`（或 `/bg kill`）中止任务，连带杀掉它的进程树。`bash_bg` / `codemode_bg` 同时最多 64 个任务，超出直接拒绝（转后台的不占这个名额）。
+- **没有 `wait`**：任务结束后结果**只**以 `pi-bg` 消息回传，收尾在后台完成，不阻塞任何一轮。提示词里因此各有一条 `Do not sleep to wait for a bash_bg / codemode_bg job` 的规则——sleep 干等既拿不到更快的答案，又白占一轮。
 - **与内置工具的启用状态联动**：三个工具都在 `session_start` 里注册，注册前读 `getActiveTools()`。`bash` 未启用就根本不注册 `bash_bg`，`codemode` 未启用就不注册 `codemode_bg`，两个都未启用就连 `bg_job` 也不注册。schema 直接复用 `getAllTools()` 里内置工具的那一份，所以 pi 给内置工具加参数时这里不用跟。`prepareLoadout` 只兜「会话中途被 `setActiveTools` 关掉」这条快照覆盖不到的路径。
 - **存续域与会话绑定**：`/new`、`/reload`、`/resume`、`/fork`、退出都会触发 `session_shutdown`，一律中止全部在跑任务；`/new` 与 `/reload` 还会重建扩展实例，任务表随之清空。已完成但未回传的结果随会话一起消失，与 pi-cron 同一取舍（[ADR-0001](docs/adr/0001-cron-tasks-are-process-scoped.md)）。
 - **文案**：给模型的文字全部在 `extensions/prompt/pi-bg.ts`，规则见 `extensions/prompt/README.md`。「长命令用后台工具」这条跨调用的规则写在 `bash_bg` / `codemode_bg` 的 `promptGuidelines` 里（工具被隐藏时规则自动消失），不写进返回值。
@@ -158,7 +158,7 @@ node --test 'tests/pi-bg.test.ts'
 两个工具：
 
 - `agent { prompt, name?, model?, thinking?, resume?, destroyAfterSeconds? }`：拉起子 agent，等 pi 就绪且 prompt 送达后返回 id / name，不等结果。`name` 是 hc 终端名（侧边栏显示），1–32 位 `[a-z0-9._-]`、活终端间唯一，非法或重名直接报错；省略用 agent id。`model` / `thinking` 省略时继承父 agent 当前值。结果作为消息回到当轮 asker（拉起也算一次 ask）。`destroyAfterSeconds` 控制空闲销毁（见下文），默认 180 秒，`0` 表示永不销毁。
-- `agent_job { action, id?, message?, timeout? }`：`list`（本 hc session 所有活 agent，带 relation / parent / depth / status）、`wait`（id 必填，只回状态，超时是 check-in）、`kill`（仅自己的后代）、`ask`（目标必须 idle，忙则报错）、`steer`（目标必须 working）。
+- `agent_job { action, id?, message? }`：`list`（本 hc session 所有活 agent，带 relation / parent / depth / status）、`kill`（仅自己的后代）、`ask`（目标必须 idle，忙则报错）、`steer`（目标必须 working）。子 agent 的结果按 asker 以消息回发，`agent` 的规则里因此写明「不要 sleep 等它」。
 
 人工入口：`/agent list` 以**卡片式森林**渲染当前 hc session 的 agent 树——每棵独立的树一块（`▌` 引导），名字在前、id 在后，状态右对齐（不显示 cwd）；根显示 pi 会话名（无会话名时 `(root)`）；`●` 自己、`↑` 父 agent，父终端已消失的 agent 标「失联」。
 

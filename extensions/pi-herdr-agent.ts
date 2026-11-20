@@ -97,14 +97,6 @@ const DESTROY_ENV = "PI_AGENT_DESTROY_AFTER";
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
-/**
- * 整个等待的默认时长（秒）：与 hc 的 `terminal.wait` 默认一致，只为了让超时文案能报出等了多久。
- */
-const WAIT_TIMEOUT_S = 180;
-
-/** 结果消息到达后、等子 agent 状态落地的最长时间（秒）。 */
-const SETTLE_TIMEOUT_S = 5;
-
 /** 可以向它发 ask 的状态：idle 与 done（「结束但还没被看」）都表示可以接活。 */
 const ASKABLE = new Set(["idle", "done"]);
 
@@ -150,10 +142,9 @@ interface AgentParams {
 }
 
 interface AgentJobParams {
-	action: "list" | "wait" | "kill" | "ask" | "steer";
+	action: "list" | "kill" | "ask" | "steer";
 	id?: string;
 	message?: string;
-	timeout?: number;
 }
 
 interface SessionFacts {
@@ -166,7 +157,7 @@ interface SessionFacts {
 
 /** 结构化 details 只记动作与结果，方便 UI 与测试断言。 */
 interface AgentToolDetails {
-	action?: "start" | "resume" | "list" | "wait" | "kill" | "ask" | "steer";
+	action?: "start" | "resume" | "list" | "kill" | "ask" | "steer";
 	id?: string;
 	name?: string;
 	error?: string;
@@ -203,9 +194,6 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	const injectedId = env.PI_AGENT_ID?.trim();
 	let myId = injectedId || self;
 	let myRoot = env.PI_AGENT_ROOT?.trim() || myId;
-	// 刚拉起/刚问过、还没看到它进入 working 的子 agent。没人在 working 时靠它区分「马上要开跑」
-	// 与「真的没活」——hc 的 children 等待把「已投递但还没开跑」的子当作在 working。
-	const pendingStarts = new Set<string>();
 	const myDepth = Number.parseInt(env.PI_AGENT_DEPTH ?? "0", 10) || 0;
 	// 空闲销毁：根 agent 没有这个 env（0 = 不销毁），子 agent 的秒数由拉起者按参数注入。
 	const destroyAfterSeconds = parseDestroyAfter(env[DESTROY_ENV]);
@@ -296,8 +284,6 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 
 		const envelope = parseAgentEnvelope(event.text);
 		if (!envelope) return;
-
-		if (envelope.kind === "result") pendingStarts.delete(envelope.from);
 
 		if (envelope.kind === "ask") {
 			if (pendingAsker) {
@@ -466,6 +452,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			label: "Agent",
 			description: piHerdrAgentPrompt.declarations.agent.description,
 			promptSnippet: piHerdrAgentPrompt.system.snippets.agent,
+			promptGuidelines: [piHerdrAgentPrompt.system.guidelines.agent],
 			parameters: Type.Object({
 				prompt: Type.String({ description: piHerdrAgentPrompt.declarations.agent.parameters.prompt }),
 				name: Type.Optional(Type.String({ description: piHerdrAgentPrompt.declarations.agent.parameters.name })),
@@ -521,7 +508,6 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			ctx,
 			destroyAfterSeconds: normalizeDestroyAfter(params.destroyAfterSeconds),
 		});
-		pendingStarts.add(id);
 		return ok(`Started agent ${id} as '${name}'. Its final answer will arrive as a message.`, {
 			action: "start",
 			id,
@@ -581,7 +567,6 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			ctx,
 			destroyAfterSeconds: normalizeDestroyAfter(params.destroyAfterSeconds),
 		});
-		pendingStarts.add(id);
 		return ok(piHerdrAgentPrompt.results.resumedAgent(id, name), {
 			action: "resume",
 			id,
@@ -698,21 +683,17 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			label: "Agent jobs",
 			description: piHerdrAgentPrompt.declarations.agentJob.description,
 			promptSnippet: piHerdrAgentPrompt.system.snippets.agentJob,
-			promptGuidelines: [piHerdrAgentPrompt.system.guidelines.agentJob],
 			parameters: Type.Object({
-				action: StringEnum(["list", "wait", "kill", "ask", "steer"] as const, {
+				action: StringEnum(["list", "kill", "ask", "steer"] as const, {
 					description: piHerdrAgentPrompt.declarations.agentJob.parameters.action,
 				}),
 				id: Type.Optional(Type.String({ description: piHerdrAgentPrompt.declarations.agentJob.parameters.id })),
 				message: Type.Optional(
 					Type.String({ description: piHerdrAgentPrompt.declarations.agentJob.parameters.message }),
 				),
-				timeout: Type.Optional(
-					Type.Number({ description: piHerdrAgentPrompt.declarations.agentJob.parameters.timeout }),
-				),
 			}),
 
-			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 				const typed = params as AgentJobParams;
 				try {
 					switch (typed.action) {
@@ -721,8 +702,6 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 							const rows = buildRows(terminals, myId, self);
 							return ok(formatRows(rows), { action: "list", agents: rows });
 						}
-						case "wait":
-							return await waitJob(typed, ctx, signal);
 						case "kill":
 							return await killJob(typed);
 						case "ask":
@@ -735,161 +714,6 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 				}
 			},
 		});
-	};
-
-	const waitJob = async (params: AgentJobParams, _ctx: ExtensionContext, signal?: AbortSignal) => {
-		if (!params.id) return fail(piHerdrAgentPrompt.results.errors.idRequired("wait"), "wait");
-		const timeout =
-			params.timeout !== undefined && Number.isFinite(params.timeout)
-				? Math.max(0, params.timeout)
-				: undefined;
-		if (params.id === "any" || params.id === "all") return await waitChildren(params.id, timeout, signal);
-		if (params.id === myId) return fail(piHerdrAgentPrompt.results.errors.cannotActOnSelf("wait on"), "wait", params.id);
-		const target = await requireTarget(params.id);
-		const wait = await waitOrAbort({ terminal: target.terminal.address, timeout }, signal);
-		if (!wait) return fail(piHerdrAgentPrompt.results.waitAborted(), "wait", target.row.id);
-		const label = `${target.row.id} (${target.row.name})`;
-
-		if (!wait.ended) {
-			return ok(piHerdrAgentPrompt.results.waitStillRunning(label, wait.status ?? "unknown", wait.turn), {
-				action: "wait",
-				id: target.row.id,
-			});
-		}
-		if (wait.reason === "exit") {
-			return ok(piHerdrAgentPrompt.results.waitExited(label, String(wait.exit_code ?? "?")), {
-				action: "wait",
-				id: target.row.id,
-			});
-		}
-		return ok(piHerdrAgentPrompt.results.waitStatus(label, wait.status ?? wait.reason, wait.turn), {
-			action: "wait",
-			id: target.row.id,
-		});
-	};
-
-	/** hc 的「等」；父轮 Esc 中止的只是这次等，agent 照跑。 */
-	const waitOrAbort = async (
-		params: { terminal: string; children?: "any" | "all"; timeout?: number },
-		signal?: AbortSignal,
-	): Promise<HcWaitResult | undefined> => {
-		try {
-			return await hc.wait({ ...params, caller: self }, signal);
-		} catch (error) {
-			if (error instanceof HcError && error.kind === "aborted") return undefined;
-			throw error;
-		}
-	};
-
-	/**
-	 * `any` / `all`：只看**直接子 agent**（hc 的 parent 关系），先自己判空再去等。
-	 * 子都闲着时 hc 的 `any` 会一路挂到 timeout（它只等新动静），所以判空不能省。
-	 */
-	const waitChildren = async (mode: "any" | "all", timeout: number | undefined, signal?: AbortSignal) => {
-		const listChildren = async () => {
-			const terminals = await hc.list();
-			return terminals
-				.filter((terminal) => terminal.state === "live" && terminal.parent === self)
-				.map((terminal) => ({
-					address: terminal.address,
-					id: agentIdOf(terminal),
-					name: terminal.name ?? terminal.address,
-					status: terminal.status?.state ?? "unknown",
-					turn: terminal.turn,
-				}))
-				.filter((child): child is { address: string; id: string; name: string; status: string; turn: number } =>
-					Boolean(child.id),
-				);
-		};
-
-		const watched = await listChildren();
-		if (watched.length === 0) return ok(piHerdrAgentPrompt.results.noAgentWorking(), { action: "wait" });
-
-		const labelOf = (address: string): string | undefined => {
-			const child = watched.find((candidate) => candidate.address === address);
-			return child ? `${child.id} (${child.name})` : undefined;
-		};
-
-		const linesFrom = (list: { id: string; name: string; status: string; turn: number }[]) =>
-			list.map((child) =>
-				piHerdrAgentPrompt.results.waitStatus(`${child.id} (${child.name})`, child.status, child.turn),
-			);
-
-		const timeoutText = (refs: string[]) => {
-			const waited = timeout === undefined ? ` after ${secondsText(WAIT_TIMEOUT_S)}` : ` after ${secondsText(timeout)}`;
-			return ok(piHerdrAgentPrompt.results.waitTimedOut(waited, refs.join(", ")), { action: "wait" });
-		};
-
-		const stillRunning = (wait: HcWaitResult): string[] => {
-			const labels = (wait.children ?? [])
-				.filter((child) => child.reason === "running")
-				.map((child) => labelOf(child.terminal))
-				.filter((label): label is string => Boolean(label));
-			return labels.length > 0 ? labels : watched.map((child) => `${child.id} (${child.name})`);
-		};
-
-		/** 子 agent 发来的结果消息：等它的状态落地（消息到达与状态切换之间有毫秒级竞态）。 */
-		const settle = async (address: string | null): Promise<void> => {
-			if (!address || !labelOf(address)) return;
-			await waitOrAbort({ terminal: address, timeout: SETTLE_TIMEOUT_S }, signal);
-		};
-
-		// 子都闲着时 hc 的 `any` 会一路挂到 timeout，所以先自己判空；但「刚拉起、还没转 working」
-		// 的子不能算闲着（已投递但还没开跑的轮在 hc 眼里也是在 working），所以看 pendingStarts。
-		const liveIds = new Set(watched.map((child) => child.id));
-		for (const id of pendingStarts) if (!liveIds.has(id)) pendingStarts.delete(id);
-		const starting = watched.some((child) => pendingStarts.has(child.id));
-		if (!watched.some((child) => child.status === "working") && !starting) {
-			return ok(piHerdrAgentPrompt.results.noAgentWorking(), { action: "wait" });
-		}
-
-		const deadline = timeout === undefined ? undefined : Date.now() + timeout * 1000;
-		const remaining = (): number | undefined =>
-			deadline === undefined ? undefined : Math.max(0, (deadline - Date.now()) / 1000);
-
-		while (true) {
-			const wait = await waitOrAbort({ terminal: self, children: mode, timeout: remaining() }, signal);
-			if (!wait) return fail(piHerdrAgentPrompt.results.waitAborted(), "wait");
-
-			// 消息也会以 `ended:false` 结束等待（与 timeout 的区别只在 reason），必须先看 reason。
-			if (wait.reason !== "message") {
-				if (!wait.ended) return timeoutText(stillRunning(wait));
-			}
-
-			if (wait.reason === "message") {
-				// 子 agent 把结果发过来时 hc 会以 reason=message 结束等待（children 是空的）。
-				await settle(wait.from);
-				// `all`：消息只是提前叫醒等待，还有子在干活就继续等剩下的。
-				if (mode === "all" && (await listChildren()).some((child) => child.status === "working")) continue;
-
-				const label = wait.from ? labelOf(wait.from) : undefined;
-				const fresh = wait.from ? (await listChildren()).find((child) => child.address === wait.from) : undefined;
-				if (mode === "any" && label && fresh) {
-					return ok(piHerdrAgentPrompt.results.waitStatus(label, fresh.status, fresh.turn), { action: "wait" });
-				}
-				if (mode === "any") return ok(piHerdrAgentPrompt.results.waitMessage(), { action: "wait" });
-				// `all`：消息结束且没人在干活，用最新状态报。
-				const finalLines = linesFrom(await listChildren());
-				return ok(finalLines.length > 0 ? finalLines.join("\n") : piHerdrAgentPrompt.results.noAgentWorking(), {
-					action: "wait",
-				});
-			}
-
-			// hc 的 `all` 会把早已消失的历史子终端也列进来（agent 终端是 rm 的）：只报调用时
-			// 还在的那一批，地址映射不回 id 的一律丢弃。
-			const lines = (wait.children ?? [])
-				.map((child) => ({ child, label: labelOf(child.terminal) }))
-				.filter((entry): entry is { child: HcWaitResult; label: string } => Boolean(entry.label))
-				.map(({ child, label }) =>
-					child.reason === "exit"
-						? piHerdrAgentPrompt.results.waitExited(label, String(child.exit_code ?? "?"))
-						: piHerdrAgentPrompt.results.waitStatus(label, child.status ?? child.reason, child.turn),
-				);
-
-			return ok(lines.length > 0 ? lines.join("\n") : piHerdrAgentPrompt.results.noAgentWorking(), {
-				action: "wait",
-			});
-		}
 	};
 
 	const killJob = async (params: AgentJobParams) => {
@@ -933,8 +757,6 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			// done 是「结束但还没被看」，hc 的 if 只认 idle/working，所以那一档不带 if。
 			if: status === "idle" ? "idle" : undefined,
 		});
-		// 还没进入 working 的 ask 也要算「马上要开跑」，否则紧接着的 wait 会误判成没活。
-		if (sent.started === false) pendingStarts.add(target.row.id);
 		const pending = sent.started === false ? piHerdrAgentPrompt.results.askPending() : "";
 		return ok(piHerdrAgentPrompt.results.asked(target.row.id, target.row.name, pending), {
 			action: "ask",
@@ -1504,13 +1326,6 @@ function resolveModel(ctx: ExtensionContext, reference: string): { provider: str
 			model.id.toLowerCase().includes(wanted) || (model.name ?? "").toLowerCase().includes(wanted),
 	);
 	return fuzzy.length === 1 ? { provider: fuzzy[0].provider, id: fuzzy[0].id } : undefined;
-}
-
-/** 秒 → `5s` / `1m03s`；只用于 `agent_job wait` 的超时文案。 */
-function secondsText(seconds: number): string {
-	const total = Math.max(0, Math.round(seconds));
-	if (total < 60) return `${total}s`;
-	return `${Math.floor(total / 60)}m${String(total % 60).padStart(2, "0")}s`;
 }
 
 /** core 错误码翻成人话。 */
