@@ -35,6 +35,8 @@ interface FakePi {
 	handlers: Map<string, ((...args: unknown[]) => unknown)[]>;
 	commands: Map<string, (args: string, ctx: unknown) => Promise<void> | void>;
 	entries: { type: string; data: any }[];
+	settings: { steeringMode: "all" | "one-at-a-time" };
+	getSettings: () => { steeringMode: "all" | "one-at-a-time" };
 	registerTool: (definition: {
 		name: string;
 		description: string;
@@ -52,11 +54,14 @@ function createFakePi(): FakePi {
 	const handlers: FakePi["handlers"] = new Map();
 	const commands: FakePi["commands"] = new Map();
 	const entries: FakePi["entries"] = [];
+	const settings = { steeringMode: "all" as "all" | "one-at-a-time" };
 	return {
 		tools,
 		handlers,
 		commands,
 		entries,
+		settings,
+		getSettings: () => settings,
 		registerTool(definition) {
 			tools.set(definition.name, definition);
 		},
@@ -168,6 +173,7 @@ interface FakeCtx {
 	thinkingLevel: string | undefined;
 	sessionManager: { getSessionName: () => string | undefined; getSessionId: () => string };
 	modelRegistry: { getAll: () => { provider: string; id: string; name?: string }[] };
+	ui: { notify: (message: string, type?: string) => void };
 }
 
 function context(overrides: Partial<FakeCtx> = {}): FakeCtx {
@@ -180,6 +186,7 @@ function context(overrides: Partial<FakeCtx> = {}): FakeCtx {
 			getSessionId: () => "0193a5c4-8f2b-7c3d-9e01-2b3c4d5e6f70",
 		},
 		modelRegistry: { getAll: () => [{ provider: "p", id: "m", name: "M" }] },
+		ui: { notify: () => undefined },
 		...overrides,
 	};
 }
@@ -705,6 +712,32 @@ test("root writes its short id as a terminal label on session_start", async () =
 		}),
 	);
 	assert.equal(hc.callsOf("label")[1]?.params.labels["pi.agent.root"], "000001");
+});
+
+test("warns once on session_start when steeringMode is not all", async () => {
+	const { pi } = await setup();
+	pi.settings.steeringMode = "one-at-a-time";
+	const notes: { message: string; type?: string }[] = [];
+	const ctx = context({ ui: { notify: (message, type) => notes.push({ message, type }) } });
+
+	await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+	assert.equal(notes.length, 1);
+	assert.match(notes[0].message, /one-at-a-time/);
+	assert.match(notes[0].message, /all/);
+	assert.equal(notes[0].type, "warning");
+
+	// 同一进程里的 /new、/resume 不再重复提醒。
+	await pi.emit("session_start", { type: "session_start", reason: "new" }, ctx);
+	assert.equal(notes.length, 1);
+});
+
+test("does not warn when steeringMode is all", async () => {
+	const { pi } = await setup();
+	const notes: string[] = [];
+	const ctx = context({ ui: { notify: (message) => notes.push(message) } });
+
+	await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+	assert.deepEqual(notes, []);
 });
 
 test("root short id is used for list, launch env and message envelopes", async () => {

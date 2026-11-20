@@ -192,8 +192,32 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		}
 	};
 
+	/**
+	 * steeringMode 非 all 时，多个子 agent 的结果会被 pi 逐条投递；只在本次进程启动时提醒一次。
+	 * 设置项在 /settings 里叫 Steering mode；`all` 是当前扩展期望的值。
+	 */
+	let steeringModeChecked = false;
+	const warnIfSteeringModeIsNotAll = (ctx: ExtensionContext): void => {
+		if (steeringModeChecked) return;
+		steeringModeChecked = true;
+
+		let mode: string | undefined;
+		try {
+			mode = pi.getSettings().steeringMode;
+		} catch {
+			return; // 旧 pi 没有 getSettings：不打断启动。
+		}
+		if (mode === undefined || mode === "all") return;
+
+		ctx.ui.notify(
+			`Steering mode 当前为 ${mode}，需改为 all；否则多个子 agent 的结果会被逐条投递。可以在 /settings 里修改。`,
+			"warning",
+		);
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
 		await syncRootId(ctx);
+		warnIfSteeringModeIsNotAll(ctx);
 	});
 
 	// 每轮的状态：asker 只在内存里（label 不承担可变语义），settle 后清空。
