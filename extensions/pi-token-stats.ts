@@ -5,11 +5,11 @@
  * SQLite 库；不做任何 session 文件扫描。
  *
  * 一次响应写三处（见 lib/token-stats-db.ts）：原始明细 `turn`、按天 × 模型的
- * `day_model`、按会话的 `session`。报告末尾只列**当前会话**的平均首字与平均输出速率
- * （按 token 加权），历史会话留在库里，不参与展示。
+ * `day_model`、按会话的 `session`。`/token` 显示按天用量图与模型汇总；`/token rate`
+ * 显示当前模型的时间窗速率。
  *
  * 命令：
- *   /token             — 近 7 天统计 + Input 柱状图 + 当前会话速率（默认）
+ *   /token             — 近 7 天用量图 + 模型汇总（默认）
  *   /token all         — 全部历史统计（/token 0d 亦可）
  *   /token 3d          — 近 3 天（Nd 任意天数）
  *   /token out         — 显示 Output 柱状图（可与天数组合，如 /token 7d Out）
@@ -29,7 +29,7 @@ import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { createFirstTokenTimer, createRateFooter, formatFirstToken, formatRate } from "./lib/footer-rate.ts";
 import { renderDimLines } from "./lib/render.ts";
-import { averageFirstTokenMs, averageOutputRate, type SessionRecord, type SessionUsageTotals } from "./lib/session-usage.ts";
+import type { SessionUsageTotals } from "./lib/session-usage.ts";
 import { openTokenStatsClient, type TokenStatsClient } from "./lib/token-stats-client.ts";
 import type { DayModelRow, RateRow } from "./lib/token-stats-db.ts";
 
@@ -298,38 +298,15 @@ function appendModelSummary(lines: string[], dayRows: DayModelRow[]): void {
 	lines.push("");
 }
 
-// ─── 当前会话 ───
-
-/** 只列当前会话：历史会话的记录保留在库里，不参与展示。 */
-function appendCurrentSession(lines: string[], record: SessionRecord | undefined): void {
-	lines.push("  当前会话");
-	if (!record) {
-		lines.push("  （本会话暂无记录）", "");
-		return;
-	}
-	const rate = averageOutputRate(record);
-	const first = averageFirstTokenMs(record);
-	const rateText = rate === undefined ? "-" : formatRate(rate);
-	const firstText = first === undefined ? "-" : formatFirstToken(first);
-	lines.push(`  ${record.turns} 轮 · Out ${fmt(record.usage.output)} · 平均首字 ${firstText} · 平均速率 ${rateText}`);
-	lines.push("  平均首字只统计流式中测到的响应；平均速率 = 有耗时响应的输出 token ÷ 耗时之和");
-	lines.push("");
-}
-
 /**
- * 只负责排版：按天数据已按天数过滤好，会话记录永远是当前会话。
+ * 只负责排版：按天数据已按天数过滤好。
  * 查询在 worker 里做，这里保持纯函数，方便单测。
  */
-export function renderStats(
-	dayRows: DayModelRow[],
-	session: SessionRecord | undefined,
-	days: number,
-	showOutput = false,
-): string[] {
-	const label = days === 0 ? "全部" : `近 ${days} 天`;
-	const lines: string[] = [`  📊 Token 用量趋势 (${label})`, ""];
+export function renderStats(dayRows: DayModelRow[], days: number, showOutput = false): string[] {
+	const label = days === 0 ? "All time" : `Last ${days}d`;
+	const lines: string[] = [`  📊 Token Usage · ${label}`, ""];
 	if (dayRows.length === 0) {
-		lines.push("  （暂无数据）", "");
+		lines.push("  No data.", "");
 	} else {
 		const { rows, maxInput, maxOutput } = collectChartData(dayRows);
 		const width = barWidth((process.stdout as { columns?: number })?.columns ?? 80);
@@ -343,33 +320,21 @@ export function renderStats(
 		appendModelSummary(lines, dayRows);
 	}
 
-	appendCurrentSession(lines, session);
 	return lines;
 }
 
 /** /token 的参数候选。可多写（如 `/token 7d Out`），补全时排除已写过的 */
 const TOKEN_ARGS: AutocompleteItem[] = [
-	{ value: "7d", label: "7d", description: "近 7 天（默认）" },
-	{ value: "1d", label: "1d", description: "近 1 天" },
-	{ value: "3d", label: "3d", description: "近 3 天" },
-	{ value: "14d", label: "14d", description: "近 14 天" },
-	{ value: "30d", label: "30d", description: "近 30 天" },
-	{ value: "90d", label: "90d", description: "近 90 天" },
-	{ value: "all", label: "all", description: "全部历史" },
-	{ value: "Out", label: "Out", description: "改看 Output 柱状图" },
+	{ value: "7d", label: "7d", description: "Last 7 days (default)" },
+	{ value: "all", label: "all", description: "All history" },
+	{ value: "Out", label: "Out", description: "Show Output chart" },
 ];
 
-const RATE_COMMAND: AutocompleteItem = { value: "rate", label: "rate", description: "当前模型速率（默认 1h）" };
+const RATE_COMMAND: AutocompleteItem = { value: "rate", label: "rate", description: "Current model rate (default 1h)" };
 
-/** `/token rate` 的窗口候选。 */
+/** `/token rate` 的窗口候选：只提示默认值，其他窗口仍可手写。 */
 const RATE_ARGS: AutocompleteItem[] = [
-	{ value: "1h", label: "1h", description: "过去 1 小时（默认）" },
-	{ value: "3h", label: "3h", description: "过去 3 小时" },
-	{ value: "6h", label: "6h", description: "过去 6 小时" },
-	{ value: "12h", label: "12h", description: "过去 12 小时" },
-	{ value: "24h", label: "24h", description: "过去 24 小时" },
-	{ value: "7d", label: "7d", description: "过去 7 天" },
-	{ value: "all", label: "all", description: "全部历史" },
+	{ value: "1h", label: "1h", description: "Last 1 hour (default)" },
 ];
 
 /**
@@ -460,7 +425,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("token", {
-		description: "Token 用量统计。默认近7天。参数: rate [1h|3h|...], all/Nd, Output|Out",
+		description: "Token usage. Default 7d. Args: rate [1h], all, Out",
 		getArgumentCompletions: (prefix) => tokenArgumentCompletions(prefix),
 		handler: async (args, ctx) => {
 			try {
@@ -491,11 +456,8 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// 查询走写线程：按 FIFO 一定看得到之前所有已提交的 turn，主线程不被 SQLite 阻塞
-				const [dayRows, session] = await Promise.all([
-					statsClient().dayRows(cutoffDate(days)),
-					statsClient().sessionRecord(ctx.sessionManager.getSessionId()),
-				]);
-				pi.appendEntry<TokenStatsEntry>("token-stats", { lines: renderStats(dayRows, session, days, showOutput) });
+				const dayRows = await statsClient().dayRows(cutoffDate(days));
+				pi.appendEntry<TokenStatsEntry>("token-stats", { lines: renderStats(dayRows, days, showOutput) });
 			} catch (e) {
 				ctx.ui.notify(`[error] ${(e as Error).message}`, "error");
 			}

@@ -15,15 +15,15 @@ _Avoid_: 速度、生成速度、tokens per second、TPS
 _Avoid_: 假 session、mock session
 
 **会话记录 (Session Record)**：
-token-stats 里按会话累计的用量与计时，key 是会话 id。每次 `turn_end` 并入一笔响应：轮次、用量、有耗时响应的输出与耗时、测到的首字时间。存在 SQLite 的 `session` 表；`/token` 只展示当前会话，历史会话仅留存。
+token-stats 里按会话累计的用量与计时，key 是会话 id。每次 `turn_end` 并入一笔响应：轮次、用量、有耗时响应的输出与耗时、测到的首字时间。存在 SQLite 的 `session` 表；`/token` 已不再展示会话平均，仅保留存取。
 _Avoid_: 会话统计条目、session stats
 
 **平均首字 (Average TTFT)**：
-会话里测到首字的响应之和除以样本数。首字只能在流式过程中测，样本数可能少于响应数；一次都没测到过的会话显示 `-`。
+`session` 表里的存储口径：会话里测到首字的响应之和除以样本数。报告不再展示，`/token rate` 改用 `turn` 明细的时间窗均值。
 _Avoid_: 平均延迟、平均耗时
 
 **会话平均速率 (Session Average Output Rate)**：
-该会话有耗时的响应输出 token 之和除以这些响应的耗时之和，单位 token/秒。按 token 加权，不是逐次速率的算术平均。
+`session` 表里的存储口径：该会话有耗时的响应输出 token 之和除以这些响应的耗时之和，单位 token/秒。报告不再展示。
 _Avoid_: 平均速度、平均 TPS
 
 **明细行 (Turn Record)**：
@@ -35,11 +35,11 @@ _Avoid_: 事件、日志行、raw event
 _Avoid_: 日聚合、daily stats
 
 **会话汇总 (Session Rollup)**：
-`session` 表里按会话累计的用量与计时，报告只查当前会话。旧 JSON 的 `sessions` 段迁移到这里。
+`session` 表里按会话累计的用量与计时，仍写入库里，但 `/token` 报告不再读取它。旧 JSON 的 `sessions` 段迁移到这里。
 _Avoid_: 会话记录表、session row
 
 **速率视图 (Rate View)**：
-`/token rate [窗口]` 的输出，只列当前模型的 `Avg TTFT` 与 `Avg Rate`，不显示用量；默认过去 1 小时。与 `/token` 用量报告是同一个命令的两个分支。
+`/token rate [窗口]` 的输出，只列当前模型的 `Avg TTFT` 与 `Avg Rate`，不显示用量；默认过去 1 小时。与 `/token` 用量报告是同一个命令的两个分支，报告文案统一英文。
 _Avoid_: 性能报告、speed command
 
 **时间窗 (Time Window)**：

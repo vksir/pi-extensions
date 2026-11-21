@@ -3,7 +3,7 @@ import { test } from "node:test";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { initTheme, type ExtensionContext, type ReadonlyFooterDataProvider, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { createFirstTokenTimer, createRateFooter, formatFirstToken, formatRate, insertRate, outputRate, shrinkPadding } from "../extensions/lib/footer-rate.ts";
-import { averageFirstTokenMs, averageOutputRate, recordSessionTurn, type SessionRecord, type SessionTurn } from "../extensions/lib/session-usage.ts";
+import { averageFirstTokenMs, averageOutputRate, recordSessionTurn, type SessionTurn } from "../extensions/lib/session-usage.ts";
 import { parseRateWindow, renderRate, renderStats, tokenArgumentCompletions } from "../extensions/pi-token-stats.ts";
 import type { RateRow } from "../extensions/lib/token-stats-db.ts";
 
@@ -238,49 +238,22 @@ test("averageFirstTokenMs：只平均测到的样本", () => {
 	assert.equal(averageFirstTokenMs(recordSessionTurn(undefined, turn(1_000, 100, 1_000))), undefined);
 });
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-function localDate(date: Date): string {
-	return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-}
-
-/** 报告只负责排版：会话记录在这里直接构造，落库/查询由 token-stats-db 的测试覆盖。 */
-function statsSession(at: number, output: number, durationMs?: number, firstTokenMs?: number): SessionRecord {
-	return recordSessionTurn(undefined, {
-		at,
-		name: "当前会话",
-		usage: { input: 100, output, cacheRead: 900, cacheWrite: 0, cost: 0.01 },
-		durationMs,
-		firstTokenMs,
-	});
-}
-
-test("renderStats：会话速率只显示当前会话，与天数参数无关", () => {
-	const old = new Date(Date.now() - 40 * DAY_MS);
-	const session = statsSession(old.getTime(), 600, 12_000, 1_200);
-
-	const text = renderStats([], session, 7).join("\n");
-	assert.match(text, /当前会话/);
-	assert.match(text, /1 轮 · Out 600 · 平均首字 1\.2s · 平均速率 50t\/s/);
-	// 近 7 天没有按天数据，会话区块照样显示自己的平均
-	assert.match(text, /Token 用量趋势 \(近 7 天\)/);
-	assert.match(text, /（暂无数据）/);
-
+test("renderStats：英文用量报告，不再显示当前会话", () => {
 	const dayRows = [
-		{ date: localDate(old), model: "deepseek/deepseek-chat", input: 100, output: 600, cacheRead: 900, cacheWrite: 0, cost: 0.01 },
+		{ date: "2026-11-18", model: "deepseek/deepseek-chat", input: 100, output: 600, cacheRead: 900, cacheWrite: 0, cost: 0.01 },
 	];
-	const all = renderStats(dayRows, session, 0).join("\n");
-	assert.match(all, /Tokens per Day \(Input\)/);
-	assert.match(all, /1 轮 · Out 600/);
-	// 没有会话记录时明说暂无
-	assert.match(renderStats(dayRows, undefined, 7).join("\n"), /本会话暂无记录/);
-});
+	const text = renderStats(dayRows, 7).join("\n");
+	assert.match(text, /Token Usage · Last 7d/);
+	assert.match(text, /Tokens per Day \(Input\)/);
+	assert.match(text, /Input: 1\.0k \(CH90\.00%\) · Output: 600 · \$0\.010/);
+	assert.doesNotMatch(text, /当前会话|本会话|平均首字|平均速率/);
 
-test("renderStats：当前会话没测到首字时显示占位", () => {
-	const session = statsSession(Date.now(), 100, 1_000);
-	const text = renderStats([], session, 7).join("\n");
-	assert.match(text, /平均首字 -/);
-	assert.match(text, /平均速率 100t\/s/);
+	const out = renderStats(dayRows, 7, true).join("\n");
+	assert.match(out, /Tokens per Day \(Output\)/);
+
+	const all = renderStats([], 0).join("\n");
+	assert.match(all, /Token Usage · All time/);
+	assert.match(all, /No data\./);
 });
 
 test("parseRateWindow：默认 1 小时，支持 m/h/d/all", () => {
@@ -332,15 +305,19 @@ test("renderRate：没有数据与没有计时样本的占位", () => {
 test("tokenArgumentCompletions：补全保留已写好的参数", () => {
 	const values = (prefix: string) => (tokenArgumentCompletions(prefix) ?? []).map((item) => item.value);
 
-	// 空参数：列出候选，旧的 7d / Out 仍在，新增 rate
+	// 空参数：usage 只提示 7d / all / Out，另加 rate
 	assert.ok(values("").includes("7d"));
-	assert.ok(values("").includes("rate"));
+	assert.ok(values("").includes("all"));
 	assert.ok(values("").includes("Out"));
-	// rate 子命令的窗口补全
+	assert.ok(values("").includes("rate"));
+	// rate 子命令只提示默认的 1h
 	assert.deepEqual(values("r"), ["rate"]);
-	assert.deepEqual(values("rate "), ["rate 1h", "rate 3h", "rate 6h", "rate 12h", "rate 24h", "rate 7d", "rate all"]);
-	assert.deepEqual(values("rate 3"), ["rate 3h"]);
+	assert.deepEqual(values("rate "), ["rate 1h"]);
+	assert.equal(tokenArgumentCompletions("rate 3"), null);
 	assert.equal(tokenArgumentCompletions("rate 1h "), null);
+	// 旧的 1d / 3d 等不再出现在提示里
+	assert.deepEqual(values("1"), []);
+	assert.deepEqual(values("3"), []);
 	// 单个参数：按前缀过滤
 	assert.deepEqual(values("o"), ["Out"]);
 	// 多参数：补全项带上前面的参数（pi 补全会整段替换参数文本）
