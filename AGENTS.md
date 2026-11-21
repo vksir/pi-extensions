@@ -4,6 +4,7 @@
 
 - 模型可见文案（如系统提示词、工具描述、工具返回等）一律集中放在 `extensions/prompt/`，按扩展区分文件，必须用英文。
 - 载体选择、文案规范与检查清单见 `extensions/prompt/README.md`。
+- 改动提示词时，动手前必须按 `docs/prompt-review.md` 的格式出一版前后对比表，审过再改。
 
 ### 测试规范
 

@@ -53,7 +53,7 @@ export const piBgPrompt = {
 | 跨调用的行为规则（如「长命令用后台工具」） | `promptGuidelines` |
 | 只在这次调用才需要的结果 | 工具返回 |
 
-- **一条规则只写一处**。参数语义写在参数 `description` 里，`description` 不再复述；动作枚举写在 `action` 的枚举描述里，`description` 不再列举。
+- **一条规则只写一处**。动作的语义写在工具 `description` 里，`action` 只列可选值；其余参数的语义写在参数 `description` 里，`description` 不复述。
 - **`promptGuidelines` 只对声明给模型的工具生效**：`prepareLoadout` 隐藏工具即消失，不需要额外条件判断。
 - **覆盖同名内置工具时**，`promptGuidelines` / `promptSnippet` / `description` / `outputSchema` 必须继承内置那份，否则等于静默删掉 pi 自己的规则（例如 bash 的 `You can inspect PI_* environment variables…`）。
 - 判断依据是**调用频次**：低频工具的规则放返回文本（每次调用付一次）；高频工具的规则放 `promptGuidelines`（每请求付一次，但不重复长文）。

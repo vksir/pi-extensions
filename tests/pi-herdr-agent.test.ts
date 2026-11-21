@@ -7,6 +7,7 @@ import {
 	agentSourceLine,
 	formatAgentEnvelope,
 	parseAgentEnvelope,
+	stripHcTransport,
 	truncateTail,
 	validateAgentName,
 } from "../extensions/lib/agent-protocol.ts";
@@ -40,6 +41,7 @@ interface FakePi {
 	handlers: Map<string, ((...args: unknown[]) => unknown)[]>;
 	commands: Map<string, (args: string, ctx: unknown) => Promise<void> | void>;
 	entries: { type: string; data: any }[];
+	userMessages: string[];
 	settings: { steeringMode: "all" | "one-at-a-time" };
 	getSettings: () => { steeringMode: "all" | "one-at-a-time" };
 	registerTool: (definition: {
@@ -51,6 +53,7 @@ interface FakePi {
 	registerCommand: (name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> | void }) => void;
 	registerEntryRenderer: () => void;
 	appendEntry: (type: string, data: unknown) => void;
+	sendUserMessage: (content: unknown) => void;
 	emit: (event: string, ...args: unknown[]) => Promise<unknown>;
 }
 
@@ -59,12 +62,14 @@ function createFakePi(): FakePi {
 	const handlers: FakePi["handlers"] = new Map();
 	const commands: FakePi["commands"] = new Map();
 	const entries: FakePi["entries"] = [];
+	const userMessages: string[] = [];
 	const settings = { steeringMode: "all" as "all" | "one-at-a-time" };
 	return {
 		tools,
 		handlers,
 		commands,
 		entries,
+		userMessages,
 		settings,
 		getSettings: () => settings,
 		registerTool(definition) {
@@ -79,6 +84,9 @@ function createFakePi(): FakePi {
 		registerEntryRenderer() {},
 		appendEntry(type, data) {
 			entries.push({ type, data });
+		},
+		sendUserMessage(content) {
+			userMessages.push(String(content));
 		},
 		async emit(event, ...args) {
 			let last: unknown;
@@ -250,14 +258,14 @@ test("root registers agent and agent_job; depth 2 registers only agent_job", asy
 	assert.deepEqual([...grandchild.pi.tools.keys()], ["agent_job"]);
 });
 
-test("agent 的 guideline 只禁止 sleep；agent_job 不再有 wait 相关规则", async () => {
+test("守则挂在 agent_job 上（深度 2 也有），agent 不再带守则", async () => {
 	const { pi } = await setup();
 	const agent = pi.tools.get("agent") as unknown as { promptGuidelines?: string[] };
 	const job = pi.tools.get("agent_job") as unknown as { promptGuidelines?: string[] };
-	assert.deepEqual(agent.promptGuidelines, [
-		"Do not sleep to wait for a sub-agent; its final answer arrives as a message when it finishes.",
+	assert.equal(agent.promptGuidelines, undefined);
+	assert.deepEqual(job.promptGuidelines, [
+		"Do not sleep or poll to wait for an agent you started or messaged.",
 	]);
-	assert.equal(job.promptGuidelines, undefined);
 });
 
 // ─── agent 拉起 ───
@@ -302,9 +310,9 @@ test("agent launches pi with identity env, labels and ask envelope", async () =>
 	assert.equal(send.terminal, "t10");
 	assert.equal(send.caller, "t4m");
 	const envelope = parseAgentEnvelope(String(send.text));
-	assert.equal(envelope?.kind, "ask");
+	assert.equal(envelope?.result, false);
 	assert.equal(envelope?.from, "t4m");
-	assert.equal(envelope?.addr, "t4m");
+	assert.equal(envelope?.name, undefined); // 根没有注入的名字，会话也未命名
 	assert.equal(envelope?.body, "do the thing");
 	assert.ok(text.includes(id));
 });
@@ -373,40 +381,26 @@ test("list shows relations, depth and orphans across the session", async () => {
 	assert.match(table, /dddd\s+lost\s+other\s+idle \(orphan\)/);
 });
 
-test("ask refuses a busy agent and accepts an idle one", async () => {
+test("ask never checks the target's status", async () => {
 	const hc = new FakeHc();
-	hc.terminals = [terminal({ address: "t10", name: "reviewer", labels: { "pi.agent": "aaaa" }, status: { app: "pi", state: "working" } })];
+	hc.terminals = [
+		terminal({ address: "t10", name: "reviewer", labels: { "pi.agent": "aaaa" }, status: { app: "pi", state: "working" } }),
+	];
 	const { pi } = await setup({ hc });
 
 	const busy = await pi.tools.get("agent_job")!.execute("call", { action: "ask", id: "aaaa", message: "hi" }, undefined, undefined, context());
-	assert.match(toolResultText(busy), /is working; ask works only when it is idle/);
-	assert.equal(hc.callsOf("send").length, 0);
+	assert.match(toolResultText(busy), /^Asked aaaa \(reviewer\)\.$/);
+	assert.equal(hc.callsOf("send").length, 1);
 
-	hc.terminals = [terminal({ address: "t10", name: "reviewer", labels: { "pi.agent": "aaaa" }, status: { app: "pi", state: "idle" } })];
-	const idle = await pi.tools.get("agent_job")!.execute("call", { action: "ask", id: "aaaa", message: "hi" }, undefined, undefined, context());
-	assert.match(toolResultText(idle), /^Asked aaaa \(reviewer\)/);
 	const send = hc.callsOf("send")[0].params;
-	assert.equal(send.if, "idle");
-	assert.equal(parseAgentEnvelope(String(send.text))?.kind, "ask");
+	assert.equal(send.terminal, "t10");
+	assert.equal(send.if, undefined); // 不再带状态前置条件
+	const envelope = parseAgentEnvelope(String(send.text));
+	assert.equal(envelope?.result, false);
+	assert.equal(envelope?.body, "hi");
 });
 
-test("steer only works while the target is working", async () => {
-	const hc = new FakeHc();
-	hc.terminals = [terminal({ address: "t10", labels: { "pi.agent": "aaaa" }, status: { app: "pi", state: "idle" } })];
-	const { pi } = await setup({ hc });
-
-	const idle = await pi.tools.get("agent_job")!.execute("call", { action: "steer", id: "aaaa", message: "hi" }, undefined, undefined, context());
-	assert.match(toolResultText(idle), /Use ask when it is idle/);
-	assert.equal(hc.callsOf("send").length, 0);
-
-	hc.terminals = [terminal({ address: "t10", labels: { "pi.agent": "aaaa" }, status: { app: "pi", state: "working" } })];
-	const working = await pi.tools.get("agent_job")!.execute("call", { action: "steer", id: "aaaa", message: "hi" }, undefined, undefined, context());
-	assert.match(toolResultText(working), /^Steered aaaa/);
-	assert.equal(hc.callsOf("send")[0].params.if, "working");
-	assert.equal(parseAgentEnvelope(String(hc.callsOf("send")[0].params.text))?.kind, "steer");
-});
-
-test("kill only reaches descendants", async () => {
+test("stop only reaches descendants", async () => {
 	const hc = new FakeHc();
 	hc.terminals = [
 		terminal({ address: "t4m", labels: {} }),
@@ -415,37 +409,153 @@ test("kill only reaches descendants", async () => {
 	];
 	const { pi } = await setup({ hc });
 
-	const stranger = await pi.tools.get("agent_job")!.execute("call", { action: "kill", id: "eeee" }, undefined, undefined, context());
+	const stranger = await pi.tools.get("agent_job")!.execute("call", { action: "stop", id: "eeee" }, undefined, undefined, context());
 	assert.match(toolResultText(stranger), /not your descendant/);
 	assert.equal(hc.callsOf("kill").length, 0);
 
-	const own = await pi.tools.get("agent_job")!.execute("call", { action: "kill", id: "aaaa" }, undefined, undefined, context());
-	assert.match(toolResultText(own), /^Killed agent aaaa/);
+	const own = await pi.tools.get("agent_job")!.execute("call", { action: "stop", id: "aaaa" }, undefined, undefined, context());
+	assert.match(toolResultText(own), /^Stopped agent aaaa/);
 	assert.equal(hc.callsOf("kill")[0].params.terminal, "t10");
 });
 
-test("kill reports success when rm removes the terminal before the reply", async () => {
+test("stop reports success when rm removes the terminal before the reply", async () => {
 	const hc = new FakeHc();
 	hc.terminals = [terminal({ address: "t10", labels: { "pi.agent": "aaaa" }, parent: "t4m" })];
 	hc.kill = async () => {
 		throw new HcError("not_found", "t10 was removed");
 	};
 	const { pi } = await setup({ hc });
-	const result = await pi.tools.get("agent_job")!.execute("call", { action: "kill", id: "aaaa" }, undefined, undefined, context());
-	assert.match(toolResultText(result), /^Killed agent aaaa/);
+	const result = await pi.tools.get("agent_job")!.execute("call", { action: "stop", id: "aaaa" }, undefined, undefined, context());
+	assert.match(toolResultText(result), /^Stopped agent aaaa/);
+});
+
+test("list hides anything outside self, parent, children and siblings", async () => {
+	const hc = new FakeHc();
+	hc.terminals = [
+		terminal({ address: "t4m", name: "root", labels: {} }),
+		terminal({ address: "t10", name: "me", labels: { "pi.agent": "aaaa" }, parent: "t4m" }),
+		terminal({ address: "t11", name: "sib", labels: { "pi.agent": "bbbb" }, parent: "t4m" }),
+		terminal({ address: "t12", name: "kid", labels: { "pi.agent": "cccc" }, parent: "t10" }),
+		terminal({ address: "t13", name: "grandkid", labels: { "pi.agent": "dddd" }, parent: "t12" }),
+		terminal({ address: "t20", name: "stranger", labels: { "pi.agent": "eeee" }, parent: null }),
+	];
+	const { pi } = await setup({
+		hc,
+		env: { HC_TERMINAL_ID: "t10", PI_AGENT_ID: "aaaa", PI_AGENT_DEPTH: "1" },
+	});
+
+	const result = await pi.tools.get("agent_job")!.execute("call", { action: "list" }, undefined, undefined, context());
+	const rows = result.details.agents as AgentRow[];
+	assert.deepEqual(rows.map((row) => row.id).sort(), ["aaaa", "bbbb", "cccc", "t4m"]);
+	// 孙辈与别的树都不可见。
+	assert.ok(!rows.some((row) => row.id === "dddd" || row.id === "eeee"));
+});
+
+test("dispatch: idle starts a round, the owner steers, others queue and merge", async () => {
+	const hc = new FakeHc();
+	hc.terminals = [
+		terminal({ address: "t7", labels: { "pi.agent": "aaaa" } }),
+		terminal({ address: "t8", labels: { "pi.agent": "bbbb" } }),
+		terminal({ address: "t9", labels: { "pi.agent": "dddd" } }),
+	];
+	const { pi } = await setup({ hc, env: { PI_AGENT_ID: "cccc", PI_AGENT_DEPTH: "1" } });
+
+	// 空闲：第一条放行，派活人 = aaaa。
+	const firstText = formatAgentEnvelope({ from: "aaaa", body: "task A" });
+	assert.deepEqual(await pi.emit("input", { type: "input", text: firstText }), {
+		action: "transform",
+		text: firstText,
+	});
+	await pi.emit("agent_start");
+
+	// 派活人插话：放行（pi 原生 steer）。
+	const moreText = formatAgentEnvelope({ from: "aaaa", body: "more" });
+	assert.deepEqual(
+		await pi.emit("input", { type: "input", text: moreText, streamingBehavior: "steer" }),
+		{ action: "transform", text: moreText },
+	);
+
+	// 别人：吞掉并排队。
+	assert.deepEqual(
+		await pi.emit("input", {
+			type: "input",
+			text: formatAgentEnvelope({ from: "bbbb", body: "task B1" }),
+			streamingBehavior: "steer",
+		}),
+		{ action: "handled" },
+	);
+	assert.deepEqual(
+		await pi.emit("input", {
+			type: "input",
+			text: formatAgentEnvelope({ from: "dddd", body: "task Z" }),
+			streamingBehavior: "steer",
+		}),
+		{ action: "handled" },
+	);
+	// 同一个发送方再发：合进他那一条，位置还在 Z 前面。
+	assert.deepEqual(
+		await pi.emit("input", {
+			type: "input",
+			text: formatAgentEnvelope({ from: "bbbb", body: "task B2" }),
+			streamingBehavior: "steer",
+		}),
+		{ action: "handled" },
+	);
+
+	// 收工：回发 aaaa，然后起队首（bbbb 的合并消息）。
+	await pi.emit("agent_end", {
+		type: "agent_end",
+		messages: [{ role: "assistant", content: [{ type: "text", text: "done A" }] }],
+	});
+	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, context());
+
+	const sends = hc.callsOf("send");
+	assert.equal(sends.length, 1);
+	assert.equal(sends[0].params.terminal, "t7");
+	const reply = parseAgentEnvelope(String(sends[0].params.text));
+	assert.equal(reply?.result, true);
+	assert.equal(reply?.body, "done A");
+
+	assert.equal(pi.userMessages.length, 1);
+	const next = parseAgentEnvelope(pi.userMessages[0]);
+	assert.equal(next?.from, "bbbb");
+	assert.equal(next?.body, "task B1\n\ntask B2");
+
+	// 下一轮收工：回发 bbbb，然后才起 Z。
+	await pi.emit("agent_start");
+	await pi.emit("agent_end", {
+		type: "agent_end",
+		messages: [{ role: "assistant", content: [{ type: "text", text: "done B" }] }],
+	});
+	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, context());
+	assert.equal(hc.callsOf("send")[1].params.terminal, "t8");
+	assert.equal(parseAgentEnvelope(pi.userMessages[1])?.from, "dddd");
+});
+
+test("result messages are passed through and never replied to", async () => {
+	const hc = new FakeHc();
+	const { pi } = await setup({ hc, env: { PI_AGENT_ID: "abcd", PI_AGENT_DEPTH: "1" } });
+
+	const resultText = formatAgentEnvelope({ result: true, from: "zzzz", body: "here is the answer" });
+	assert.deepEqual(await pi.emit("input", { type: "input", text: resultText }), {
+		action: "transform",
+		text: resultText,
+	});
+	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, context());
+	assert.equal(hc.callsOf("send").length, 0);
 });
 
 // ─── 入站消息与结果回发 ───
 
-test("ask envelope is stripped and its sender receives the final answer", async () => {
+test("inbound ask keeps the sender line and its sender receives the final answer", async () => {
 	const hc = new FakeHc();
+	hc.terminals = [terminal({ address: "t7", labels: { "pi.agent": "zzzz" } })];
 	const { pi } = await setup({ hc, env: { PI_AGENT_ID: "abcd", PI_AGENT_NAME: "worker", PI_AGENT_DEPTH: "1" } });
 
-	const transformed = await pi.emit("input", {
-		type: "input",
-		text: formatAgentEnvelope({ kind: "ask", from: "zzzz", addr: "t7", name: "boss", body: "do the thing" }),
-	});
-	assert.deepEqual(transformed, { action: "transform", text: "do the thing" });
+	const askText = formatAgentEnvelope({ from: "zzzz", name: "boss", body: "do the thing" });
+	const passed = await pi.emit("input", { type: "input", text: askText });
+	// 首行留给模型看，不再剥；只有 hc 包装会被剥掉。
+	assert.deepEqual(passed, { action: "transform", text: askText });
 
 	await pi.emit("agent_end", {
 		type: "agent_end",
@@ -460,42 +570,72 @@ test("ask envelope is stripped and its sender receives the final answer", async 
 	assert.equal(send.terminal, "t7");
 	assert.equal(send.caller, "t4m");
 	const envelope = parseAgentEnvelope(String(send.text));
-	assert.equal(envelope?.kind, "result");
+	assert.equal(envelope?.result, true);
 	assert.equal(envelope?.from, "abcd");
-	assert.equal(envelope?.body, "[agent abcd · worker]\nall done");
+	assert.equal(envelope?.name, "worker");
+	assert.equal(envelope?.body, "all done");
 });
 
-test("result envelopes never set an asker", async () => {
+test("a reply to a peer that is gone is dropped and noted, not retried", async () => {
 	const hc = new FakeHc();
+	hc.terminals = [];
 	const { pi } = await setup({ hc, env: { PI_AGENT_ID: "abcd", PI_AGENT_DEPTH: "1" } });
 
-	await pi.emit("input", {
-		type: "input",
-		text: formatAgentEnvelope({ kind: "result", from: "zzzz", addr: "t7", body: "[agent zzzz]\nhi" }),
+	await pi.emit("input", { type: "input", text: formatAgentEnvelope({ from: "zzzz", body: "q" }) });
+	await pi.emit("agent_end", {
+		type: "agent_end",
+		messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
 	});
 	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, context());
+
 	assert.equal(hc.callsOf("send").length, 0);
+	assert.ok(pi.entries.some((entry) => String(entry.data?.text ?? "").includes("replay to zzzz failed")));
+});
+
+test("quit notifies the owner and everyone still queued", async () => {
+	const hc = new FakeHc();
+	hc.terminals = [
+		terminal({ address: "t7", labels: { "pi.agent": "aaaa" } }),
+		terminal({ address: "t8", labels: { "pi.agent": "bbbb" } }),
+	];
+	const { pi } = await setup({ hc, env: { PI_AGENT_ID: "abcd", PI_AGENT_DEPTH: "1" } });
+
+	await pi.emit("input", { type: "input", text: formatAgentEnvelope({ from: "aaaa", body: "task A" }) });
+	await pi.emit("agent_start");
+	await pi.emit("input", {
+		type: "input",
+		text: formatAgentEnvelope({ from: "bbbb", body: "task B" }),
+		streamingBehavior: "steer",
+	});
+
+	await pi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context());
+
+	const bodies = hc.callsOf("send").map((call) => parseAgentEnvelope(String(call.params.text))?.body);
+	assert.ok(bodies.some((body) => body === "agent abcd exited before answering."));
+	assert.ok(bodies.some((body) => body === "agent abcd exited. Your task was not processed."));
 });
 
 test("empty answers and aborted runs still report back", async () => {
 	const hc = new FakeHc();
+	hc.terminals = [terminal({ address: "t7", labels: { "pi.agent": "aaaa" } })];
 	const { pi } = await setup({ hc, env: { PI_AGENT_ID: "abcd", PI_AGENT_DEPTH: "1" } });
 
-	await pi.emit("input", { type: "input", text: "<pi-agent from=\"a\" addr=\"t7\" kind=\"ask\">\nq" });
+	await pi.emit("input", { type: "input", text: formatAgentEnvelope({ from: "aaaa", body: "q" }) });
 	await pi.emit("agent_settled", { type: "agent_settled", aborted: true }, context());
 	assert.match(String(hc.callsOf("send")[0].params.text), /Run aborted\./);
 
-	await pi.emit("input", { type: "input", text: "<pi-agent from=\"a\" addr=\"t7\" kind=\"ask\">\nq" });
+	await pi.emit("input", { type: "input", text: formatAgentEnvelope({ from: "aaaa", body: "q" }) });
 	await pi.emit("agent_end", { type: "agent_end", messages: [] });
 	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, context());
 	assert.match(String(hc.callsOf("send")[1].params.text), /No text output this turn\./);
 });
 
-test("blocked dialog notifies the asker once per span", async () => {
+test("blocked dialog notifies the owner once per span", async () => {
 	const hc = new FakeHc();
+	hc.terminals = [terminal({ address: "t7", labels: { "pi.agent": "aaaa" } })];
 	const { pi } = await setup({ hc, env: { PI_AGENT_ID: "abcd", PI_AGENT_DEPTH: "1" } });
 
-	await pi.emit("input", { type: "input", text: "<pi-agent from=\"a\" addr=\"t7\" kind=\"ask\">\nq" });
+	await pi.emit("input", { type: "input", text: formatAgentEnvelope({ from: "aaaa", body: "q" }) });
 	await pi.emit("ui_prompt_start", { type: "ui_prompt_start", reason: "ui_prompt", kind: "confirm", title: "Allow?" });
 	await pi.emit("ui_prompt_start", { type: "ui_prompt_start", reason: "ui_prompt", kind: "confirm", title: "Allow?" });
 	assert.equal(hc.callsOf("send").length, 1);
@@ -508,9 +648,10 @@ test("blocked dialog notifies the asker once per span", async () => {
 
 test("long answers are truncated and spilled to a file", async () => {
 	const hc = new FakeHc();
+	hc.terminals = [terminal({ address: "t7", labels: { "pi.agent": "aaaa" } })];
 	const { pi } = await setup({ hc, env: { PI_AGENT_ID: "abcd", PI_AGENT_DEPTH: "1" } });
 
-	await pi.emit("input", { type: "input", text: "<pi-agent from=\"a\" addr=\"t7\" kind=\"ask\">\nq" });
+	await pi.emit("input", { type: "input", text: formatAgentEnvelope({ from: "aaaa", body: "q" }) });
 	const big = "x".repeat(60 * 1024);
 	await pi.emit("agent_end", { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: big }] }] });
 	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, context());
@@ -757,17 +898,29 @@ test("resume applies destroyAfterSeconds from the call, not from the session", a
 // ─── 纯函数 ───
 
 test("envelope round-trips and rejects foreign text", () => {
-	const text = formatAgentEnvelope({ kind: "ask", from: "a7k2", addr: "t7", name: "reviewer", body: "hi\nthere" });
-	assert.equal(
-		text,
-		'<pi-agent from="a7k2" addr="t7" name="reviewer" kind="ask">\nhi\nthere',
-	);
-	const parsed = parseAgentEnvelope(text);
-	assert.deepEqual(parsed, { kind: "ask", from: "a7k2", addr: "t7", name: "reviewer", body: "hi\nthere" });
+	const text = formatAgentEnvelope({ from: "a7k2", name: "reviewer", body: "hi\nthere" });
+	assert.equal(text, '<agent a7k2 "reviewer">\nhi\nthere');
+	assert.deepEqual(parseAgentEnvelope(text), {
+		from: "a7k2",
+		name: "reviewer",
+		result: false,
+		body: "hi\nthere",
+	});
+
+	const reply = formatAgentEnvelope({ from: "a7k2", result: true, body: "done" });
+	assert.equal(reply, "<agent a7k2 result>\ndone");
+	assert.deepEqual(parseAgentEnvelope(reply), { from: "a7k2", name: undefined, result: true, body: "done" });
 
 	assert.equal(parseAgentEnvelope("hello world"), undefined);
-	assert.equal(parseAgentEnvelope('<pi-agent from="a" addr="t7" kind="nope">\nx'), undefined);
-	assert.equal(parseAgentEnvelope('<pi-agent from="a" kind="ask">\nx'), undefined);
+	assert.equal(parseAgentEnvelope('<pi-agent from="a" addr="t7" kind="ask">\nx'), undefined);
+	assert.equal(parseAgentEnvelope("<agent>\nx"), undefined);
+	// 没有正文也认：空着正文的发现在收工时不会发生，但解析器不该因此乱喷。
+	assert.deepEqual(parseAgentEnvelope('<agent a7k2 "boss">'), {
+		from: "a7k2",
+		name: "boss",
+		result: false,
+		body: "",
+	});
 });
 
 test("agent names follow the herdr-core terminal rule", () => {
@@ -776,8 +929,9 @@ test("agent names follow the herdr-core terminal rule", () => {
 	for (const bad of ["", "Reviewer", "fix login", "代码审查", "a".repeat(33)]) {
 		assert.match(String(validateAgentName(bad)), /name must be/);
 	}
-	assert.equal(agentSourceLine("a7k2", "reviewer"), "[agent a7k2 · reviewer]");
-	assert.equal(agentSourceLine("a7k2"), "[agent a7k2]");
+	assert.equal(agentSourceLine("a7k2", "reviewer"), '<agent a7k2 "reviewer">');
+	assert.equal(agentSourceLine("a7k2"), "<agent a7k2>");
+	assert.equal(agentSourceLine("a7k2", "reviewer", true), '<agent a7k2 "reviewer" result>');
 });
 
 test("truncateTail keeps the tail within both limits", () => {
@@ -860,18 +1014,16 @@ test("rows include a stable sort and table header", () => {
 
 test("hc transport wrapper is unwrapped before the envelope", () => {
 	const wrapped = `<hc from="t4m">${formatAgentEnvelope({
-		kind: "ask",
 		from: "a7k2",
-		addr: "t7",
 		body: "hi",
 	})}</hc>`;
 	assert.deepEqual(parseAgentEnvelope(wrapped), {
-		kind: "ask",
 		from: "a7k2",
-		addr: "t7",
 		name: undefined,
+		result: false,
 		body: "hi",
 	});
+	assert.equal(stripHcTransport(wrapped), formatAgentEnvelope({ from: "a7k2", body: "hi" }));
 });
 
 function treeText(line: TreeLine): string {

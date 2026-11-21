@@ -190,6 +190,10 @@ _Avoid_: 进程级、全局、persistent
 
 ### 子 agent（pi-herdr-agent）
 
+**轮次 (round)**：
+agent 从空闲被一条消息叫醒，经过一个或多个模型请求（每次含工具调用），到收工（`agent_settled`）为止的整段。一条入站消息起一个轮次，**这条消息的发送方就是这个轮次的派活人**；轮次进行中只有派活人再发来的消息算插话（不另起轮次），其他人的消息排队，各自起一个轮次、各自收工。pi 自己的 `turn`（一次 assistant 响应 + 它引发的工具调用）与 `run`（一次提交到不再需要新请求）都比轮次细或不等长，不要借用。
+_Avoid_: 一次运行、run、回合、T、轮
+
 **herdr 子 agent (agent)**：
 由 `agent` 工具在 headless hc 终端里拉起的交互式 pi；每个都是独立进程、独立 pi 会话，按 hc 的 parent 关系组成树。与 pi-subagents 的进程内子 agent 是两种形态。
 _Avoid_: 进程内子 agent、subagent、分身、worker
@@ -202,21 +206,25 @@ _Avoid_: 会话 id、uuid、handle、agent 名
 子 agent 的 hc 终端名，创建时固定，herdr-app 侧边栏显示的就是它；1–32 位 `[a-z0-9._-]`，活终端间唯一，非法或重名直接报错。根 agent 没有自己的 hc 名，`/agent list` 里的显示名取 pi 终端标题（`/name` 的会话名，未命名时 `π - <cwd>`），不取 hc 终端名。只作显示，寻址一律用 agent id。
 _Avoid_: label、别名、标题、会话名
 
-**asker（当轮提问者）**：
-发起当前这一轮对话的 agent：可能是拉起者，也可能是后来通过 `agent_job ask` 提问的任意 agent。只活在接收方进程内存里，一轮 settle 后清空；拉起时的 prompt 也算一次 ask。
-_Avoid_: 调用方、owner、requester、父 agent（归属关系与当轮发起是两件事）
+**派活人 (owner)**：
+叫醒当前这一轮的那条消息的发送方。一轮只有一个派活人，只活在接收方进程内存里。收工时把本轮最后一段回答自动发回去的就是它。派活人跨过中止保留：只有新的普通消息能换派活人。
+_Avoid_: 调用方、提问者、asker、requester、父 agent（归属关系与当轮发起是两件事）
 
-**结果回发 (result delivery)**：
-子 agent 一轮结束（settle）时把最终 assistant 文本发给当轮 asker 的动作；没有 asker 的轮（人直接打字、收到 result、单纯 steer）不回发。
-_Avoid_: 通知、回调、completion、汇报
+**自动回发 (auto reply)**：
+收工时扩展自己把本轮最后一段 assistant 文本发回给派活人的动作，不经过模型、不需要模型调任何工具。只有 `agent_job ask` 起的轮次会回发；自动回发本身、人打字、被中止的轮次都不回发（否则 A 与 C 会无限来回）。
+_Avoid_: 通知、回调、completion、汇报、结果回发
+
+**排队 (queue)**：
+agent 忙着时，非派活人发来的消息不进它的上下文，按发送方攒在扩展内存里，各自起一个轮次。**按发送方聚合**：同一个发送方在排队里最多只有一条，新消息并进他那一条，位置不变，最终只回发一次。
+_Avoid_: 等待队列、backlog、待办
 
 **销毁倒计时 (destroy countdown)**：
-子 agent 空闲满 `destroyAfterSeconds`（默认 180 秒）后自行退出、由 hc 删掉终端的机制；`0` 表示永不销毁。只有「安静」时才计时——还有活着的子终端、运行中的后台任务、进程内子 agent 或 cron job 都不算，任何新入站立即清零。销毁只回收终端与进程，会话文件仍在磁盘上，可按 id resume。
+子 agent 空闲满 `destroyAfterSeconds`（默认 180 秒）后自行退出、由 hc 删掉终端的机制；`0` 表示永不销毁。只有「安静」时才计时——还有活着的子终端、运行中的后台任务、进程内子 agent、cron job，或排队里还有没处理的消息，都不算安静。任何新入站立即清零。销毁只回收终端与进程，会话文件仍在磁盘上，可按 id resume。
 _Avoid_: TTL、超时、idle timeout、GC、回收
 
-**信封 (agent envelope)**：
-消息首行的一行标签 `<pi-agent from="…" addr="…" name="…" kind="ask|steer|result">`；接收方扩展在 `input` 事件里剥掉它，模型只看到正文。`kind=result` 的入站消息不设 asker，避免回环。
-_Avoid_: header、前缀、metadata、标记
+**消息首行 (agent source line)**：
+每条 agent 消息正文的第一行，`<agent 7f3a "reviewer">`，自动回发多一个 `result`：`<agent 7f3a "reviewer" result>`。接收方扩展读它判定发送方与类型，模型也看得到（知道这活是谁派的）。不再剥离，也不写发送方地址：寻址一律用 id。
+_Avoid_: 信封、header、前缀、metadata、标记
 
 **会话推导 (derived session id)**：
 子 agent 的 pi 会话 id 由 agent id 确定性推导为 `pi-<agent id>`；resume 时按它扫 `sessions/*/` 找会话文件，不需要任何登记表。根 agent 反过来：id 是从自己的会话 id 尾部截出来的。

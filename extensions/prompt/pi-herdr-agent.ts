@@ -1,13 +1,14 @@
 /**
  * pi-herdr-agent 的模型可见文案。
  *
- * 呈现场景见每条注释。规则见 ./README.md。
+ * 呈现场景见每条注释。规则见 ./README.md，改动前的审核流程见 docs/prompt-review.md。
  * 本文件不 import 任何扩展代码：只收已格式化的原始值。
  *
- * 去重口径（2026-02）：`agent` 的描述不再复述 `name` / `model` / `thinking` / `resume` /
- * `destroyAfterSeconds` 的规则；
- * `agent_job` 的动作枚举只出现在 snippet（索引）与 `action` 枚举（语义）两处，
- * 「忙是错误」「答案作为消息到达」「只能杀自己的后代」各只留一份。
+ * 去重口径：
+ * - 动作的语义在工具描述里，`action` 只列可选值。
+ * - 「答案会以消息回来」写在工具描述里，返回文本不再复述。
+ * - 「不要睡等」只在守则里，守则挂 `agent_job`（最深一层没有 `agent` 工具）。
+ * - 可见范围不进文案：模型看不到的 agent，本来就不会出现在它的参数里。
  */
 
 /** 错误结果的统一前缀。 */
@@ -20,7 +21,7 @@ export const piHerdrAgentPrompt = {
 		agent: {
 			// 常驻·工具声明。参数规则只在参数描述里，这里不再复述。
 			description:
-				"Start a sub-agent in its own terminal. It runs a separate pi session and sends its final answer back as a message.",
+				"Start a sub-agent in its own terminal. It runs a separate pi session; the answer comes back as a message when it finishes.",
 			parameters: {
 				prompt: "The task for the sub-agent.",
 				name: "Sidebar name: 1-32 chars of a-z, 0-9, '.', '_' or '-', unique among running agents. Defaults to the agent id.",
@@ -33,13 +34,15 @@ export const piHerdrAgentPrompt = {
 			},
 		},
 		agentJob: {
-			// 常驻·工具声明。跨动作的权限约束；单动作语义在 action 枚举里。
-			description: "Manage the sub-agents you started. Only your own descendants can be killed.",
+			// 常驻·工具声明。三个动作的语义都写在这里。
+			description:
+				"The list action returns the running agents. " +
+				"The ask action sends a message and the answer comes back as a message when the target finishes; a busy target queues it. " +
+				"The stop action ends one of your own descendants.",
 			parameters: {
-				action:
-					"list: running agents. kill: end one of your own descendants. ask: send a request to an idle agent; busy is an error and the answer arrives as a message. steer: insert a message into a working agent.",
+				action: "One of: list, ask, stop.",
 				id: "Agent id. Required for every action except list.",
-				message: "Message for ask and steer.",
+				message: "Message for ask.",
 			},
 		},
 	},
@@ -50,14 +53,14 @@ export const piHerdrAgentPrompt = {
 		snippets: {
 			agent: "Start a sub-agent that reports back by message",
 			// 动作名与 action 的枚举值逐字一致，避免模型在两套词之间做映射。
-			agentJob: "List, kill, ask, or steer sub-agents",
+			agentJob: "List, message, or stop sub-agents",
 		},
 		/**
-		 * 常驻·系统提示词：Guidelines 段的规则。挂在 `agent` 上——agent 不可用时规则一起消失。
-		 * 结果本来就会以消息回发，sleep 只会白占一轮。
+		 * 常驻·系统提示词：Guidelines 段的规则。挂在 `agent_job` 上——它全深度都有，
+		 * 而 `agent` 在树深上限那一层不会注册。
 		 */
 		guidelines: {
-			agent: "Do not sleep to wait for a sub-agent; its final answer arrives as a message when it finishes.",
+			agentJob: "Do not sleep or poll to wait for an agent you started or messaged.",
 		},
 	},
 
@@ -65,28 +68,19 @@ export const piHerdrAgentPrompt = {
 
 	results: {
 		/** 每次调用。`agent` 启动成功。 */
-		startedAgent: (id: string, name: string) =>
-			`Started agent ${id} as '${name}'. Its final answer will arrive as a message.`,
+		startedAgent: (id: string, name: string) => `Started agent ${id} as '${name}'.`,
 
 		/** 每次调用。`agent` resume 成功。 */
-		resumedAgent: (id: string, name: string) =>
-			`Resumed agent ${id} as '${name}'. Its final answer will arrive as a message.`,
+		resumedAgent: (id: string, name: string) => `Resumed agent ${id} as '${name}'.`,
 
 		/** 每次调用。`agent_job list` 没有 agent。 */
 		listEmpty: () => "No agents are running.",
 
-		/** 每次调用。`agent_job kill` 成功。 */
-		killed: (id: string) => `Killed agent ${id}.`,
+		/** 每次调用。`agent_job ask` 投递成功。 */
+		asked: (id: string, name: string) => `Asked ${id} (${name}).`,
 
-		/** 每次调用。`agent_job ask` 投递成功；`pending` 是「还没开始干活」的补充。 */
-		asked: (id: string, name: string, pending: string) =>
-			`Asked ${id} (${name}). Its answer will arrive as a message when the turn ends.${pending}`,
-
-		/** 每次调用。`ask` 已投递但对方尚未开始。 */
-		askPending: () => " It has not started working yet.",
-
-		/** 每次调用。`agent_job steer` 成功。 */
-		steered: (id: string, name: string) => `Steered ${id} (${name}).`,
+		/** 每次调用。`agent_job stop` 成功。 */
+		stopped: (id: string) => `Stopped agent ${id}.`,
 
 		errors: {
 			/** 每次调用。 */
@@ -96,20 +90,15 @@ export const piHerdrAgentPrompt = {
 			/** 每次调用。 */
 			notRunning: (id: string) => `agent '${id}' is not running.`,
 			/** 每次调用。 */
-			notDescendant: (id: string) => `agent '${id}' is not your descendant; only your own subtree can be killed.`,
+			notDescendant: (id: string) => `agent '${id}' is not your descendant; only your own subtree can be stopped.`,
 			/** 每次调用。 */
 			cannotActOnSelf: (action: string) => `an agent cannot ${action} itself.`,
-			/** 每次调用。 */
-			askNotIdle: (id: string, status: string) => `agent '${id}' is ${status}; ask works only when it is idle.`,
-			/** 每次调用。 */
-			steerNotWorking: (id: string, status: string) =>
-				`agent '${id}' is ${status}; steer works only while it is running. Use ask when it is idle.`,
 			/** 每次调用。 */
 			noId: () => "could not allocate an unused agent id.",
 			/** 每次调用。 */
 			invalidName: (name: string, reason: string) => `invalid name '${name}': ${reason}`,
 			/** 每次调用。 */
-			stillRunning: (id: string) => `agent '${id}' is still running; use agent_job ask or agent_job steer.`,
+			stillRunning: (id: string) => `agent '${id}' is still running; use agent_job ask.`,
 			/** 每次调用。 */
 			noSession: (id: string) => `no session for agent '${id}'.`,
 			/** 每次调用。 */
@@ -146,10 +135,12 @@ export const piHerdrAgentPrompt = {
 		noText: () => "No text output this turn.",
 		/** 每次投递。run 被中止。 */
 		runAborted: () => "Run aborted.",
-		/** 每次投递。另一个 ask 已经占着这一轮。 */
-		busy: () => "Busy: another request is already pending. Try again when this agent is idle.",
 		/** 每次投递。子 agent 在等人工输入；`detail` 是弹窗标题，可空。 */
 		blocked: (detail: string) => `Blocked waiting for human input${detail}.`,
+		/** 每次投递。子 agent 在收工前退出，本轮不会再回发。 */
+		exitedBeforeAnswering: (id: string) => `agent ${id} exited before answering.`,
+		/** 每次投递。子 agent 退出时排队里还有待处理的消息。 */
+		exitedTaskNotProcessed: (id: string) => `agent ${id} exited. Your task was not processed.`,
 		/** 每次投递。文本被截断。 */
 		truncatedWithPath: (path: string) => `[Output truncated. Full output: ${path}]`,
 		truncated: (reason: string) => `[Output truncated: ${reason}]`,

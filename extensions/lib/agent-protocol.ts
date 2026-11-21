@@ -1,95 +1,83 @@
 /**
- * agent 之间的消息信封与结果整形（纯函数，无 I/O，便于测试）。
+ * agent 之间的消息首行与结果整形（纯函数，无 I/O，便于测试）。
  *
  * 消息经 hc 的 `terminal.send` 打进对方终端的输入框，对端 pi 收到的是普通用户输入。
- * hc 自己会给“发给 agent 的消息”套一层 `<hc from="t4m">…</hc>`（`notes = false` 时
- * 才不套），所以解析时先剥这层，再看信封。为了既让接收方的扩展知道「谁发的、是什么」，
- * 又不把这层机器信息喂给模型，信封是**首行一行标签**，接收方在 `input` 事件里剥掉它，
- * 只把正文交下去：
+ * hc 自己会给「发给 agent 的消息」套一层 `<hc from="t4m">…</hc>`（`notes = false` 时才不套），
+ * 所以解析时先剥这层，再看首行。
  *
- *   <pi-agent from="a7k2" addr="t7" name="reviewer" kind="ask">
- *   ...正文...
+ * 首行同时承担两个职责，所以只保留一个格式：
+ * - 给接收方扩展读：谁发的、是不是自动回发
+ * - 给模型看：这条活是哪个 agent 派的
  *
- * `kind` 三种：
- * - `ask`    提问（拉起时的那条 prompt 也算）。接收方把它记成当轮 asker，settle 时回发结果。
- * - `steer`  插话。不改 asker。
- * - `result` 结果回发。不设 asker，避免 A→B→A 的回环。
+ *   <agent a7k2 "reviewer">           派活 / 普通消息
+ *   <agent a7k2 "reviewer" result>    自动回发
  *
- * 结果正文前保留一行可见来源（`[agent a7k2 · reviewer]`），让模型知道是谁交的活。
- * 正文超过 bash 工具同款上限（2000 行 / 50 KB）时按尾部截断，全文另存临时文件，由
- * asker 自己去读。
+ * `result` 为真的消息不会被再次回发（否则 A 与 C 会无限来回），也不排队。
+ * 发送方地址不写在首行：按术语表的「寻址一律用 id」，回发时用 id 反查终端。
+ *
+ * 正文超过 bash 工具同款上限（2000 行 / 50 KB）时按尾部截断，全文另存临时文件。
  */
 
-/** 信封种类；`result` 同时承载「卡住（blocked）」「忙（busy）」这类非提问回报。 */
-export type AgentEnvelopeKind = "ask" | "steer" | "result";
-
+/** 解析出来的首行。 */
 export interface AgentEnvelope {
-	kind: AgentEnvelopeKind;
 	/** 发送方的 agent id。 */
 	from: string;
-	/** 发送方的 hc 终端地址；结果直接回发到这里，省一次寻址。 */
-	addr: string;
 	/** 发送方的显示名（可缺省）。 */
 	name?: string;
-	/** 剥掉信封首行后的正文。 */
+	/** true 表示这是自动回发，接收方不回发、不排队。 */
+	result: boolean;
+	/** 首行之后的正文。 */
 	body: string;
 }
 
 export interface AgentEnvelopeInput {
-	kind: AgentEnvelopeKind;
 	from: string;
-	addr: string;
 	name?: string;
+	result?: boolean;
 	body: string;
 }
 
-const ENVELOPE_PATTERN = /^<pi-agent\s+([^>\r\n]*)>[ \t]*\r?\n?/;
-const ATTRIBUTE_PATTERN = /([A-Za-z][A-Za-z0-9_-]*)="([^"]*)"/g;
-/** hc 给消息套的运输层标签；先剥掉才能看到我们自己的信封。 */
+const ENVELOPE_PATTERN = /^<agent\s+([^\s>"]+)(?:\s+"([^"]*)")?(?:\s+(result))?>[ \t]*\r?\n?/;
+/** hc 给消息套的运输层标签；先剥掉才能看到我们自己的首行。 */
 const HC_OPEN_PATTERN = /^<hc\s+[^>\r\n]*>[ \t]*\r?\n?/;
 const HC_CLOSE_PATTERN = /<\/hc>\s*$/;
 
-/** 引号与尖括号会破坏信封；id/addr/name 都来自受控取值，这里只做防御性清理。 */
-function attribute(value: string): string {
+/** 引号与尖括号会破坏首行；id/name 都来自受控取值，这里只做防御性清理。 */
+function clean(value: string): string {
 	return value.replace(/["<>\r\n]/g, "");
 }
 
+/** 消息首行；扩展拼出来、模型也能看到的那一行。 */
+export function agentSourceLine(id: string, name?: string, result = false): string {
+	const head = name ? `${clean(id)} "${clean(name)}"` : clean(id);
+	return result ? `<agent ${head} result>` : `<agent ${head}>`;
+}
+
 export function formatAgentEnvelope(envelope: AgentEnvelopeInput): string {
-	const attributes = [
-		`from="${attribute(envelope.from)}"`,
-		`addr="${attribute(envelope.addr)}"`,
-	];
-	if (envelope.name) attributes.push(`name="${attribute(envelope.name)}"`);
-	attributes.push(`kind="${envelope.kind}"`);
-	return `<pi-agent ${attributes.join(" ")}>\n${envelope.body}`;
+	return `${agentSourceLine(envelope.from, envelope.name, envelope.result)}\n${envelope.body}`;
+}
+
+/** 剥掉 hc CLI 的运输层包装，保留我们自己的首行。 */
+export function stripHcTransport(text: string): string {
+	return text.replace(HC_OPEN_PATTERN, "").replace(HC_CLOSE_PATTERN, "");
 }
 
 /**
- * 解析首行信封。不是信封（普通人打字、别的扩展消息）返回 undefined，调用方原样放行。
- * 属性不全或 kind 不认识也按「不是信封」处理——宁可让模型看到一行怪文本，也不吞消息。
+ * 解析首行。不是信封（人打字、别的扩展消息）返回 undefined，调用方原样放行。
+ * 宁可让模型看到一行怪文本，也不吞消息。
  */
 export function parseAgentEnvelope(text: string): AgentEnvelope | undefined {
 	// hc 的运输层包装（from 是发送终端地址；若 notes 被关掉则不存在）。
-	const unwrapped = text.replace(HC_OPEN_PATTERN, "");
+	const unwrapped = stripHcTransport(text);
 
 	const match = ENVELOPE_PATTERN.exec(unwrapped);
 	if (!match) return undefined;
 
-	const attributes: Record<string, string> = {};
-	for (const attributeMatch of match[1].matchAll(ATTRIBUTE_PATTERN)) {
-		attributes[attributeMatch[1]] = attributeMatch[2];
-	}
-
-	const kind = attributes.kind;
-	if (kind !== "ask" && kind !== "steer" && kind !== "result") return undefined;
-	if (!attributes.from || !attributes.addr) return undefined;
-
 	return {
-		kind,
-		from: attributes.from,
-		addr: attributes.addr,
-		name: attributes.name || undefined,
-		body: unwrapped.slice(match[0].length).replace(HC_CLOSE_PATTERN, ""),
+		from: match[1],
+		name: match[2] || undefined,
+		result: Boolean(match[3]),
+		body: unwrapped.slice(match[0].length),
 	};
 }
 
@@ -100,11 +88,6 @@ export const AGENT_NAME_PATTERN = /^[a-z0-9._-]{1,32}$/;
 export function validateAgentName(name: string): string | undefined {
 	if (AGENT_NAME_PATTERN.test(name)) return undefined;
 	return "name must be 1-32 characters of a-z, 0-9, '.', '_' or '-' (herdr-core terminal name rule)";
-}
-
-/** 结果正文前的可见来源行。 */
-export function agentSourceLine(id: string, name?: string): string {
-	return name ? `[agent ${id} · ${name}]` : `[agent ${id}]`;
 }
 
 /** 与 bash 工具一致：2000 行 / 50 KB，先到者生效。 */

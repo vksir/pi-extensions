@@ -17,14 +17,19 @@
  *   `PI_AGENT_DEPTH`，子进程的扩展据此知道自己是谁、在树里的哪一层；另外注入
  *   `PI_AGENT_DESTROY_AFTER`（空闲销毁秒数，0 = 不销毁）。
  *
- * 消息：
- * - `ask` 只发给 idle（或 done）的 agent，忙则报错；`steer` 只发给 working 的 agent。
- * - 谁 ask 谁收结果：拉起时的那条 prompt 也算一次 ask。子 agent settle 时把最终答复
- *   发给**当轮 asker**；没有 asker 的轮（人直接打字、收到 result、单纯 steer）不回发。
- * - 消息经 `terminal.send` 打进对方输入框，首行 `<pi-agent ... kind="ask|steer|result">`
- *   由接收方扩展在 `input` 事件里剥掉；`kind=result` 不设 asker，避免回环。
+ * 消息（派发规则）：
+ * - `agent_job ask` 不检查对方状态：忙就排队或插入，闲就起一轮。
+ * - 一轮（round）只有一个「派活人」= 叫醒它的那条消息的发送方。收到消息时：
+ *   - 我空闲：开一轮，派活人 = 发送方。
+ *   - 我忙、发送方就是派活人：直接插进当前轮（pi 原生 steer）。
+ *   - 我忙、发送方是别人：吞掉，不进上下文，按发送方排队。
+ *   - 收到自动回发（首行带 result）：不排队、不回发，直接投递。
+ * - 收工时扩展自动把本轮最后一段回答发回给派活人，不依赖模型调工具。
+ *   只有 `ask` 起的轮次回发；回发本身、人打字、被中止的轮次都不回发。
+ * - 队列按发送方聚合：同一个发送方最多一条，新消息并进他那条，位置不变。
+ * - 首行 `<agent id "name">` / `<agent id "name" result>` 由扩展生成，模型可见。
  * - 结果正文超过 2000 行 / 50 KB 时按 bash 工具同款方式尾部截断，全文落临时文件。
- * - 拉起时 `no_notify: true`：hc 自己的 note 不参与语义，消息只有 ask / steer 与结果回发。
+ * - 拉起时 `no_notify: true`：hc 自己的 note 不参与语义。
  *
  * 生命周期：`session_shutdown(reason=quit)` 时杀掉自己的直接子 agent（递归由各自的
  * shutdown 完成）。子终端的程序就是 pi 本身，所以子进程硬死时 hc 原生级联会接管；
@@ -54,14 +59,15 @@ import {
 	type Theme,
 	type ThemeColor,
 } from "@earendil-works/pi-coding-agent";
-import { Box, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import {
-	agentSourceLine,
 	formatAgentEnvelope,
 	parseAgentEnvelope,
+	stripHcTransport,
 	truncateTail,
 	validateAgentName,
+	type AgentEnvelope,
 } from "./lib/agent-protocol.ts";
 import { hasBusyActivity } from "./lib/activity.ts";
 import { errorMessage } from "./lib/errors.ts";
@@ -97,17 +103,18 @@ const DESTROY_ENV = "PI_AGENT_DESTROY_AFTER";
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
-/** 可以向它发 ask 的状态：idle 与 done（「结束但还没被看」）都表示可以接活。 */
-const ASKABLE = new Set(["idle", "done"]);
-
 // ─── 类型 ───
 
-/** 当轮提问者；只活在内存里，settle 后即清空。 */
-interface Asker {
+/** 对端 agent：发送方与派活人都用它。 */
+interface Peer {
 	id: string;
-	/** 发送方的 hc 终端地址，结果直接回发到这里。 */
-	addr: string;
 	name?: string;
+}
+
+/** 排队里的一条：同一个发送方只有一条，`parts` 按到达顺序拼接。 */
+interface QueuedMessage {
+	peer: Peer;
+	parts: string[];
 }
 
 export interface AgentRow {
@@ -142,7 +149,7 @@ interface AgentParams {
 }
 
 interface AgentJobParams {
-	action: "list" | "kill" | "ask" | "steer";
+	action: "list" | "ask" | "stop";
 	id?: string;
 	message?: string;
 }
@@ -157,7 +164,7 @@ interface SessionFacts {
 
 /** 结构化 details 只记动作与结果，方便 UI 与测试断言。 */
 interface AgentToolDetails {
-	action?: "start" | "resume" | "list" | "kill" | "ask" | "steer";
+	action?: "start" | "resume" | "list" | "stop" | "ask";
 	id?: string;
 	name?: string;
 	error?: string;
@@ -246,59 +253,149 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		warnIfSteeringModeIsNotAll(ctx);
 	});
 
-	// 每轮的状态：asker 只在内存里（label 不承担可变语义），settle 后清空。
-	let pendingAsker: Asker | undefined;
+	// 每轮的状态：派活人与队列只在内存里（label 不承担可变语义）。
+	/** 本轮派活人；收工时清空，新的普通消息重新指定。 */
+	let owner: Peer | undefined;
+	/** 是否有轮次正在跑。`streamingBehavior` 只作交叉校验，这里才是准的。 */
+	let busy = false;
 	let lastAnswer: string | undefined;
 	let blockedNotified = false;
 
-	/** 显示名：子 agent 用注入的 env，根用会话名。只用于消息来源行。 */
+	/**
+	 * 排队：key = 发送方 id，Map 的插入顺序就是队列顺序。
+	 * 同一个发送方最多一条 —— 已有 key 再 set 不改变位置，正好对上「合并但保留原位」。
+	 */
+	const queue = new Map<string, QueuedMessage>();
+
+	/** 显示名：子 agent 用注入的 env，根用会话名。只用于消息首行。 */
 	const displayName = (ctx?: ExtensionContext): string | undefined => {
 		const fromEnv = env.PI_AGENT_NAME?.trim();
 		if (fromEnv) return fromEnv;
 		return ctx?.sessionManager.getSessionName()?.trim() || undefined;
 	};
 
-	const sendReport = async (target: { addr: string }, ctx: ExtensionContext, body: string): Promise<void> => {
+	// ─── 界面记录（TUI 可见，不进模型上下文） ───
+
+	const NOTE_ENTRY = "pi-herdr-agent:note";
+	const QUEUE_ENTRY = "pi-herdr-agent:queued";
+
+	pi.registerEntryRenderer<{ text: string }>(NOTE_ENTRY, (entry, _options, theme) => {
+		const box = new Box(0, 1);
+		box.addChild(new Text(theme.fg("muted", entry.data?.text ?? ""), 0, 0));
+		return box;
+	});
+
+	pi.registerEntryRenderer<{ from: string; name?: string; body: string }>(QUEUE_ENTRY, (entry, _options, theme) => {
+		const box = new Box(0, 1);
+		const who = entry.data?.name ? `${entry.data.from} "${entry.data.name}"` : entry.data?.from;
+		const head = theme.fg("warning", `⏸ ${who ?? "?"} · queued`);
+		const first = (entry.data?.body ?? "").split("\n")[0].slice(0, 80);
+		box.addChild(new Text(first ? `${head}  ${theme.fg("dim", first)}` : head, 0, 0));
+		return box;
+	});
+
+	/** 界面记一行。失败不影响主流程。 */
+	const appendNote = (text: string): void => {
+		try {
+			pi.appendEntry(NOTE_ENTRY, { text });
+		} catch {
+			// 界面记录是尽力而为。
+		}
+	};
+
+	const enqueue = (envelope: AgentEnvelope): void => {
+		const existing = queue.get(envelope.from);
+		if (existing) {
+			existing.parts.push(envelope.body);
+		} else {
+			queue.set(envelope.from, { peer: { id: envelope.from, name: envelope.name }, parts: [envelope.body] });
+		}
+		try {
+			pi.appendEntry(QUEUE_ENTRY, { from: envelope.from, name: envelope.name, body: envelope.body });
+		} catch {
+			// 同上。
+		}
+	};
+
+	/** 取队首；取出来的同时从队列里移除。 */
+	const takeNext = (): { id: string; peer: Peer; parts: string[] } | undefined => {
+		const first = queue.entries().next();
+		if (first.done) return undefined;
+		const [id, entry] = first.value;
+		queue.delete(id);
+		return { id, peer: entry.peer, parts: entry.parts };
+	};
+
+	/** 起队首失败时放回队首，位置不丢。 */
+	const putBackFront = (id: string, peer: Peer, parts: string[]): void => {
+		const rest = [...queue.entries()];
+		queue.clear();
+		queue.set(id, { peer, parts });
+		for (const [key, value] of rest) queue.set(key, value);
+	};
+
+	/** 派活人 id → 当前终端地址；已经不在的返回 undefined。 */
+	const addressOf = async (id: string): Promise<string | undefined> => {
+		try {
+			const terminals = await hc.list();
+			return terminals.find((terminal) => agentIdOf(terminal) === id && terminal.state === "live")?.address;
+		} catch {
+			return undefined;
+		}
+	};
+
+	/**
+	 * 自动回发一条结果。对方已经不在时静默丢弃，并在自己界面上记一行：
+	 * 重试没有意义，那是死信箱。
+	 */
+	const sendReport = async (target: Peer, ctx: ExtensionContext, body: string): Promise<void> => {
+		const address = await addressOf(target.id);
+		if (!address) {
+			appendNote(`replay to ${target.id} failed: it is gone.`);
+			return;
+		}
+
 		try {
 			await hc.send({
-				terminal: target.addr,
+				terminal: address,
 				caller: self,
-				text: formatAgentEnvelope({
-					kind: "result",
-					from: myId,
-					addr: self,
-					name: displayName(ctx),
-					body,
-				}),
+				text: formatAgentEnvelope({ result: true, from: myId, name: displayName(ctx), body }),
 			});
 		} catch {
-			// asker 已经不在了（终端被关/agent 退出）：结果留在自己终端里，静默丢弃这条回发。
+			appendNote(`replay to ${target.id} failed: it disappeared.`);
 		}
 	};
 
 	// ─── 入站消息 ───
 
-	// 有新活就不销毁：不管是 ask / steer 还是人直接打字，都发生在 agent_start 之前。
-	pi.on("input", (event, ctx) => {
+	// 有新活就不销毁：不管是 agent 消息还是人直接打字，都发生在 agent_start 之前。
+	pi.on("input", (event) => {
 		stopDestroyCountdown();
 
 		const envelope = parseAgentEnvelope(event.text);
 		if (!envelope) return;
 
-		if (envelope.kind === "ask") {
-			if (pendingAsker) {
-				// 并发的第二个 ask 抢在对方进入 working 之前到达：第一个 asker 拥有这一轮，
-				// 第二个只能收到一句忙。消息正文仍会交给模型，但结果不会回给它。
-				const busy = `${agentSourceLine(myId, displayName(ctx))} ${piHerdrAgentPrompt.reports.busy()}`;
-				void sendReport(envelope, ctx, busy);
-			} else {
-				pendingAsker = { id: envelope.from, addr: envelope.addr, name: envelope.name };
-				lastAnswer = undefined;
-			}
+		// 自动回发只是一条答案：空闲就起一轮读它（不回发），忙就直接插进去。
+		// 首行留给模型看，只剥掉 hc CLI 的运输层包装。
+		if (envelope.result) return { action: "transform" as const, text: stripHcTransport(event.text) };
+
+		const running = busy || event.streamingBehavior !== undefined;
+
+		if (!running) {
+			// 空闲：开一轮，派活人 = 发送方。首行留给模型看。
+			owner = { id: envelope.from, name: envelope.name };
+			lastAnswer = undefined;
+			return { action: "transform" as const, text: stripHcTransport(event.text) };
 		}
 
-		// 机器头剥掉，模型只看正文；kind=result 不改 asker，避免 A→B→A 回环。
-		return { action: "transform" as const, text: envelope.body };
+		// 派活人插话：直接插进当前轮（pi 原生 steer）。
+		if (owner?.id === envelope.from) {
+			return { action: "transform" as const, text: stripHcTransport(event.text) };
+		}
+
+		// 别人：吞掉，不进上下文，按发送方排队。
+		enqueue(envelope);
+		return { action: "handled" as const };
 	});
 
 	// ─── 出站结果 ───
@@ -309,49 +406,79 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	});
 
 	pi.on("agent_settled", async (event, ctx) => {
-		const asker = pendingAsker;
-		pendingAsker = undefined;
+		busy = false;
 		blockedNotified = false;
+
+		const current = owner;
+		owner = undefined;
 		const answer = lastAnswer;
 		lastAnswer = undefined;
 
-		if (asker) {
-			const body = event.aborted
-				? `${agentSourceLine(myId, displayName(ctx))}\n${piHerdrAgentPrompt.reports.runAborted()}`
-				: await resultBody(answer, ctx);
-			await sendReport(asker, ctx, body);
+		// 被中止：只回一句，不附半截回答；队列不动，也不自动开工。
+		if (current) {
+			const body = event.aborted ? piHerdrAgentPrompt.reports.runAborted() : await resultBody(answer);
+			await sendReport(current, ctx, body);
 		}
 
-		// 先回发再武装：asker 的结果不被倒计时的探测拖慢。
+		if (event.aborted) {
+			// 队列里还有活就不倒计时：那些任务不能跟着一起消失。
+			if (queue.size === 0) await armDestroyCountdown(ctx);
+			return;
+		}
+
+		const next = takeNext();
+		if (next) {
+			owner = next.peer;
+			lastAnswer = undefined;
+			try {
+				pi.sendUserMessage(formatAgentEnvelope({ from: next.peer.id, name: next.peer.name, body: next.parts.join("\n\n") }));
+			} catch (error) {
+				putBackFront(next.id, next.peer, next.parts);
+				owner = undefined;
+				appendNote(`queued message from ${next.id} could not start: ${errorMessage(error)}`);
+				return; // 还有活没干成：不进入空闲销毁。
+			}
+			return; // 新一轮已开始，倒计时由那一轮收工时再武装。
+		}
+
 		await armDestroyCountdown(ctx);
 	});
 
 	// 不论因为什么起了一轮（cron 投递、人打字、ask），倒计时都作废。
 	pi.on("agent_start", () => {
+		busy = true;
 		stopDestroyCountdown();
 	});
 
 	pi.on("ui_prompt_start", async (event, ctx) => {
 		// 弹窗等人回答：这一轮还没结束，先把倒计时停掉（settle 后会重新武装）。
 		stopDestroyCountdown();
-		if (!pendingAsker || blockedNotified) return;
+		if (!owner || blockedNotified) return;
 		blockedNotified = true;
 		const detail = event.title ? ` (${event.title})` : "";
-		await sendReport(
-			pendingAsker,
-			ctx,
-			`${agentSourceLine(myId, displayName(ctx))} ${piHerdrAgentPrompt.reports.blocked(detail)}`,
-		);
+		await sendReport(owner, ctx, piHerdrAgentPrompt.reports.blocked(detail));
 	});
 
 	pi.on("ui_prompt_end", () => {
 		blockedNotified = false;
 	});
 
-	pi.on("session_shutdown", async (event) => {
+	pi.on("session_shutdown", async (event, ctx) => {
 		stopDestroyCountdown();
 		// 只有真正退出（quit）才收尸；/reload、/new、/resume、/fork 不动子 agent。
 		if (event.reason !== "quit") return;
+
+		// 退出前把「没做完」交代清楚：派活人一条，排队里每人一条。
+		const current = owner;
+		const queued = [...queue.values()];
+		owner = undefined;
+		queue.clear();
+		if (current) await sendReport(current, ctx, piHerdrAgentPrompt.reports.exitedBeforeAnswering(myId));
+		await Promise.allSettled(
+			queued.map((entry) =>
+				sendReport(entry.peer, ctx, piHerdrAgentPrompt.reports.exitedTaskNotProcessed(myId)),
+			),
+		);
 		try {
 			const terminals = await hc.list();
 			const children = terminals.filter((terminal) => terminal.parent === self);
@@ -376,6 +503,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	 */
 	const isQuiet = async (ctx: ExtensionContext): Promise<boolean> => {
 		if (!ctx.isIdle()) return false;
+		if (queue.size > 0) return false; // 还有排着的话，销毁就等于把它们一起埋了。
 		if (hasBusyActivity() || hasRunningSubagents()) return false;
 		try {
 			const terminals = await hc.list();
@@ -428,19 +556,18 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 
 	// ─── 结果整形 ───
 
-	const resultBody = async (answer: string | undefined, ctx: ExtensionContext): Promise<string> => {
-		const source = agentSourceLine(myId, displayName(ctx));
+	const resultBody = async (answer: string | undefined): Promise<string> => {
 		const text = answer?.trim();
-		if (!text) return `${source}\n${piHerdrAgentPrompt.reports.noText()}`;
+		if (!text) return piHerdrAgentPrompt.reports.noText();
 
 		const truncation = truncateTail(text);
-		if (!truncation.truncated) return `${source}\n${text}`;
+		if (!truncation.truncated) return text;
 
 		try {
 			const path = options.spill ? await options.spill(text) : await writeOutputFile("pi-herdr-agent", ".log", text);
-			return `${source}\n${truncation.text}\n\n${piHerdrAgentPrompt.reports.truncatedWithPath(path)}`;
+			return `${truncation.text}\n\n${piHerdrAgentPrompt.reports.truncatedWithPath(path)}`;
 		} catch (error) {
-			return `${source}\n${truncation.text}\n\n${piHerdrAgentPrompt.reports.truncated(errorMessage(error))}`;
+			return `${truncation.text}\n\n${piHerdrAgentPrompt.reports.truncated(errorMessage(error))}`;
 		}
 	};
 
@@ -452,7 +579,6 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			label: "Agent",
 			description: piHerdrAgentPrompt.declarations.agent.description,
 			promptSnippet: piHerdrAgentPrompt.system.snippets.agent,
-			promptGuidelines: [piHerdrAgentPrompt.system.guidelines.agent],
 			parameters: Type.Object({
 				prompt: Type.String({ description: piHerdrAgentPrompt.declarations.agent.parameters.prompt }),
 				name: Type.Optional(Type.String({ description: piHerdrAgentPrompt.declarations.agent.parameters.name })),
@@ -508,7 +634,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			ctx,
 			destroyAfterSeconds: normalizeDestroyAfter(params.destroyAfterSeconds),
 		});
-		return ok(`Started agent ${id} as '${name}'. Its final answer will arrive as a message.`, {
+		return ok(piHerdrAgentPrompt.results.startedAgent(id, name), {
 			action: "start",
 			id,
 			name,
@@ -630,13 +756,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			await hc.send({
 				terminal: run.address,
 				caller: self,
-				text: formatAgentEnvelope({
-					kind: "ask",
-					from: myId,
-					addr: self,
-					name: displayName(ctx),
-					body: prompt,
-				}),
+				text: formatAgentEnvelope({ from: myId, name: displayName(ctx), body: prompt }),
 			});
 		} catch (error) {
 			await hc.kill(run.address).catch(() => undefined);
@@ -683,8 +803,10 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			label: "Agent jobs",
 			description: piHerdrAgentPrompt.declarations.agentJob.description,
 			promptSnippet: piHerdrAgentPrompt.system.snippets.agentJob,
+			// 守则挂在 agent_job 上：它全深度都有，而 agent 在最深一层不注册。
+			promptGuidelines: [piHerdrAgentPrompt.system.guidelines.agentJob],
 			parameters: Type.Object({
-				action: StringEnum(["list", "kill", "ask", "steer"] as const, {
+				action: StringEnum(["list", "ask", "stop"] as const, {
 					description: piHerdrAgentPrompt.declarations.agentJob.parameters.action,
 				}),
 				id: Type.Optional(Type.String({ description: piHerdrAgentPrompt.declarations.agentJob.parameters.id })),
@@ -699,15 +821,14 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 					switch (typed.action) {
 						case "list": {
 							const terminals = await hc.list();
-							const rows = buildRows(terminals, myId, self);
+							// 只看自己、一级父、一级子、兄弟；爷爷、侄子、别的树都看不到。
+							const rows = buildRows(terminals, myId, self).filter((row) => row.relation !== "other");
 							return ok(formatRows(rows), { action: "list", agents: rows });
 						}
-						case "kill":
-							return await killJob(typed);
+						case "stop":
+							return await stopJob(typed);
 						case "ask":
 							return await askJob(typed, ctx);
-						case "steer":
-							return await steerJob(typed, ctx);
 					}
 				} catch (error) {
 					return fail(humanError(error, typed.id), typed.action);
@@ -716,14 +837,15 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		});
 	};
 
-	const killJob = async (params: AgentJobParams) => {
-		if (!params.id) return fail(piHerdrAgentPrompt.results.errors.idRequired("kill"), "kill");
+	const stopJob = async (params: AgentJobParams) => {
+		if (!params.id) return fail(piHerdrAgentPrompt.results.errors.idRequired("stop"), "stop");
 		const terminals = await hc.list();
 		const target = terminals.find((terminal) => agentIdOf(terminal) === params.id && terminal.state === "live");
-		if (!target) return fail(piHerdrAgentPrompt.results.errors.notRunning(params.id), "kill", params.id);
-		if (target.address === self) return fail(piHerdrAgentPrompt.results.errors.cannotActOnSelf("kill"), "kill", params.id);
+		if (!target) return fail(piHerdrAgentPrompt.results.errors.notRunning(params.id), "stop", params.id);
+		if (target.address === self)
+			return fail(piHerdrAgentPrompt.results.errors.cannotActOnSelf("stop"), "stop", params.id);
 		if (!isDescendant(target, terminals, self)) {
-			return fail(piHerdrAgentPrompt.results.errors.notDescendant(params.id), "kill", params.id);
+			return fail(piHerdrAgentPrompt.results.errors.notDescendant(params.id), "stop", params.id);
 		}
 		await hc.kill(target.address).catch((error: unknown) => {
 			// `rm: true` 的终端在 kill 成功后会被立刻删除，core 有时把这次删除回成 not_found /
@@ -731,62 +853,28 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			if (error instanceof HcError && (error.kind === "not_found" || error.kind === "finished")) return;
 			throw error;
 		});
-		return ok(piHerdrAgentPrompt.results.killed(params.id), { action: "kill", id: params.id });
+		return ok(piHerdrAgentPrompt.results.stopped(params.id), { action: "stop", id: params.id });
 	};
 
+	/**
+	 * 发一条消息。不检查对方状态：忙就由对方插进当前轮或排队，闲就起一轮。
+	 * 对方收工时会把这一轮的最后回答自动发回来。
+	 */
 	const askJob = async (params: AgentJobParams, ctx: ExtensionContext) => {
 		if (!params.id) return fail(piHerdrAgentPrompt.results.errors.idRequired("ask"), "ask");
 		if (!params.message?.trim()) return fail(piHerdrAgentPrompt.results.errors.messageRequired("ask"), "ask", params.id);
 		const target = await requireTarget(params.id);
 		if (target.row.id === myId) return fail(piHerdrAgentPrompt.results.errors.cannotActOnSelf("ask"), "ask", params.id);
-		const status = target.terminal.status?.state;
-		if (!status || !ASKABLE.has(status)) {
-			return fail(piHerdrAgentPrompt.results.errors.askNotIdle(params.id, status ?? "not ready"), "ask", params.id);
-		}
-
-		const sent = await hc.send({
-			terminal: target.terminal.address,
-			caller: self,
-			text: formatAgentEnvelope({
-				kind: "ask",
-				from: myId,
-				addr: self,
-				name: displayName(ctx),
-				body: params.message,
-			}),
-			// done 是「结束但还没被看」，hc 的 if 只认 idle/working，所以那一档不带 if。
-			if: status === "idle" ? "idle" : undefined,
-		});
-		const pending = sent.started === false ? piHerdrAgentPrompt.results.askPending() : "";
-		return ok(piHerdrAgentPrompt.results.asked(target.row.id, target.row.name, pending), {
-			action: "ask",
-			id: target.row.id,
-		});
-	};
-
-	const steerJob = async (params: AgentJobParams, ctx: ExtensionContext) => {
-		if (!params.id) return fail(piHerdrAgentPrompt.results.errors.idRequired("steer"), "steer");
-		if (!params.message?.trim()) return fail(piHerdrAgentPrompt.results.errors.messageRequired("steer"), "steer", params.id);
-		const target = await requireTarget(params.id);
-		if (target.row.id === myId) return fail(piHerdrAgentPrompt.results.errors.cannotActOnSelf("steer"), "steer", params.id);
-		const status = target.terminal.status?.state;
-		if (status !== "working") {
-			return fail(piHerdrAgentPrompt.results.errors.steerNotWorking(params.id, status ?? "not working"), "steer", params.id);
-		}
 
 		await hc.send({
 			terminal: target.terminal.address,
 			caller: self,
-			text: formatAgentEnvelope({
-				kind: "steer",
-				from: myId,
-				addr: self,
-				name: displayName(ctx),
-				body: params.message,
-			}),
-			if: "working",
+			text: formatAgentEnvelope({ from: myId, name: displayName(ctx), body: params.message }),
 		});
-		return ok(piHerdrAgentPrompt.results.steered(target.row.id, target.row.name), { action: "steer", id: target.row.id });
+		return ok(piHerdrAgentPrompt.results.asked(target.row.id, target.row.name), {
+			action: "ask",
+			id: target.row.id,
+		});
 	};
 
 	const requireTarget = async (id: string): Promise<{ terminal: HcTerminal; row: AgentRow }> => {
