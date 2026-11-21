@@ -42,8 +42,8 @@ interface FakePi {
 	commands: Map<string, (args: string, ctx: unknown) => Promise<void> | void>;
 	entries: { type: string; data: any }[];
 	userMessages: string[];
-	settings: { steeringMode: "all" | "one-at-a-time" };
-	getSettings: () => { steeringMode: "all" | "one-at-a-time" };
+	settings: { steeringMode?: "all" | "one-at-a-time"; followUpMode?: "all" | "one-at-a-time" };
+	getSettings: () => { steeringMode?: "all" | "one-at-a-time"; followUpMode?: "all" | "one-at-a-time" };
 	registerTool: (definition: {
 		name: string;
 		description: string;
@@ -63,7 +63,9 @@ function createFakePi(): FakePi {
 	const commands: FakePi["commands"] = new Map();
 	const entries: FakePi["entries"] = [];
 	const userMessages: string[] = [];
-	const settings = { steeringMode: "all" as "all" | "one-at-a-time" };
+	const settings: { steeringMode?: "all" | "one-at-a-time"; followUpMode?: "all" | "one-at-a-time" } = {
+		steeringMode: "all",
+	};
 	return {
 		tools,
 		handlers,
@@ -530,6 +532,36 @@ test("dispatch: idle starts a round, the owner steers, others queue and merge", 
 	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, context());
 	assert.equal(hc.callsOf("send")[1].params.terminal, "t8");
 	assert.equal(parseAgentEnvelope(pi.userMessages[1])?.from, "dddd");
+});
+
+test("a message arriving while the previous round is settling is queued, not promoted", async () => {
+	const hc = new FakeHc();
+	hc.terminals = [
+		terminal({ address: "t7", labels: { "pi.agent": "aaaa" } }),
+		terminal({ address: "t8", labels: { "pi.agent": "bbbb" } }),
+	];
+	const { pi } = await setup({ hc, env: { PI_AGENT_ID: "cccc", PI_AGENT_DEPTH: "1" } });
+
+	await pi.emit("input", { type: "input", text: formatAgentEnvelope({ from: "aaaa", body: "task A" }) });
+	await pi.emit("agent_start");
+	await pi.emit("agent_end", {
+		type: "agent_end",
+		messages: [{ role: "assistant", content: [{ type: "text", text: "done A" }] }],
+	});
+
+	// 收工处理里有 await；这期间进来的消息不能抢成新的派活人。
+	const settled = pi.emit("agent_settled", { type: "agent_settled", aborted: false }, context());
+	const arriving = await pi.emit("input", {
+		type: "input",
+		text: formatAgentEnvelope({ from: "bbbb", body: "task B" }),
+	});
+	assert.deepEqual(arriving, { action: "handled" });
+
+	await settled;
+	assert.equal(hc.callsOf("send").length, 1);
+	assert.equal(hc.callsOf("send")[0].params.terminal, "t7");
+	assert.equal(pi.userMessages.length, 1);
+	assert.equal(parseAgentEnvelope(pi.userMessages[0])?.from, "bbbb");
 });
 
 test("result messages are passed through and never replied to", async () => {
@@ -1097,15 +1129,16 @@ test("root writes its short id as a terminal label on session_start", async () =
 	assert.equal(hc.callsOf("label")[1]?.params.labels["pi.agent.root"], "000001");
 });
 
-test("warns once on session_start when steeringMode is not all", async () => {
+test("warns once on session_start when a queue mode is one-at-a-time", async () => {
 	const { pi } = await setup();
 	pi.settings.steeringMode = "one-at-a-time";
+	pi.settings.followUpMode = "one-at-a-time";
 	const notes: { message: string; type?: string }[] = [];
 	const ctx = context({ ui: { notify: (message, type) => notes.push({ message, type }) } });
 
 	await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
 	assert.equal(notes.length, 1);
-	assert.match(notes[0].message, /one-at-a-time/);
+	assert.match(notes[0].message, /steeringMode \/ followUpMode/);
 	assert.match(notes[0].message, /all/);
 	assert.equal(notes[0].type, "warning");
 
@@ -1114,7 +1147,18 @@ test("warns once on session_start when steeringMode is not all", async () => {
 	assert.equal(notes.length, 1);
 });
 
-test("does not warn when steeringMode is all", async () => {
+test("names only the queue mode that is actually set to one-at-a-time", async () => {
+	const { pi } = await setup();
+	pi.settings.followUpMode = "one-at-a-time";
+	const notes: string[] = [];
+	const ctx = context({ ui: { notify: (message) => notes.push(message) } });
+
+	await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+	assert.equal(notes.length, 1);
+	assert.match(notes[0], /^followUpMode 当前为/);
+});
+
+test("does not warn when both queue modes are all or unset", async () => {
 	const { pi } = await setup();
 	const notes: string[] = [];
 	const ctx = context({ ui: { notify: (message) => notes.push(message) } });

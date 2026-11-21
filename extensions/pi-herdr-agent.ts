@@ -226,31 +226,36 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	};
 
 	/**
-	 * steeringMode 非 all 时，多个子 agent 的结果会被 pi 逐条投递；只在本次进程启动时提醒一次。
-	 * 设置项在 /settings 里叫 Steering mode；`all` 是当前扩展期望的值。
+	 * 队列模式非 all 时，派活人的插话与自动回发会被 pi 逐条延后；只在本次进程启动时提醒一次。
+	 * 设置项在 /settings 里叫 Steering mode 与 Follow-up mode；`all` 是当前扩展期望的值。
+	 * 未设置（undefined）不提醒：那是 pi 的默认值，提醒会变成每次启动都喷。
 	 */
-	let steeringModeChecked = false;
-	const warnIfSteeringModeIsNotAll = (ctx: ExtensionContext): void => {
-		if (steeringModeChecked) return;
-		steeringModeChecked = true;
+	let queueModesChecked = false;
+	const warnIfQueueModesAreNotAll = (ctx: ExtensionContext): void => {
+		if (queueModesChecked) return;
+		queueModesChecked = true;
 
-		let mode: string | undefined;
+		let settings: { steeringMode?: string; followUpMode?: string };
 		try {
-			mode = pi.getSettings().steeringMode;
+			settings = pi.getSettings();
 		} catch {
 			return; // 旧 pi 没有 getSettings：不打断启动。
 		}
-		if (mode === undefined || mode === "all") return;
+		const oneAtATime = [
+			settings.steeringMode === "one-at-a-time" ? "steeringMode" : undefined,
+			settings.followUpMode === "one-at-a-time" ? "followUpMode" : undefined,
+		].filter((name): name is string => Boolean(name));
+		if (oneAtATime.length === 0) return;
 
 		ctx.ui.notify(
-			`Steering mode 当前为 ${mode}，需改为 all；否则多个子 agent 的结果会被逐条投递。可以在 /settings 里修改。`,
+			`${oneAtATime.join(" / ")} 当前为 one-at-a-time，需改为 all；否则派活人的插话与自动回发会被逐条延后。可以在 /settings 里修改。`,
 			"warning",
 		);
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
 		await syncRootId(ctx);
-		warnIfSteeringModeIsNotAll(ctx);
+		warnIfQueueModesAreNotAll(ctx);
 	});
 
 	// 每轮的状态：派活人与队列只在内存里（label 不承担可变语义）。
@@ -258,6 +263,8 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	let owner: Peer | undefined;
 	/** 是否有轮次正在跑。`streamingBehavior` 只作交叉校验，这里才是准的。 */
 	let busy = false;
+	/** 收工处理进行中（里面有 await）；这段时间也算忙。 */
+	let settling = false;
 	let lastAnswer: string | undefined;
 	let blockedNotified = false;
 
@@ -379,7 +386,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		// 首行留给模型看，只剥掉 hc CLI 的运输层包装。
 		if (envelope.result) return { action: "transform" as const, text: stripHcTransport(event.text) };
 
-		const running = busy || event.streamingBehavior !== undefined;
+		const running = busy || settling || event.streamingBehavior !== undefined;
 
 		if (!running) {
 			// 空闲：开一轮，派活人 = 发送方。首行留给模型看。
@@ -407,6 +414,9 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 
 	pi.on("agent_settled", async (event, ctx) => {
 		busy = false;
+		// 收工处理里有 await（回发要查地址）。这段时间里进来的消息也按「忙」处理，
+		// 否则它会把自己当成新一轮的派活人，和下面要起的队首撞车。
+		settling = true;
 		blockedNotified = false;
 
 		const current = owner;
@@ -414,34 +424,40 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		const answer = lastAnswer;
 		lastAnswer = undefined;
 
-		// 被中止：只回一句，不附半截回答；队列不动，也不自动开工。
-		if (current) {
-			const body = event.aborted ? piHerdrAgentPrompt.reports.runAborted() : await resultBody(answer);
-			await sendReport(current, ctx, body);
-		}
-
-		if (event.aborted) {
-			// 队列里还有活就不倒计时：那些任务不能跟着一起消失。
-			if (queue.size === 0) await armDestroyCountdown(ctx);
-			return;
-		}
-
-		const next = takeNext();
-		if (next) {
-			owner = next.peer;
-			lastAnswer = undefined;
-			try {
-				pi.sendUserMessage(formatAgentEnvelope({ from: next.peer.id, name: next.peer.name, body: next.parts.join("\n\n") }));
-			} catch (error) {
-				putBackFront(next.id, next.peer, next.parts);
-				owner = undefined;
-				appendNote(`queued message from ${next.id} could not start: ${errorMessage(error)}`);
-				return; // 还有活没干成：不进入空闲销毁。
+		try {
+			// 被中止：只回一句，不附半截回答；队列不动，也不自动开工。
+			if (current) {
+				const body = event.aborted ? piHerdrAgentPrompt.reports.runAborted() : await resultBody(answer);
+				await sendReport(current, ctx, body);
 			}
-			return; // 新一轮已开始，倒计时由那一轮收工时再武装。
-		}
 
-		await armDestroyCountdown(ctx);
+			if (event.aborted) {
+				// 队列里还有活就不倒计时：那些任务不能跟着一起消失。
+				if (queue.size === 0) await armDestroyCountdown(ctx);
+				return;
+			}
+
+			const next = takeNext();
+			if (next) {
+				owner = next.peer;
+				lastAnswer = undefined;
+				try {
+					pi.sendUserMessage(
+						formatAgentEnvelope({ from: next.peer.id, name: next.peer.name, body: next.parts.join("\n\n") }),
+					);
+				} catch (error) {
+					putBackFront(next.id, next.peer, next.parts);
+					owner = undefined;
+					appendNote(`queued message from ${next.id} could not start: ${errorMessage(error)}`);
+					return; // 还有活没干成：不进入空闲销毁。
+				}
+				return; // 新一轮已开始，倒计时由那一轮收工时再武装。
+			}
+
+			await armDestroyCountdown(ctx);
+		} finally {
+			settling = false;
+		}
 	});
 
 	// 不论因为什么起了一轮（cron 投递、人打字、ask），倒计时都作废。
