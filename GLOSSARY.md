@@ -4,7 +4,7 @@
 
 ## Language
 
-### Token 速率（pi-token-stats）
+### Token 用量与速率（pi-token-stats）
 
 **输出速率 (Output Rate)**：
 最近一次完成的 assistant 响应的输出 token 数除以该次耗时（`AssistantMessage.durationMs`），单位 token/秒，显示在 footer 状态行的缓存读取与缓存命中率之间。耗时含思考与首字等待，不单算生成窗口。
@@ -22,6 +22,10 @@ _Avoid_: 区间、时间段、period
 `/token` 报告里唯一统计的模型，由 `ctx.model` 的 `provider/id` 确定，与 `turn` 表里落盘的 `provider/model` 同形。当前模型没有记录时显示 `No data for ...`，不混入其他模型的数据。
 _Avoid_: 活动模型、默认模型（切换模型后默认值不变）
 
+**时间窗用量 (Window Usage)**：
+当前模型在时间窗内的 `Turns` / `Input`（总输入，含缓存；`CH` 为缓存命中率）/ `Output` / `Cost`。直接由 `turn` 明细的 `input / output / cache_read / cache_write / cost` 聚合，不依赖已删除的 `day_model` / `session`。
+_Avoid_: 用量汇总、usage rollup
+
 **首字延迟 (Time to First Token)**：
 时间窗内当前模型测到首字的响应之和除以样本数。首字只能在流式过程中测，样本数可能少于响应数；没有样本时显示 `-`。
 _Avoid_: 平均延迟、平均耗时、平均首字（与旧会话口径混淆）
@@ -35,7 +39,7 @@ SQLite 里 `turn` 表的一行，对应一次 assistant 响应，带时间、会
 _Avoid_: 事件、日志行、raw event
 
 **schema 版本 (Schema Version)**：
-记在 `meta.schema_version` 的整数。打开数据库时按它跑迁移；v3 直接删除旧汇总表，并把版本写回。
+记在 `meta.schema_version` 的整数。打开数据库时按它跑迁移；v3 删除旧汇总表，但保留 `turn` 明细里的用量字段，并把版本写回。
 _Avoid_: 数据库版本、migration id
 
 **写线程 (Writer Worker)**：

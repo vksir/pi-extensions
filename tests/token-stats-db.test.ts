@@ -59,7 +59,11 @@ test("recordTurn：明细落库，windowRow 只聚合指定模型并按窗口过
 			provider: "deepseek",
 			model: "deepseek/deepseek-chat",
 			turns: 2,
+			input: 30,
 			output: 400,
+			cacheRead: 2_700,
+			cacheWrite: 0,
+			cost: 0.03,
 			timedOutput: 400,
 			timedMs: 4_000,
 			firstTokenMs: 1_400,
@@ -106,7 +110,10 @@ test("recordTurn：没有耗时或没有输出的响应不进速率样本", () =
 		const row = store.windowRow(0, "deepseek/deepseek-chat");
 		assert.ok(row);
 		assert.equal(row.turns, 2);
+		assert.equal(row.input, 20);
 		assert.equal(row.output, 100);
+		assert.equal(row.cacheRead, 900);
+		assert.equal(row.cost, 0.01);
 		assert.equal(row.timedOutput, 0);
 		assert.equal(row.timedMs, 0);
 		assert.equal(row.firstTokenSamples, 1);

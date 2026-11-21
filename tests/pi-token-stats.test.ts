@@ -181,7 +181,11 @@ function windowRow(overrides: Partial<WindowModelRow> = {}): WindowModelRow {
 		provider: "deepseek",
 		model: "deepseek/deepseek-chat",
 		turns: 2,
+		input: 1_000,
 		output: 1_000,
+		cacheRead: 9_000,
+		cacheWrite: 0,
+		cost: 0.01,
 		timedOutput: 1_000,
 		timedMs: 10_000,
 		firstTokenMs: 1_600,
@@ -190,42 +194,48 @@ function windowRow(overrides: Partial<WindowModelRow> = {}): WindowModelRow {
 	};
 }
 
-test("renderStats：只显示当前模型的平均首字与平均速率", () => {
+test("renderStats：同时显示当前模型的 token 用量与速率", () => {
 	const row = windowRow();
 	const text = renderStats(row, "deepseek/deepseek-chat", { since: 0, label: "1h" }, 120).join("\n");
 
-	assert.match(text, /Token Speed · Last 1h/);
-	assert.match(text, /Model\s+Avg TTFT\s+Avg Rate/);
+	assert.match(text, /Token Usage & Speed · Last 1h/);
 	// provider 已经在模型名里，不重复拼前缀
 	assert.doesNotMatch(text, /deepseek\/deepseek\/deepseek-chat/);
-	assert.match(text, /deepseek\/deepseek-chat\s+800ms\s+100t\/s/);
-	// 不再有 Turns、All models 或口径说明
-	assert.doesNotMatch(text, /Turns|All models|TTFT =|Rate =/);
+	assert.match(text, /deepseek\/deepseek-chat/);
+	assert.match(text, /Turns\s+2/);
+	assert.match(text, /Input\s+10\.0k \(CH90\.00%\)/);
+	assert.match(text, /Output\s+1\.0k/);
+	assert.match(text, /Cost\s+\$0\.010/);
+	assert.match(text, /Avg TTFT\s+800ms/);
+	assert.match(text, /Avg Rate\s+100t\/s/);
+	assert.doesNotMatch(text, /All models|TTFT =|Rate =/);
 });
 
-test("renderStats：没有计时样本的行显示占位", () => {
+test("renderStats：没有计时样本时用量照常显示，速率显示占位", () => {
 	const text = renderStats(
 		windowRow({ output: 100, timedOutput: 0, timedMs: 0, firstTokenMs: 0, firstTokenSamples: 0 }),
 		"deepseek/deepseek-chat",
 		{ since: 0, label: "3h" },
 		80,
 	).join("\n");
-	assert.match(text, /deepseek\/deepseek-chat\s+-\s+-/);
+	assert.match(text, /Output\s+100/);
+	assert.match(text, /Avg TTFT\s+-/);
+	assert.match(text, /Avg Rate\s+-/);
 });
 
 test("renderStats：没有数据时说明是哪个模型", () => {
 	const empty = renderStats(undefined, "openai/gpt-5", { since: 0, label: "1h" }, 80).join("\n");
-	assert.match(empty, /Token Speed · Last 1h/);
+	assert.match(empty, /Token Usage & Speed · Last 1h/);
 	assert.match(empty, /No data for openai\/gpt-5\./);
 
 	const all = renderStats(undefined, "openai/gpt-5", { since: 0, label: "all" }, 80).join("\n");
-	assert.match(all, /Token Speed · All time/);
+	assert.match(all, /Token Usage & Speed · All time/);
 });
 
 test("renderStats：窄终端里截断模型名，不超出宽度", () => {
 	const row = windowRow({ provider: "very-long-provider", model: "very-long-provider/a-very-long-model-name-here" });
-	const lines = renderStats(row, row.model, { since: 0, label: "1h" }, 60);
-	assert.ok(lines.every((line) => visibleWidth(line) <= 60), lines.join("\n"));
+	const lines = renderStats(row, row.model, { since: 0, label: "1h" }, 40);
+	assert.ok(lines.every((line) => visibleWidth(line) <= 40), lines.join("\n"));
 	assert.match(lines.join("\n"), /…/);
 });
 

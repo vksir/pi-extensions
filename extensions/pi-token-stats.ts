@@ -5,8 +5,8 @@
  * SQLite 库；不做任何 session 文件扫描。
  *
  * `/token` 默认看过去 1 小时，也可以 `/token 3h`、`/token 30m`、`/token 7d`、`/token all`。
- * 所有会话、所有进程的记录都在同一个库里，但报告只统计**当前模型**：只列平均首字与
- * 平均输出速率两个指标，不再按模型拆表。
+ * 所有会话、所有进程的记录都在同一个库里，但报告只统计**当前模型**，同时列出 token
+ * 用量（Turns / Input / Output / Cost）与速度（Avg TTFT / Avg Rate）。
  *
  * footer 状态行里插入最近一次响应的首字时间与输出速率（如 `R1.5M 0.9s 42t/s CH97.1%`），
  * 由 lib/footer-rate.ts 包一层内置 footer 实现。
@@ -93,12 +93,31 @@ export function formatWindowLabel(ms: number): string {
 	return `${days > 0 ? `${days}d` : ""}${hours > 0 ? `${hours}h` : ""}${minutes > 0 ? `${minutes}m` : ""}`;
 }
 
+// ─── 格式化 ───
+
+function fmt(n: number): string {
+	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+	if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+	return `${n}`;
+}
+
+function fmtCost(n: number): string {
+	if (n >= 1) return `$${n.toFixed(2)}`;
+	if (n >= 0.01) return `$${n.toFixed(3)}`;
+	return `$${n.toFixed(4)}`;
+}
+
+// 缓存命中率 = cacheRead / 总输入(含缓存)，与旧版用量报告同口径。
+function hitRate(cacheRead: number, totalInput: number): string {
+	if (totalInput === 0) return "-";
+	return `CH${((cacheRead / totalInput) * 100).toFixed(2)}%`;
+}
+
 // ─── 表格渲染 ───
 
 const INDENT = "  ";
 const GAP = "   ";
-const TTFT_WIDTH = 8;
-const RATE_WIDTH = 8;
+const METRIC_WIDTH = 9;
 
 /** 模型列显示 `provider/model`；模型名已经带 provider 前缀时不重复。 */
 function modelLabel(row: WindowModelRow): string {
@@ -139,30 +158,16 @@ function clipCell(text: string, width: number): string {
 	return `${out}…`;
 }
 
-function renderCells(cells: [string, string, string], modelWidth: number): string {
-	return (
-		INDENT +
-		padCell(clipCell(cells[0], modelWidth), modelWidth) +
-		GAP +
-		padCell(cells[1], TTFT_WIDTH, "right") +
-		GAP +
-		padCell(cells[2], RATE_WIDTH, "right")
-	);
+function renderMetric(metric: string, value: string, valueWidth: number): string {
+	return `${INDENT}${padCell(metric, METRIC_WIDTH)}${GAP}${padCell(clipCell(value, valueWidth), valueWidth, "right")}`;
 }
 
-function tableRule(modelWidth: number): string {
-	return (
-		INDENT +
-		"─".repeat(modelWidth) +
-		GAP +
-		"─".repeat(TTFT_WIDTH) +
-		GAP +
-		"─".repeat(RATE_WIDTH)
-	);
+function metricRule(valueWidth: number): string {
+	return `${INDENT}${"─".repeat(METRIC_WIDTH)}${GAP}${"─".repeat(valueWidth)}`;
 }
 
 /**
- * 只负责排版：单个模型的聚合行由 worker 查好，这里保持纯函数，方便单测。
+ * 只负责排版：当前模型的用量与速率由 worker 查好，这里保持纯函数，方便单测。
  * model 用于没有数据时说明是哪个模型。
  */
 export function renderStats(
@@ -171,7 +176,8 @@ export function renderStats(
 	window: TokenWindow,
 	width = 80,
 ): string[] {
-	const title = window.label === "all" ? "📊 Token Speed · All time" : `📊 Token Speed · Last ${window.label}`;
+	const title =
+		window.label === "all" ? "📊 Token Usage & Speed · All time" : `📊 Token Usage & Speed · Last ${window.label}`;
 	const lines: string[] = [`${INDENT}${title}`, ""];
 
 	if (!row) {
@@ -180,24 +186,30 @@ export function renderStats(
 	}
 
 	const label = modelLabel(row);
-	const longest = Math.max(visibleWidth(label), visibleWidth("Model"));
-	const available = width - INDENT.length - GAP.length * 2 - TTFT_WIDTH - RATE_WIDTH;
-	const modelWidth = Math.max(4, Math.min(longest, available));
+	const totalInput = row.input + row.cacheRead + row.cacheWrite;
 	const ttft = averageTtft(row);
 	const rate = averageRate(row);
+	const usageRows: Array<[string, string]> = [
+		["Turns", String(row.turns)],
+		["Input", `${fmt(totalInput)} (${hitRate(row.cacheRead, totalInput)})`],
+		["Output", fmt(row.output)],
+		["Cost", fmtCost(row.cost)],
+	];
+	const speedRows: Array<[string, string]> = [
+		["Avg TTFT", ttft === undefined ? "-" : formatFirstToken(ttft)],
+		["Avg Rate", rate === undefined ? "-" : formatRate(rate)],
+	];
+	const values = [...usageRows, ...speedRows].map(([, value]) => value);
+	const maxValueWidth = Math.max(8, width - INDENT.length - GAP.length - METRIC_WIDTH);
+	const valueWidth = Math.min(Math.max(visibleWidth("Value"), ...values.map(visibleWidth)), maxValueWidth);
 
-	lines.push(renderCells(["Model", "Avg TTFT", "Avg Rate"], modelWidth));
-	lines.push(tableRule(modelWidth));
-	lines.push(
-		renderCells(
-			[
-				label,
-				ttft === undefined ? "-" : formatFirstToken(ttft),
-				rate === undefined ? "-" : formatRate(rate),
-			],
-			modelWidth,
-		),
-	);
+	lines.push(`${INDENT}${clipCell(label, Math.max(4, width - INDENT.length))}`);
+	lines.push("");
+	lines.push(renderMetric("Metric", "Value", valueWidth));
+	lines.push(metricRule(valueWidth));
+	for (const [metric, value] of usageRows) lines.push(renderMetric(metric, value, valueWidth));
+	lines.push(metricRule(valueWidth));
+	for (const [metric, value] of speedRows) lines.push(renderMetric(metric, value, valueWidth));
 	lines.push("");
 	return lines;
 }

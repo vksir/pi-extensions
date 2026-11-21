@@ -22,7 +22,7 @@ node --test tests/*.test.ts
 | [pi-balance](extensions/pi-balance.ts) | 查询 AI 模型提供商余额/额度（支持 DeepSeek、Moonshot、OpenRouter、OpenAI Codex、OpenCode Go、智谱 GLM）；`/balance` 列支持的 Provider，`/balance all` 查全部，`/balance <provider>` 查单个 |
 | [pi-notify](extensions/pi-notify.ts) | 任务完成后发送桌面通知（支持 iTerm2、Kitty、Ghostty、WezTerm、Windows Terminal）；需 Pi ≥ 1.3.0 |
 | [pi-title](extensions/pi-title.ts) | Agent 运行时在窗口标题显示旋转动画，结束后恢复原标题；herdr 环境（两代）不修改窗口标题，`/name` 更名与会话启动（resume / `/reload` / 切换会话）时同步重命名所在标签（旧 herdr 经 CLI 直接寻址，herdr app 经 herdr-app CLI ls 寻址）；进程内子 agent 会话（ctx.mode 非 "tui"）不参与标题与标签管理 |
-| [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 速率（`/token`，默认过去 1 小时，支持 `3h` / `30m` / `7d` / `all`），按当前模型汇总所有会话与进程的平均首字与输出速率；footer 状态行里插入最近一次响应的首字时间与输出速率（`R1.5M 0.9s 42t/s CH97.1%`） |
+| [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 用量与速率（`/token`，默认过去 1 小时，支持 `3h` / `30m` / `7d` / `all`），按当前模型汇总所有会话与进程的 Turns / Input / Output / Cost 与平均首字/输出速率；footer 状态行里插入最近一次响应的首字时间与输出速率（`R1.5M 0.9s 42t/s CH97.1%`） |
 | [pi-context](extensions/pi-context.ts) | `/context` 触发一次空转请求，导出这次请求的系统提示词与工具声明（含 codemode 动态描述），两者同源 |
 | [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron [间隔] [once] <prompt>`（省略间隔按 `15m`）、`/cron list`、`/cron delete [id]` |
 | [pi-btw](extensions/pi-btw.ts) | 顺带分派：仅在 herdr / herdr app 环境注册 `/btw <消息>`，新开一个标签，fork 当前会话启动 pi 并把消息作为首条消息递交；本轮还在跑时先把 fork 源截到上一个完整轮次，避免新会话继承半截 turn（见 [ADR-0008](docs/adr/0008-btw-forks-at-turn-boundary.md)） |
@@ -41,15 +41,18 @@ footer 状态行里多一段首字时间与输出速率，位置在缓存读取�
 
 pi 没有给 footer 留插槽，`setFooter` 只能整体替换，所以 `lib/footer-rate.ts` 用内置 `FooterComponent` 渲染原状态行，只往里面插一段首字时间与速率：路径、用量、命中率、上下文占比、模型右对齐、扩展状态行仍由 pi 自己管。插入多出的宽度从模型名前的留白里扣回，窄终端上留白不够才截断。代价是扩展上下文拿不到的几段不显示：虚拟模型的路由结果（`→ 物理模型`）与订阅标记（`(sub)`）。
 
-### 时间窗速率与 SQLite 存储
+### 时间窗用量与速率
 
-`/token` 默认汇总**过去 1 小时**，也可以 `/token 3h`。参数沿用旧命令的 `<数字><单位>` 写法：`30m`、`6h`、`24h`、`7d`（旧默认）、`all`；旧的 `Out` 已随柱状图移除。窗口覆盖所有会话、所有 pi 进程，但只统计**当前模型**（`ctx.model` 的 `provider/id`），不再按模型拆表（见 [ADR-0009](docs/adr/0009-rolling-window-from-turn-detail.md)）：
+`/token` 默认汇总**过去 1 小时**，也可以 `/token 3h`。参数沿用旧命令的 `<数字><单位>` 写法：`30m`、`6h`、`24h`、`7d`（旧默认）、`all`；旧的 `Out` 已随柱状图移除。窗口覆盖所有会话、所有 pi 进程，但只统计**当前模型**（`ctx.model` 的 `provider/id`），不按模型拆表（见 [ADR-0009](docs/adr/0009-rolling-window-from-turn-detail.md)）：
 
+- `Turns`：窗口内的响应数。
+- `Input`：总输入（未缓存 + 缓存读 + 缓存写），括号内 `CH` 是缓存命中率 = 缓存读 ÷ 总输入。
+- `Output` / `Cost`：窗口内的输出 token 与费用。
 - `Avg TTFT`：窗口内当前模型测到首字的响应之和 ÷ 样本数。首字只能在流式过程中测到，所以续聊、重启、老会话里的响应可能没有样本；没有样本时显示 `-`。
 - `Avg Rate`：窗口内当前模型有耗时响应的输出 token 之和 ÷ 这些响应的耗时之和，单位 token/秒。按 token 加权，不是逐次速率的算术平均；耗时取 `AssistantMessage.durationMs`，是包含首字等待的完整请求时间。没有计时样本时显示 `-`。
 - 当前模型没有记录时显示 `No data for <provider/model>.`，不会混入其他模型的数据。
 
-数据落在 `~/.pi/agent/pi-token-stats/token-stats.db`，每次 `turn_end` 只写一行 `turn` 明细（时间、会话、模型、用量、耗时、首字）。滚动窗口的边界不固定，直接对明细做 `at >= 窗口起点 AND model = 当前模型` 的聚合，不再维护按天/按会话的汇总表。
+数据落在 `~/.pi/agent/pi-token-stats/token-stats.db`，每次 `turn_end` 只写一行 `turn` 明细（时间、会话、模型、用量、耗时、首字）。用量字段 `input / output / cache_read / cache_write / cost` 都在这行里，所以删掉旧的按天/按会话汇总表不会丢用量；`/token` 直接对明细做 `at >= 窗口起点 AND model = 当前模型` 的聚合。
 
 写库在 **worker 线程**里（`lib/token-stats-worker.ts`）：`turn_end` 只 `postMessage` 一轮响应就返回，建库、迁移、INSERT 都在 worker 里按顺序执行；多进程抢写时 `busy_timeout` 的等待也不会卡住 TUI 的事件循环。worker 启动时用 `--disable-warning=ExperimentalWarning` 屏蔽 Node 22/23 的 SQLite 实验性警告，否则那行提示会被 pi 画进 TUI。`/token` 的查询同样走这个 worker（消息 FIFO，查询前投递的 turn 一定已提交），主线程不碰 SQLite。
 

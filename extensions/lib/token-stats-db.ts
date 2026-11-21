@@ -70,8 +70,15 @@ export interface WindowModelRow {
 	model: string;
 	/** 窗口内的响应数（含没有计时样本的响应） */
 	turns: number;
+	/** 窗口内的未缓存输入 token 数 */
+	input: number;
 	/** 窗口内的输出 token 总数 */
 	output: number;
+	/** 窗口内的缓存读取与缓存写入 token 数 */
+	cacheRead: number;
+	cacheWrite: number;
+	/** 窗口内的总费用 */
+	cost: number;
 	/** 有耗时的响应的输出之和与耗时之和（ms），平均速率由两者相除得到 */
 	timedOutput: number;
 	timedMs: number;
@@ -93,7 +100,11 @@ interface WindowRow {
 	provider: string | null;
 	model: string | null;
 	turns: number;
+	input: number;
 	output: number;
+	cache_read: number;
+	cache_write: number;
+	cost: number;
 	timed_output: number;
 	timed_ms: number;
 	first_token_ms: number;
@@ -209,7 +220,11 @@ class SqliteStore implements TokenStatsStore {
 		);
 		this.selectModelWindow = this.db.prepare(
 			"SELECT COALESCE(provider, '') AS provider, COALESCE(model, 'unknown') AS model, COUNT(*) AS turns, " +
+				"COALESCE(SUM(input), 0) AS input, " +
 				"COALESCE(SUM(output), 0) AS output, " +
+				"COALESCE(SUM(cache_read), 0) AS cache_read, " +
+				"COALESCE(SUM(cache_write), 0) AS cache_write, " +
+				"COALESCE(SUM(cost), 0) AS cost, " +
 				"COALESCE(SUM(CASE WHEN output > 0 AND duration_ms > 0 THEN output ELSE 0 END), 0) AS timed_output, " +
 				"COALESCE(SUM(CASE WHEN output > 0 AND duration_ms > 0 THEN duration_ms ELSE 0 END), 0) AS timed_ms, " +
 				"COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL THEN first_token_ms ELSE 0 END), 0) AS first_token_ms, " +
@@ -247,7 +262,11 @@ class SqliteStore implements TokenStatsStore {
 			provider: row.provider ?? "",
 			model: row.model ?? "unknown",
 			turns: row.turns,
+			input: row.input,
 			output: row.output,
+			cacheRead: row.cache_read,
+			cacheWrite: row.cache_write,
+			cost: row.cost,
 			timedOutput: row.timed_output,
 			timedMs: row.timed_ms,
 			firstTokenMs: row.first_token_ms,

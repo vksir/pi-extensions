@@ -9,7 +9,7 @@ SQLite 的 `turn` 表从引入起就按响应逐行记录时间、模型、输�
 - **默认过去 1 小时**：`/token` 不带参数时汇总最近 1 小时；沿用旧的 `<数字><单位>` 参数写法，支持 `3h`、`30m`、`24h`、`7d`（旧默认）、`all`。旧的 `Out` 随柱状图一起移除。
 - **只统计当前模型**：模型由 `ctx.model` 的 `provider/id` 确定，与 `turn.model` 落盘的 `provider/model` 同形。查询条件是 `at >= 窗口起点 AND model = 当前模型`；当前模型没有记录时显示 `No data for ...`，不混入其他模型的数据。
 - **所有会话、所有进程一视同仁**：不再有「当前会话」区块。多个 pi 进程共用同一个库，同一个模型在 `turn` 里的每一行都参与聚合，会话 id 只作为明细来源保留。
-- **只展示两个指标**：`Avg TTFT`（测到首字的样本均值）与 `Avg Rate`（有耗时响应的输出之和 ÷ 耗时之和，token/秒）。`Avg Rate` 按 token 加权，耗时取完整请求时间（含首字等待），与 footer 的口径一致。表格不写口径说明，也不再列 `Turns` 或 `All models`。
+- **同时展示用量与速度**：用量行给 `Turns`、`Input`（总输入，括号内 `CH` 命中率）、`Output`、`Cost`；速度行给 `Avg TTFT`（测到首字的样本均值）与 `Avg Rate`（有耗时响应的输出之和 ÷ 耗时之和，token/秒）。`Avg Rate` 按 token 加权，耗时取完整请求时间（含首字等待），与 footer 的口径一致。表格不写口径说明，也不再列 `All models`。
 - **schema v3 迁移**：打开旧库时直接删除 `day_model` / `session`，以及 v2 一度改名保留的 `archive_day_model` / `archive_session`；删除 v1 的 `turn_session` 索引；版本号写入 `meta.schema_version`。旧汇总数据不保留。迁移只做一次，多个进程同时打开时靠 `BEGIN IMMEDIATE` 排队。
 - **删除旧 JSON 导入**：`token-stats-legacy.ts` 是上一版明确标注「下个版本删除」的临时代码。v3 之后按小时统计只依赖 `turn`，旧 JSON 没有逐轮时间与首字，无法补出可用样本；旧导入标记也一并删除。
 
@@ -25,6 +25,7 @@ SQLite 的 `turn` 表从引入起就按响应逐行记录时间、模型、输�
 ## 后果
 
 - 时间窗统计只覆盖 SQLite 里有 `turn` 明细的响应。旧 JSON 与旧汇总表的数据都不再保留，升级后 `/token` 不会显示它们；这是有意的，因为它们的粒度本来就不支持小时窗口。
+- 用量字段（`input / output / cache_read / cache_write / cost`）仍逐轮存在 `turn` 表里，删掉旧汇总表不会丢用量；`/token` 的 `Turns / Input / Output / Cost` 直接聚合这些字段。
 - 只装过旧 JSON、从未建过 SQLite 库的用户，升级后不会自动导入旧数据；`token-stats.json` 原文件仍在 agent dir 下，需要时可手工查。
 - 切换模型后，`/token` 立即改为统计新模型；新模型在窗口内还没有响应时显示 `No data for ...`，不会拿旧模型的数据顶替。
 - `turn` 表一轮一行，数据库随使用线性增长；`turn_at` 索引让窗口查询只扫最近一段。清理策略不在本 ADR 范围。
