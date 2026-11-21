@@ -1,41 +1,32 @@
 /**
  * Token Stats Extension
  *
- * 全局 Token 用量统计。每次 turn_end 从事件中提取 usage，写进 agent dir 下的
+ * 全局 Token 用量与耗时统计。每次 turn_end 从事件中提取 usage，写进 agent dir 下的
  * SQLite 库；不做任何 session 文件扫描。
  *
- * 一次响应写三处（见 lib/token-stats-db.ts）：原始明细 `turn`、按天 × 模型的
- * `day_model`、按会话的 `session`。报告末尾只列**当前会话**的平均首字与平均输出速率
- * （按 token 加权），历史会话留在库里，不参与展示。
- *
- * 命令：
- *   /token             — 近 7 天统计 + Input 柱状图 + 当前会话速率（默认）
- *   /token all         — 全部历史统计（/token 0d 亦可）
- *   /token 3d          — 近 3 天（Nd 任意天数）
- *   /token out         — 显示 Output 柱状图（可与天数组合，如 /token 7d Out）
+ * `/token` 默认看过去 1 小时，也可以 `/token 3h`、`/token 30m`、`/token all`。
+ * 所有会话、所有进程的记录都在同一个库里，按模型汇总成一张表，只列平均首字与
+ * 平均输出速率。
  *
  * footer 状态行里插入最近一次响应的首字时间与输出速率（如 `R1.5M 0.9s 42t/s CH97.1%`），
  * 由 lib/footer-rate.ts 包一层内置 footer 实现。
  *
- * 数据库在 `~/.pi/agent/pi-token-stats/token-stats.db`；读写都交给 lib/token-stats-worker.ts
- * 的 worker 线程，主线程只收发消息，不碰 SQLite。旧 JSON 的静默迁移是临时代码，
- * 见 lib/token-stats-legacy.ts，下个版本删除。entry 渲染在 lib/render.ts。
+ * 数据库在 `~/.pi/agent/pi-token-stats/token-stats.db`，只保留 `turn` 明细；schema v2
+ * 打开时把旧的 `day_model` / `session` 汇总改名归档，见 lib/token-stats-db.ts。读写都交给
+ * lib/token-stats-worker.ts 的 worker 线程，主线程只收发消息，不碰 SQLite。entry 渲染在
+ * lib/render.ts。
  */
 
 import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { visibleWidth, type AutocompleteItem } from "@earendil-works/pi-tui";
 import { createFirstTokenTimer, createRateFooter, formatFirstToken, formatRate } from "./lib/footer-rate.ts";
 import { renderDimLines } from "./lib/render.ts";
-import { averageFirstTokenMs, averageOutputRate, type SessionRecord, type SessionUsageTotals } from "./lib/session-usage.ts";
 import { openTokenStatsClient, type TokenStatsClient } from "./lib/token-stats-client.ts";
-import type { DayModelRow } from "./lib/token-stats-db.ts";
+import type { WindowModelRow } from "./lib/token-stats-db.ts";
 
 // ─── 存储 ───
-
-/** 下个版本删掉这一行与 importLegacyCache 的 import：旧 JSON 迁移是临时的。 */
-const LEGACY_CACHE_FILE = "token-stats.json";
 
 function tokenStatsDir(): string {
 	return join(getAgentDir(), "pi-token-stats");
@@ -44,261 +35,230 @@ function tokenStatsDir(): string {
 let client: TokenStatsClient | undefined;
 
 /**
- * 懒启动写线程：建库、静默迁移、写入、查询都在 worker 里排队，
+ * 懒启动写线程：建库、迁移、写入、查询都在 worker 里排队，
  * 主线程只收发消息，不碰 SQLite。
  */
 function statsClient(): TokenStatsClient {
 	if (!client) {
-		client = openTokenStatsClient({
-			dbPath: join(tokenStatsDir(), "token-stats.db"),
-			// 临时：旧版 JSON 的静默迁移，下个版本连同 lib/token-stats-legacy.ts 一起删除
-			legacyPath: join(getAgentDir(), LEGACY_CACHE_FILE),
-		});
+		client = openTokenStatsClient({ dbPath: join(tokenStatsDir(), "token-stats.db") });
 	}
 	return client;
 }
-
-// ─── usage 聚合 ───
-
-type ModelUsage = SessionUsageTotals;
 
 interface TokenStatsEntry {
 	lines: string[];
 }
 
-function emptyUsage(): ModelUsage {
-	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
-}
+// ─── 时间窗 ───
 
-function addUsage(target: ModelUsage, usage: ModelUsage): void {
-	target.input += usage.input;
-	target.output += usage.output;
-	target.cacheRead += usage.cacheRead;
-	target.cacheWrite += usage.cacheWrite;
-	target.cost += usage.cost;
-}
+const MINUTE_MS = 60_000;
+const HOUR_MS = 3_600_000;
+const DEFAULT_WINDOW_MS = HOUR_MS;
+const UNIT_MS: Record<string, number> = { m: MINUTE_MS, h: HOUR_MS, d: 86_400_000 };
 
-function computeTotalsByModel(rows: DayModelRow[]): Map<string, ModelUsage> {
-	const byModel = new Map<string, ModelUsage>();
-	for (const row of rows) {
-		let acc = byModel.get(row.model);
-		if (!acc) {
-			acc = emptyUsage();
-			byModel.set(row.model, acc);
-		}
-		addUsage(acc, row);
-	}
-	return byModel;
-}
-
-function sumUsage(byModel: Map<string, ModelUsage>): ModelUsage {
-	const total = emptyUsage();
-	for (const usage of byModel.values()) addUsage(total, usage);
-	return total;
-}
-
-// ─── 格式化 ───
-
-function fmt(n: number): string {
-	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-	if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-	return `${n}`;
-}
-
-function fmtCost(n: number): string {
-	if (n >= 1) return `$${n.toFixed(2)}`;
-	if (n >= 0.01) return `$${n.toFixed(3)}`;
-	return `$${n.toFixed(4)}`;
-}
-
-function shortDate(date?: Date): string {
-	const d = date ?? new Date();
-	return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
-// 缓存命中率 = cacheRead / 总输入(含缓存)。不用 cacheRead/(cacheRead+cacheWrite)：
-// DeepSeek 等 OpenAI 兼容 provider 不报告 cache_write_tokens（pi 映射后 cacheWrite 恒 0，
-// 未命中 token 被计入 input），旧口径会恒显示 100%。
-// 新口径在 DeepSeek 下等价于 hit/(hit+miss)，在 Anthropic 下度量"输入中缓存命中占比"。
-function hitRate(cacheRead: number, totalInput: number): string {
-	if (totalInput === 0) return "-";
-	return `CH${((cacheRead / totalInput) * 100).toFixed(2)}%`;
-}
-
-// ─── 柱状图渲染 ───
-
-interface DailyRow {
-	date: string;
-	model: string;
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-}
-
-interface ChartData {
-	rows: DailyRow[];
-	maxInput: number;
-	maxOutput: number;
-}
-
-function barWidth(termWidth: number): number {
-	return Math.min(termWidth - 26, 80);
-}
-
-function renderBar(value: number, max: number, width: number): string {
-	if (max === 0) return " ".repeat(width);
-	return "█".repeat(Math.max(1, Math.round((value / max) * width)));
-}
-
-/** 近 N 天 = 含今天往前数 N 天；days = 0 表示全部历史（没有起点）。 */
-function cutoffDate(days: number): string | undefined {
-	if (days === 0) return undefined;
-	const cutoff = new Date();
-	cutoff.setDate(cutoff.getDate() - days + 1);
-	return shortDate(cutoff);
-}
-
-function collectChartData(dayRows: DayModelRow[]): ChartData {
-	const rows: DailyRow[] = [];
-	let maxInput = 0;
-	let maxOutput = 0;
-	for (const day of dayRows) {
-		const input = day.input + day.cacheRead + day.cacheWrite;
-		const output = day.output;
-		if (input > maxInput) maxInput = input;
-		if (output > maxOutput) maxOutput = output;
-		rows.push({
-			date: day.date,
-			model: day.model,
-			input,
-			output,
-			cacheRead: day.cacheRead,
-			cacheWrite: day.cacheWrite,
-		});
-	}
-	return { rows, maxInput: maxInput || 1, maxOutput: maxOutput || 1 };
-}
-
-function appendChart(
-	lines: string[],
-	rows: DailyRow[],
-	title: string,
-	valueOf: (row: DailyRow) => number,
-	maxValue: number,
-	width: number,
-	showHit: boolean,
-): void {
-	lines.push(`  ${title}`);
-	let prevDate = "";
-	for (const row of rows) {
-		const value = valueOf(row);
-		const dateLabel = row.date === prevDate ? "     " : row.date.slice(5);
-		if (row.date !== prevDate && prevDate !== "") lines.push("");
-		prevDate = row.date;
-		// bar 区域固定宽度（padEnd），使数值+命中率列在所有行落在同一纵列
-		const bar = renderBar(value, maxValue, width).padEnd(width);
-		// 值右对齐固定列；命中率用括号括起，格式: 184.7k (CH93.78%)
-		const hitPart = showHit ? ` (${hitRate(row.cacheRead, row.input).padStart(8)})` : "";
-		lines.push(`  ${dateLabel} ${bar}  ${fmt(value).padStart(8)}${hitPart}  ${row.model}`);
-	}
-	lines.push("");
-}
-
-function appendModelSummary(lines: string[], dayRows: DayModelRow[]): void {
-	const byModel = computeTotalsByModel(dayRows);
-	const total = sumUsage(byModel);
-	const totalInput = total.input + total.cacheRead + total.cacheWrite;
-
-	// 汇总按模型名称排序，便于在多次查看间定位同一模型
-	const modelList = [...byModel.entries()]
-		.map(([key, usage]) => ({
-			key,
-			input: usage.input + usage.cacheRead + usage.cacheWrite,
-			cacheRead: usage.cacheRead,
-			cacheWrite: usage.cacheWrite,
-			output: usage.output,
-			cost: usage.cost,
-		}))
-		.sort((a, b) => a.key.localeCompare(b.key));
-
-	for (const model of modelList) {
-		const pct = totalInput > 0 ? ((model.input / totalInput) * 100).toFixed(1) : "0.0";
-		lines.push(`  ● ${model.key} (${pct}%)`);
-		// In 显示总输入（未命中+命中），括号内为缓存命中率
-		lines.push(`    In: ${fmt(model.input)} (${hitRate(model.cacheRead, model.input)}) · Out: ${fmt(model.output)} · ${fmtCost(model.cost)}`);
-	}
-	lines.push("");
-	// Input 显示总输入（未命中+命中）
-	lines.push(`  Input: ${fmt(totalInput)} (${hitRate(total.cacheRead, totalInput)}) · Output: ${fmt(total.output)} · ${fmtCost(total.cost)}`);
-	lines.push("");
-}
-
-// ─── 当前会话 ───
-
-/** 只列当前会话：历史会话的记录保留在库里，不参与展示。 */
-function appendCurrentSession(lines: string[], record: SessionRecord | undefined): void {
-	lines.push("  当前会话");
-	if (!record) {
-		lines.push("  （本会话暂无记录）", "");
-		return;
-	}
-	const rate = averageOutputRate(record);
-	const first = averageFirstTokenMs(record);
-	const rateText = rate === undefined ? "-" : formatRate(rate);
-	const firstText = first === undefined ? "-" : formatFirstToken(first);
-	lines.push(`  ${record.turns} 轮 · Out ${fmt(record.usage.output)} · 平均首字 ${firstText} · 平均速率 ${rateText}`);
-	lines.push("  平均首字只统计流式中测到的响应；平均速率 = 有耗时响应的输出 token ÷ 耗时之和");
-	lines.push("");
+export interface TokenWindow {
+	/** 窗口起点（epoch ms，含）；0 表示全部历史 */
+	since: number;
+	/** 显示用标签：1h / 30m / 1d / 1h30m / all */
+	label: string;
 }
 
 /**
- * 只负责排版：按天数据已按天数过滤好，会话记录永远是当前会话。
- * 查询在 worker 里做，这里保持纯函数，方便单测。
+ * 解析 `/token` 参数：空 = 过去 1 小时；`3h` / `30m` / `1d`；可连写（`1h30m` 或
+ * `1h 30m`）；`all` = 全部历史。非法参数抛错，由命令处理成通知。
  */
-export function renderStats(
-	dayRows: DayModelRow[],
-	session: SessionRecord | undefined,
-	days: number,
-	showOutput = false,
-): string[] {
-	const label = days === 0 ? "全部" : `近 ${days} 天`;
-	const lines: string[] = [`  📊 Token 用量趋势 (${label})`, ""];
-	if (dayRows.length === 0) {
-		lines.push("  （暂无数据）", "");
-	} else {
-		const { rows, maxInput, maxOutput } = collectChartData(dayRows);
-		const width = barWidth((process.stdout as { columns?: number })?.columns ?? 80);
+export function parseTokenWindow(args: string, now: number = Date.now()): TokenWindow {
+	const text = args.trim().toLowerCase();
+	if (!text) return { since: now - DEFAULT_WINDOW_MS, label: "1h" };
+	if (text === "all") return { since: 0, label: "all" };
 
-		if (showOutput) {
-			appendChart(lines, rows, "Tokens per Day (Output)", (row) => row.output, maxOutput, width, false);
-		} else {
-			appendChart(lines, rows, "Tokens per Day (Input)", (row) => row.input, maxInput, width, true);
+	let ms = 0;
+	for (const part of text.split(/\s+/)) {
+		if (!/^(?:\d+[mhd])+$/.test(part)) throw new Error(`unknown argument '${part}'`);
+		for (const match of part.matchAll(/(\d+)([mhd])/g)) {
+			ms += Number(match[1]) * UNIT_MS[match[2]!]!;
 		}
+	}
+	if (ms <= 0) throw new Error("window must be greater than 0");
+	return { since: now - ms, label: formatWindowLabel(ms) };
+}
 
-		appendModelSummary(lines, dayRows);
+/** 把毫秒写成紧凑标签：`30m`、`3h`、`1d`、`1h30m`。 */
+export function formatWindowLabel(ms: number): string {
+	const totalMinutes = Math.round(ms / MINUTE_MS);
+	if (totalMinutes < 60) return `${totalMinutes}m`;
+	const days = Math.floor(totalMinutes / 1440);
+	const hours = Math.floor((totalMinutes % 1440) / 60);
+	const minutes = totalMinutes % 60;
+	return `${days > 0 ? `${days}d` : ""}${hours > 0 ? `${hours}h` : ""}${minutes > 0 ? `${minutes}m` : ""}`;
+}
+
+// ─── 表格渲染 ───
+
+interface ModelStats {
+	label: string;
+	turns: number;
+	timedOutput: number;
+	timedMs: number;
+	firstTokenMs: number;
+	firstTokenSamples: number;
+}
+
+const INDENT = "  ";
+const GAP = "   ";
+const TURNS_WIDTH = 5;
+const TTFT_WIDTH = 6;
+const RATE_WIDTH = 7;
+
+/** 模型列显示 `provider/model`；模型名已经带 provider 前缀时不重复。 */
+function modelLabel(row: WindowModelRow): string {
+	const provider = row.provider.trim();
+	const model = row.model.trim() || "unknown";
+	if (!provider || model === provider || model.startsWith(`${provider}/`)) return model;
+	return `${provider}/${model}`;
+}
+
+function toStats(row: WindowModelRow): ModelStats {
+	return {
+		label: modelLabel(row),
+		turns: row.turns,
+		timedOutput: row.timedOutput,
+		timedMs: row.timedMs,
+		firstTokenMs: row.firstTokenMs,
+		firstTokenSamples: row.firstTokenSamples,
+	};
+}
+
+function totalStats(rows: ModelStats[]): ModelStats {
+	return {
+		label: "All models",
+		turns: rows.reduce((sum, row) => sum + row.turns, 0),
+		timedOutput: rows.reduce((sum, row) => sum + row.timedOutput, 0),
+		timedMs: rows.reduce((sum, row) => sum + row.timedMs, 0),
+		firstTokenMs: rows.reduce((sum, row) => sum + row.firstTokenMs, 0),
+		firstTokenSamples: rows.reduce((sum, row) => sum + row.firstTokenSamples, 0),
+	};
+}
+
+function averageTtft(stats: ModelStats): number | undefined {
+	if (stats.firstTokenSamples <= 0) return undefined;
+	return stats.firstTokenMs / stats.firstTokenSamples;
+}
+
+/** 按 token 加权：输出之和 ÷ 耗时之和，不是逐次速率的算术平均。 */
+function averageRate(stats: ModelStats): number | undefined {
+	if (stats.timedMs <= 0) return undefined;
+	return stats.timedOutput / (stats.timedMs / 1000);
+}
+
+function padCell(text: string, width: number, align: "left" | "right" = "left"): string {
+	const pad = " ".repeat(Math.max(0, width - visibleWidth(text)));
+	return align === "right" ? pad + text : text + pad;
+}
+
+/** 截断到指定宽度并补省略号；不用 pi-tui 的 truncateToWidth，避免它插入 ANSI 重置打断 dim 色。 */
+function clipCell(text: string, width: number): string {
+	if (visibleWidth(text) <= width) return text;
+	if (width <= 1) return "…";
+	let out = "";
+	let used = 0;
+	for (const char of text) {
+		const w = visibleWidth(char);
+		if (used + w > width - 1) break;
+		out += char;
+		used += w;
+	}
+	return `${out}…`;
+}
+
+function renderCells(cells: [string, string, string, string], modelWidth: number): string {
+	return (
+		INDENT +
+		padCell(clipCell(cells[0], modelWidth), modelWidth) +
+		GAP +
+		padCell(cells[1], TURNS_WIDTH, "right") +
+		GAP +
+		padCell(cells[2], TTFT_WIDTH, "right") +
+		GAP +
+		padCell(cells[3], RATE_WIDTH, "right")
+	);
+}
+
+function renderStatsRow(stats: ModelStats, modelWidth: number): string {
+	const ttft = averageTtft(stats);
+	const rate = averageRate(stats);
+	return renderCells(
+		[
+			stats.label,
+			String(stats.turns),
+			ttft === undefined ? "-" : formatFirstToken(ttft),
+			rate === undefined ? "-" : formatRate(rate),
+		],
+		modelWidth,
+	);
+}
+
+function tableRule(modelWidth: number): string {
+	return (
+		INDENT +
+		"─".repeat(modelWidth) +
+		GAP +
+		"─".repeat(TURNS_WIDTH) +
+		GAP +
+		"─".repeat(TTFT_WIDTH) +
+		GAP +
+		"─".repeat(RATE_WIDTH)
+	);
+}
+
+/**
+ * 只负责排版：按模型聚合的行由 worker 查好，这里保持纯函数，方便单测。
+ */
+export function renderStats(rows: WindowModelRow[], window: TokenWindow, width = 80): string[] {
+	const title = window.label === "all" ? "📊 Token Speed · All time" : `📊 Token Speed · Last ${window.label}`;
+	const lines: string[] = [`${INDENT}${title}`, ""];
+
+	if (rows.length === 0) {
+		lines.push(
+			INDENT + (window.label === "all" ? "No turns recorded yet." : `No turns in the last ${window.label}.`),
+			"",
+		);
+		return lines;
 	}
 
-	appendCurrentSession(lines, session);
+	const stats = rows.map(toStats).sort((a, b) => b.turns - a.turns || a.label.localeCompare(b.label));
+	const all = totalStats(stats);
+	const longest = Math.max(...stats.map((row) => visibleWidth(row.label)), visibleWidth("Model"));
+	const available =
+		width - INDENT.length - GAP.length * 3 - TURNS_WIDTH - TTFT_WIDTH - RATE_WIDTH;
+	const modelWidth = Math.max(4, Math.min(longest, available));
+
+	lines.push(renderCells(["Model", "Turns", "TTFT", "Rate"], modelWidth));
+	lines.push(tableRule(modelWidth));
+	for (const row of stats) lines.push(renderStatsRow(row, modelWidth));
+	lines.push(tableRule(modelWidth));
+	lines.push(renderStatsRow(all, modelWidth));
+	lines.push("");
+	lines.push(`${INDENT}TTFT = average time to first token`);
+	lines.push(`${INDENT}Rate = output tokens ÷ full request time`);
+	lines.push("");
 	return lines;
 }
 
-/** /token 的参数候选。可多写（如 `/token 7d Out`），补全时排除已写过的 */
+/** /token 的参数候选。可多写（如 `/token 1h 30m`），补全时排除已写过的 */
 const TOKEN_ARGS: AutocompleteItem[] = [
-	{ value: "7d", label: "7d", description: "近 7 天（默认）" },
-	{ value: "1d", label: "1d", description: "近 1 天" },
-	{ value: "3d", label: "3d", description: "近 3 天" },
-	{ value: "14d", label: "14d", description: "近 14 天" },
-	{ value: "30d", label: "30d", description: "近 30 天" },
-	{ value: "90d", label: "90d", description: "近 90 天" },
+	{ value: "1h", label: "1h", description: "过去 1 小时（默认）" },
+	{ value: "3h", label: "3h", description: "过去 3 小时" },
+	{ value: "6h", label: "6h", description: "过去 6 小时" },
+	{ value: "12h", label: "12h", description: "过去 12 小时" },
+	{ value: "24h", label: "24h", description: "过去 24 小时" },
 	{ value: "all", label: "all", description: "全部历史" },
-	{ value: "Out", label: "Out", description: "改看 Output 柱状图" },
 ];
 
 /**
  * 只补正在输入的最后一个参数，并排除已写过的。补全项的 `value` 带上前面已写好的参数：
- * pi 的参数补全会整段替换参数文本，不带上的话 `/token all o` 补完会变成 `/token Out`，
- * 天数被吃掉。
+ * pi 的参数补全会整段替换参数文本，不带上的话 `/token all 3` 补完会变成 `/token 3h`，
+ * 前一个参数被吃掉。
  */
 export function tokenArgumentCompletions(prefix: string): AutocompleteItem[] | null {
 	// 不 trim：末尾的空格表示上一个参数已写完，此时该补下一个
@@ -341,7 +301,7 @@ export default function (pi: ExtensionAPI) {
 		firstToken.record(event.message, event.assistantMessageEvent);
 	});
 
-	// turn_end: 从事件中直接取 usage，一次事务写 turn / day_model / session
+	// turn_end: 从事件中直接取 usage，写一轮明细
 	pi.on("turn_end", (event, ctx) => {
 		try {
 			// event.message 是所有消息的联合类型，只有 assistant 消息带 usage
@@ -351,7 +311,6 @@ export default function (pi: ExtensionAPI) {
 			const model = msg.provider && msg.model ? `${msg.provider}/${msg.model}` : msg.model || "unknown";
 			// 首字时间只在流式过程中测得到，必须当场落盘，否则重启后无从补算。
 			statsClient().recordTurn({
-				date: shortDate(),
 				at: Date.now(),
 				sessionId: ctx.sessionManager.getSessionId(),
 				sessionName: ctx.sessionManager.getSessionName(),
@@ -373,28 +332,17 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("token", {
-		description: "Token 用量统计。默认近7天。参数: all/Nd(天数) / Output|Out",
+		description: "过去 1 小时的 Token 速率。参数: 3h / 30m / 24h / all",
 		getArgumentCompletions: (prefix) => tokenArgumentCompletions(prefix),
 		handler: async (args, ctx) => {
 			try {
-				const parts = args.trim().split(/\s+/);
-				// 默认近 7 天；all / 0d 表示全部历史
-				let days = 7;
-				let showOutput = false;
-				for (const part of parts) {
-					const token = part.toLowerCase();
-					const match = token.match(/^(\d+)d$/);
-					if (match) days = parseInt(match[1], 10);
-					else if (token === "all") days = 0;
-					else if (token === "output" || token === "out") showOutput = true;
-				}
-
+				const window = parseTokenWindow(args);
 				// 查询走写线程：按 FIFO 一定看得到之前所有已提交的 turn，主线程不被 SQLite 阻塞
-				const [dayRows, session] = await Promise.all([
-					statsClient().dayRows(cutoffDate(days)),
-					statsClient().sessionRecord(ctx.sessionManager.getSessionId()),
-				]);
-				pi.appendEntry<TokenStatsEntry>("token-stats", { lines: renderStats(dayRows, session, days, showOutput) });
+				const rows = await statsClient().windowRows(window.since);
+				// entry 外层 Box 左右各留 1 格，表格按可用内容宽度排版
+				const columns = (process.stdout as { columns?: number })?.columns || 80;
+				const width = Math.max(20, columns - 2);
+				pi.appendEntry<TokenStatsEntry>("token-stats", { lines: renderStats(rows, window, width) });
 			} catch (e) {
 				ctx.ui.notify(`[error] ${(e as Error).message}`, "error");
 			}

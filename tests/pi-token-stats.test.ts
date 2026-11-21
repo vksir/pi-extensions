@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { initTheme, type ExtensionContext, type ReadonlyFooterDataProvider, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { createFirstTokenTimer, createRateFooter, formatFirstToken, formatRate, insertRate, outputRate, shrinkPadding } from "../extensions/lib/footer-rate.ts";
-import { averageFirstTokenMs, averageOutputRate, recordSessionTurn, type SessionRecord, type SessionTurn } from "../extensions/lib/session-usage.ts";
-import { renderStats, tokenArgumentCompletions } from "../extensions/pi-token-stats.ts";
+import { parseTokenWindow, renderStats, tokenArgumentCompletions } from "../extensions/pi-token-stats.ts";
+import type { WindowModelRow } from "../extensions/lib/token-stats-db.ts";
 
 // 内置 FooterComponent 渲染时会取当前主题的颜色。
 initTheme("dark");
@@ -175,126 +176,104 @@ test("createRateFooter：拿不到速率时保留内置状态行", () => {
 	assert.doesNotMatch(lines[1], /\(auto\)/);
 });
 
-function turn(at: number, output: number, durationMs?: number, firstTokenMs?: number): SessionTurn {
+function windowRow(overrides: Partial<WindowModelRow> = {}): WindowModelRow {
 	return {
-		at,
-		name: "会话 A",
-		usage: { input: 100, output, cacheRead: 900, cacheWrite: 0, cost: 0.01 },
-		durationMs,
-		firstTokenMs,
+		provider: "deepseek",
+		model: "deepseek/deepseek-chat",
+		turns: 2,
+		output: 1_000,
+		timedOutput: 1_000,
+		timedMs: 10_000,
+		firstTokenMs: 1_600,
+		firstTokenSamples: 2,
+		...overrides,
 	};
 }
 
-test("recordSessionTurn：首次见到会话时建记录，累计用量与轮次", () => {
-	const first = recordSessionTurn(undefined, turn(1_000, 100, 2_000, 800));
-	assert.equal(first.firstActiveAt, 1_000);
-	assert.equal(first.lastActiveAt, 1_000);
-	assert.equal(first.turns, 1);
-	assert.deepEqual(first.usage, { input: 100, output: 100, cacheRead: 900, cacheWrite: 0, cost: 0.01 });
-
-	const second = recordSessionTurn(first, turn(5_000, 300, 1_000, 400));
-	assert.equal(second.firstActiveAt, 1_000);
-	assert.equal(second.lastActiveAt, 5_000);
-	assert.equal(second.turns, 2);
-	assert.deepEqual(second.usage, { input: 200, output: 400, cacheRead: 1800, cacheWrite: 0, cost: 0.02 });
-	// 纯函数：不改上一条记录
-	assert.equal(first.turns, 1);
-});
-
-test("recordSessionTurn：会话名跟着最新一次记录更新", () => {
-	const record = recordSessionTurn(undefined, turn(1_000, 100));
-	assert.equal(record.name, "会话 A");
-	// 拿不到名字（未命名 / 续聊）时保留已记录的名字
-	assert.equal(recordSessionTurn(record, { ...turn(2_000, 100), name: undefined }).name, "会话 A");
-	assert.equal(recordSessionTurn(record, { ...turn(2_000, 100), name: "改名了" }).name, "改名了");
-});
-
-test("averageOutputRate：按 token 加权，不是逐次速率的平均", () => {
-	const record = recordSessionTurn(
-		recordSessionTurn(undefined, turn(1_000, 100, 2_000)), // 50 t/s
-		turn(2_000, 900, 1_000), // 900 t/s
-	);
-	// 逐次平均会得到 475 t/s；加权 = 1000 token / 3s
-	assert.equal(averageOutputRate(record), 1000 / 3);
-	assert.equal(record.timedOutput, 1_000);
-	assert.equal(record.timedMs, 3_000);
-
-	// 没有耗时或没有输出的响应不进样本
-	const noTiming = recordSessionTurn(undefined, turn(1_000, 500, undefined));
-	assert.equal(averageOutputRate(noTiming), undefined);
-	assert.equal(averageOutputRate(recordSessionTurn(undefined, turn(1_000, 0, 1_000))), undefined);
-});
-
-test("averageFirstTokenMs：只平均测到的样本", () => {
-	const record = recordSessionTurn(
-		recordSessionTurn(undefined, turn(1_000, 100, 1_000, 800)),
-		turn(2_000, 100, 1_000), // 没测到首字
-	);
-	assert.equal(record.firstTokenSamples, 1);
-	assert.equal(averageFirstTokenMs(record), 800);
-	// 首字为 0（立即返回）也是有效样本
-	assert.equal(averageFirstTokenMs(recordSessionTurn(undefined, turn(1_000, 100, 1_000, 0))), 0);
-	assert.equal(averageFirstTokenMs(recordSessionTurn(undefined, turn(1_000, 100, 1_000))), undefined);
-});
-
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-function localDate(date: Date): string {
-	return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-}
-
-/** 报告只负责排版：会话记录在这里直接构造，落库/查询由 token-stats-db 的测试覆盖。 */
-function statsSession(at: number, output: number, durationMs?: number, firstTokenMs?: number): SessionRecord {
-	return recordSessionTurn(undefined, {
-		at,
-		name: "当前会话",
-		usage: { input: 100, output, cacheRead: 900, cacheWrite: 0, cost: 0.01 },
-		durationMs,
-		firstTokenMs,
-	});
-}
-
-test("renderStats：会话速率只显示当前会话，与天数参数无关", () => {
-	const old = new Date(Date.now() - 40 * DAY_MS);
-	const session = statsSession(old.getTime(), 600, 12_000, 1_200);
-
-	const text = renderStats([], session, 7).join("\n");
-	assert.match(text, /当前会话/);
-	assert.match(text, /1 轮 · Out 600 · 平均首字 1\.2s · 平均速率 50t\/s/);
-	// 近 7 天没有按天数据，会话区块照样显示自己的平均
-	assert.match(text, /Token 用量趋势 \(近 7 天\)/);
-	assert.match(text, /（暂无数据）/);
-
-	const dayRows = [
-		{ date: localDate(old), model: "deepseek/deepseek-chat", input: 100, output: 600, cacheRead: 900, cacheWrite: 0, cost: 0.01 },
+test("renderStats：按模型列出平均首字与平均速率，并给出总计", () => {
+	const rows = [
+		windowRow(),
+		windowRow({
+			provider: "openai",
+			model: "gpt-5",
+			turns: 1,
+			output: 500,
+			timedOutput: 500,
+			timedMs: 2_000,
+			firstTokenMs: 1_200,
+			firstTokenSamples: 1,
+		}),
 	];
-	const all = renderStats(dayRows, session, 0).join("\n");
-	assert.match(all, /Tokens per Day \(Input\)/);
-	assert.match(all, /1 轮 · Out 600/);
-	// 没有会话记录时明说暂无
-	assert.match(renderStats(dayRows, undefined, 7).join("\n"), /本会话暂无记录/);
+	const text = renderStats(rows, { since: 0, label: "1h" }, 120).join("\n");
+
+	assert.match(text, /Token Speed · Last 1h/);
+	assert.match(text, /Model\s+Turns\s+TTFT\s+Rate/);
+	// provider 已经在模型名里，不重复拼前缀
+	assert.doesNotMatch(text, /deepseek\/deepseek\/deepseek-chat/);
+	assert.match(text, /deepseek\/deepseek-chat\s+2\s+800ms\s+100t\/s/);
+	assert.match(text, /openai\/gpt-5\s+1\s+1\.2s\s+250t\/s/);
+	// 总计按 token 加权：1500 token / 12s = 125 t/s；首字是 2800ms / 3
+	assert.match(text, /All models\s+3\s+933ms\s+125t\/s/);
+	assert.match(text, /TTFT = average time to first token/);
+	assert.match(text, /Rate = output tokens ÷ full request time/);
 });
 
-test("renderStats：当前会话没测到首字时显示占位", () => {
-	const session = statsSession(Date.now(), 100, 1_000);
-	const text = renderStats([], session, 7).join("\n");
-	assert.match(text, /平均首字 -/);
-	assert.match(text, /平均速率 100t\/s/);
+test("renderStats：没有计时样本的行显示占位", () => {
+	const text = renderStats(
+		[windowRow({ turns: 1, output: 100, timedOutput: 0, timedMs: 0, firstTokenMs: 0, firstTokenSamples: 0 })],
+		{ since: 0, label: "3h" },
+		80,
+	).join("\n");
+	assert.match(text, /deepseek\/deepseek-chat\s+1\s+-\s+-/);
+});
+
+test("renderStats：空窗口与 all 的文案", () => {
+	const empty = renderStats([], { since: 0, label: "1h" }, 80).join("\n");
+	assert.match(empty, /Token Speed · Last 1h/);
+	assert.match(empty, /No turns in the last 1h\./);
+
+	const all = renderStats([], { since: 0, label: "all" }, 80).join("\n");
+	assert.match(all, /Token Speed · All time/);
+	assert.match(all, /No turns recorded yet\./);
+});
+
+test("renderStats：窄终端里截断模型名，不超出宽度", () => {
+	const rows = [
+		windowRow({ provider: "very-long-provider", model: "very-long-provider/a-very-long-model-name-here" }),
+	];
+	const lines = renderStats(rows, { since: 0, label: "1h" }, 60);
+	assert.ok(lines.every((line) => visibleWidth(line) <= 60), lines.join("\n"));
+	assert.match(lines.join("\n"), /…/);
+});
+
+test("parseTokenWindow：默认 1 小时，支持 m/h/d/all", () => {
+	const now = 1_000_000_000;
+	assert.deepEqual(parseTokenWindow("", now), { since: now - 3_600_000, label: "1h" });
+	assert.deepEqual(parseTokenWindow("3h", now), { since: now - 3 * 3_600_000, label: "3h" });
+	assert.deepEqual(parseTokenWindow("30m", now), { since: now - 1_800_000, label: "30m" });
+	assert.deepEqual(parseTokenWindow("1d", now), { since: now - 86_400_000, label: "1d" });
+	assert.deepEqual(parseTokenWindow("90m", now), { since: now - 5_400_000, label: "1h30m" });
+	assert.deepEqual(parseTokenWindow("1h 30m", now), { since: now - 5_400_000, label: "1h30m" });
+	assert.deepEqual(parseTokenWindow("all", now), { since: 0, label: "all" });
+	assert.throws(() => parseTokenWindow("7d?"), /unknown argument/);
+	assert.throws(() => parseTokenWindow("0h"), /greater than 0/);
 });
 
 test("tokenArgumentCompletions：补全保留已写好的参数", () => {
 	const values = (prefix: string) => (tokenArgumentCompletions(prefix) ?? []).map((item) => item.value);
 
-	// 空参数：全部候选，没有已删除的 Sessions
-	assert.ok(values("").includes("7d"));
-	assert.ok(!values("").includes("Sessions"));
+	// 空参数：列出候选，不再有旧的 7d / Out
+	assert.ok(values("").includes("1h"));
+	assert.ok(values("").includes("3h"));
+	assert.ok(values("").includes("all"));
+	assert.ok(!values("").includes("7d"));
+	assert.ok(!values("").includes("Out"));
 	// 单个参数：按前缀过滤
-	assert.deepEqual(values("o"), ["Out"]);
+	assert.deepEqual(values("3"), ["3h"]);
+	// 已写过的参数不再出现在下一条候选里，补全项带上前面的参数
+	assert.deepEqual(values("1h "), ["1h 3h", "1h 6h", "1h 12h", "1h 24h", "1h all"]);
 	// 多参数：补全项带上前面的参数（pi 补全会整段替换参数文本）
-	assert.deepEqual(values("all o"), ["all Out"]);
-	assert.deepEqual(values("7d out"), ["7d Out"]);
-	// 已写过的参数不再出现在下一条候选里
-	assert.ok(!values("all ").includes("all"));
+	assert.deepEqual(values("1h a"), ["1h all"]);
 	// 没有候选
 	assert.equal(tokenArgumentCompletions("zzz"), null);
 });

@@ -6,15 +6,14 @@
  */
 
 import { Worker } from "node:worker_threads";
-import type { SessionRecord } from "./session-usage.ts";
-import type { DayModelRow, TurnInput } from "./token-stats-db.ts";
+import type { TurnInput, WindowModelRow } from "./token-stats-db.ts";
 import type { WorkerReply, WorkerRequest, WorkerStartData } from "./token-stats-worker.ts";
 
 export interface TokenStatsClient {
 	/** 投递一轮响应；worker 未就绪或已失败时静默丢弃。 */
 	recordTurn(turn: TurnInput): void;
-	dayRows(from?: string): Promise<DayModelRow[]>;
-	sessionRecord(id: string): Promise<SessionRecord | undefined>;
+	/** 按时间窗聚合，since 为起点（epoch ms，含）；0 表示全部历史。 */
+	windowRows(since: number): Promise<WindowModelRow[]>;
 	/** 等 worker 处理完已投递的消息并关闭数据库 */
 	close(): Promise<void>;
 }
@@ -62,9 +61,7 @@ export function openTokenStatsClient(options: TokenStatsClientOptions): TokenSta
 		if (!closed) fail(new Error(`token-stats worker exited with ${code}`));
 	});
 
-	type QueryRequest = { type: "dayRows"; from?: string } | { type: "session"; sessionId: string };
-
-	function request<T>(message: QueryRequest): Promise<T> {
+	function request<T>(message: { type: "window"; since: number }): Promise<T> {
 		if (failure) return Promise.reject(failure);
 		if (closed) return Promise.reject(new Error("token-stats client is closed"));
 		const id = nextId++;
@@ -83,11 +80,8 @@ export function openTokenStatsClient(options: TokenStatsClientOptions): TokenSta
 				/* worker 已退出：与查询失败同样处理，丢这一轮 */
 			}
 		},
-		dayRows(from?: string): Promise<DayModelRow[]> {
-			return request<DayModelRow[]>({ type: "dayRows", from });
-		},
-		sessionRecord(id: string): Promise<SessionRecord | undefined> {
-			return request<SessionRecord | null>({ type: "session", sessionId: id }).then((value) => value ?? undefined);
+		windowRows(since: number): Promise<WindowModelRow[]> {
+			return request<WindowModelRow[]>({ type: "window", since });
 		},
 		async close(): Promise<void> {
 			if (closed) return;
