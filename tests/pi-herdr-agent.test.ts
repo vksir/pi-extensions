@@ -171,6 +171,13 @@ class FakeHc implements HcClient {
 		return this.terminals;
 	}
 
+	async keys(params: { terminal: string; keys: string[] }) {
+		this.record("keys", params);
+		// 模拟优雅退出：终端自己消失。
+		this.terminals = this.terminals.filter((candidate) => candidate.address !== params.terminal);
+		return { status: "working", turn: 0 };
+	}
+
 	async kill(name: string) {
 		this.record("kill", { terminal: name });
 		return terminal({ address: name, state: "finished" });
@@ -219,6 +226,7 @@ async function setup(
 		sessionDir?: string;
 		now?: () => number;
 		schedule?: (tick: () => void, ms: number) => () => void;
+		stopGraceMs?: number;
 	} = {},
 ) {
 	const { default: extension } = await import(`../extensions/pi-herdr-agent.ts?run=${moduleSeq++}`);
@@ -234,6 +242,7 @@ async function setup(
 		sessionDir: options.sessionDir,
 		now: options.now,
 		schedule: options.schedule,
+		stopGraceMs: options.stopGraceMs,
 		spill: async (text: string) => `/tmp/spill-${text.length}.log`,
 	});
 	return { pi, hc };
@@ -402,31 +411,54 @@ test("ask never checks the target's status", async () => {
 	assert.equal(envelope?.body, "hi");
 });
 
-test("stop only reaches descendants", async () => {
+test("stop only reaches descendants, and asks first before killing", async () => {
 	const hc = new FakeHc();
 	hc.terminals = [
 		terminal({ address: "t4m", labels: {} }),
 		terminal({ address: "t20", labels: { "pi.agent": "eeee" }, parent: null }),
 		terminal({ address: "t10", labels: { "pi.agent": "aaaa" }, parent: "t4m" }),
 	];
-	const { pi } = await setup({ hc });
+	const { pi } = await setup({ hc, stopGraceMs: 20 });
 
 	const stranger = await pi.tools.get("agent_job")!.execute("call", { action: "stop", id: "eeee" }, undefined, undefined, context());
 	assert.match(toolResultText(stranger), /not your descendant/);
+	assert.equal(hc.callsOf("keys").length, 0);
 	assert.equal(hc.callsOf("kill").length, 0);
 
+	// 正常路径：先发 ctrl+d 请它自己退出，对方退出后不再硬杀。
 	const own = await pi.tools.get("agent_job")!.execute("call", { action: "stop", id: "aaaa" }, undefined, undefined, context());
 	assert.match(toolResultText(own), /^Stopped agent aaaa/);
+	assert.equal(hc.callsOf("keys")[0].params.terminal, "t10");
+	assert.deepEqual(hc.callsOf("keys")[0].params.keys, ["ctrl+d"]);
+	assert.equal(hc.callsOf("kill").length, 0);
+});
+
+test("stop falls back to a hard kill when the agent does not quit in time", async () => {
+	const hc = new FakeHc();
+	hc.terminals = [terminal({ address: "t10", labels: { "pi.agent": "aaaa" }, parent: "t4m" })];
+	// 按键无效：终端一直活着。
+	hc.keys = async (params: { terminal: string; keys: string[] }) => {
+		hc.record("keys", params);
+		return { status: "working", turn: 0 };
+	};
+	const { pi } = await setup({ hc, stopGraceMs: 1 });
+
+	const result = await pi.tools.get("agent_job")!.execute("call", { action: "stop", id: "aaaa" }, undefined, undefined, context());
+	assert.match(toolResultText(result), /^Stopped agent aaaa/);
+	assert.equal(hc.callsOf("keys").length, 2); // 中止一下 + 退出一下
 	assert.equal(hc.callsOf("kill")[0].params.terminal, "t10");
 });
 
-test("stop reports success when rm removes the terminal before the reply", async () => {
+test("stop reports success when the terminal is already gone", async () => {
 	const hc = new FakeHc();
 	hc.terminals = [terminal({ address: "t10", labels: { "pi.agent": "aaaa" }, parent: "t4m" })];
+	hc.keys = async () => {
+		throw new HcError("not_found", "t10 was removed");
+	};
 	hc.kill = async () => {
 		throw new HcError("not_found", "t10 was removed");
 	};
-	const { pi } = await setup({ hc });
+	const { pi } = await setup({ hc, stopGraceMs: 1 });
 	const result = await pi.tools.get("agent_job")!.execute("call", { action: "stop", id: "aaaa" }, undefined, undefined, context());
 	assert.match(toolResultText(result), /^Stopped agent aaaa/);
 });

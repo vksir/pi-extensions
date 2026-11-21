@@ -98,6 +98,12 @@ const DEFAULT_DESTROY_AFTER_S = 180;
 /** 空闲销毁的检查节拍（秒）：销毁最多迟到一拍。 */
 const DESTROY_TICK_S = 30;
 
+/** `stop` 先请对方自己退出，每次按键宽限这么多秒；不走再硬杀。 */
+const STOP_GRACE_S = 5;
+
+/** `stop` 等对方退出的轮询间隔。 */
+const STOP_POLL_MS = 250;
+
 /** 子进程从 env 读自己的空闲销毁秒数；0 或缺省表示不销毁。 */
 const DESTROY_ENV = "PI_AGENT_DESTROY_AFTER";
 
@@ -181,6 +187,8 @@ export interface HerdrAgentOptions {
 	spill?: (text: string) => Promise<string>;
 	/** 空闲销毁的时钟（测试可替换）；默认 Date.now。 */
 	now?: () => number;
+	/** `stop` 每次按键的宽限（毫秒，测试可缩短）；默认 STOP_GRACE_S 秒。 */
+	stopGraceMs?: number;
 	/** 空闲销毁的调度：每 ms 毫秒回调一次、返回取消函数；默认 setInterval。 */
 	schedule?: (tick: () => void, ms: number) => () => void;
 }
@@ -206,6 +214,8 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	const destroyAfterSeconds = parseDestroyAfter(env[DESTROY_ENV]);
 	const now = options.now ?? (() => Date.now());
 	const schedule = options.schedule ?? defaultSchedule;
+	/** `stop` 每次按键后的宽限；测试可缩短。 */
+	const stopGraceMs = options.stopGraceMs ?? STOP_GRACE_S * 1000;
 
 	/**
 	 * 根 agent 的短 id：会话 id 末尾 6 位字母数字（uuidv7 的尾段就是随机 hex；
@@ -863,13 +873,54 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		if (!isDescendant(target, terminals, self)) {
 			return fail(piHerdrAgentPrompt.results.errors.notDescendant(params.id), "stop", params.id);
 		}
-		await hc.kill(target.address).catch((error: unknown) => {
+		await requestQuit(target.address);
+		return ok(piHerdrAgentPrompt.results.stopped(params.id), { action: "stop", id: params.id });
+	};
+
+	/**
+	 * 先请对方自己退出：只有优雅退出才会跑到 `session_shutdown`，
+	 * 把「没来得及回答」与「队列里的活没做」交代给派活人和排队的人。
+	 * `hc.kill` 是硬杀，进程来不及做任何事；宽限期内没走才用它兜底。
+	 */
+	const requestQuit = async (address: string): Promise<void> => {
+		// 工作状态下第一下 ctrl+d 是「中止」，停下来的第二下才是「退出」；
+		// 两次各给一段宽限，还不走就硬杀。
+		for (const attempt of [1, 2]) {
+			try {
+				await hc.keys({ terminal: address, keys: ["ctrl+d"] });
+			} catch {
+				break; // 旧 core 没有 terminal.keys：直接去硬杀。
+			}
+
+			const finished = await waitUntilGone(address, stopGraceMs / 1000);
+			if (finished) return;
+			if (attempt === 2) break;
+		}
+
+		await hc.kill(address).catch((error: unknown) => {
 			// `rm: true` 的终端在 kill 成功后会被立刻删除，core 有时把这次删除回成 not_found /
-			// finished；目标刚刚还在，所以这仍然是「已杀掉」，不是失败。
+			// finished；目标刚刚还在，所以这仍然是「已结束」，不是失败。
 			if (error instanceof HcError && (error.kind === "not_found" || error.kind === "finished")) return;
 			throw error;
 		});
-		return ok(piHerdrAgentPrompt.results.stopped(params.id), { action: "stop", id: params.id });
+	};
+
+	/**
+	 * 轮询到终端消失或超时。不用 `terminal.wait`：它等的是「下一次停」，
+	 * 对一个已经停下来的终端会一直等到超时，分不清「退出了」和「只是闲置」。
+	 */
+	const waitUntilGone = async (address: string, seconds: number): Promise<boolean> => {
+		const deadline = now() + seconds * 1000;
+		while (now() < deadline) {
+			try {
+				const terminal = await hc.get(address);
+				if (terminal.state === "finished") return true;
+			} catch (error) {
+				if (error instanceof HcError && (error.kind === "not_found" || error.kind === "finished")) return true;
+			}
+			await new Promise((resolve) => setTimeout(resolve, STOP_POLL_MS));
+		}
+		return false;
 	};
 
 	/**

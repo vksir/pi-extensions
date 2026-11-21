@@ -167,7 +167,7 @@ node --test 'tests/pi-bg.test.ts'
 两个工具：
 
 - `agent { prompt, name?, model?, thinking?, resume?, destroyAfterSeconds? }`：拉起子 agent，等 pi 就绪且 prompt 送达后返回 id / name，不等结果。`name` 是 hc 终端名（侧边栏显示），1–32 位 `[a-z0-9._-]`、活终端间唯一，非法或重名直接报错；省略用 agent id。`model` / `thinking` 省略时继承父 agent 当前值。结果由扩展在该轮收工时自动回发（拉起时的那条 prompt 也算一次派活）。`destroyAfterSeconds` 控制空闲销毁（见下文），默认 180 秒，`0` 表示永不销毁。
-- `agent_job { action, id?, message? }`：`list`（只看得到自己、一级父、一级子、兄弟）、`ask`（发给任意 agent，不检查对方状态）、`stop`（只能停自己的后代）。派发规则见下。
+- `agent_job { action, id?, message? }`：`list`（只看得到自己、一级父、一级子、兄弟）、`ask`（发给任意 agent，不检查对方状态）、`stop`（只能停自己的后代；先发 ctrl+d 请它自己退出，宽限内没走再硬杀）。派发规则见下。
 
 人工入口：`/agent list` 以**卡片式森林**渲染当前 hc session 的 agent 树——每棵独立的树一块（`▌` 引导），名字在前、id 在后，状态右对齐（不显示 cwd）；根显示 pi 会话名（无会话名时 `(root)`）；`●` 自己、`↑` 父 agent，父终端已消失的 agent 标「失联」。
 
@@ -186,7 +186,7 @@ node --test 'tests/pi-bg.test.ts'
 - 树深最多三层（root → 子 → 孙），深度 2 的 agent 不再注册 `agent`。
 - resume 不允许换模型 / 思考级别：传了与会话记录不一致的值直接报错（避免缓存整体未命中）。
 - 结果正文超过 2000 行 / 50 KB 时按 bash 同款尾部截断，全文写 `pi-herdr-agent-*.log`，由派活人自己读。
-- `stop` 只允许自己的后代；root 正常退出时递归清理直接子 agent；硬崩溃留下的孤儿在 `list` 里标 `orphan`。
+- `stop` 只允许自己的后代；它先发 `ctrl+d`（每下宽限 5 秒，最多两下），宽限内没退出才 `hc.kill` 硬杀 —— 只有优雅退出才会跑到 `session_shutdown`，把「没做完」交代出去。root 正常退出时递归清理直接子 agent；硬崩溃留下的孤儿在 `list` 里标 `orphan`。
 - 拉起时 `no_notify: true`：hc 的 note 不进消息通道；消息只有 `ask` 与自动回发。
 - 子 agent settle 时把 pi 内置 reporter 的 OSC `state=done` 在 stdout 层改写成 `state=idle`：hc 侧只看到 `working → idle`，不留下 done（根 agent 不受影响）。
 - 子 agent 卡在扩展 UI 弹窗时会给派活人发一条 blocked 提示。

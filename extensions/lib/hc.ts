@@ -107,6 +107,13 @@ export interface HcLabelParams {
 	labels: Record<string, string>;
 }
 
+export interface HcKeysParams {
+	terminal: string;
+	caller?: string;
+	/** 按键名：`enter` / `esc` / `ctrl+d` / `a` ... */
+	keys: string[];
+}
+
 export interface HcClient {
 	run(params: HcRunParams): Promise<HcRunResult>;
 	send(params: HcSendParams): Promise<HcSendResult>;
@@ -114,6 +121,7 @@ export interface HcClient {
 	get(terminal: string): Promise<HcTerminal>;
 	list(): Promise<HcTerminal[]>;
 	label(params: HcLabelParams): Promise<HcTerminal>;
+	keys(params: HcKeysParams): Promise<unknown>;
 	kill(terminal: string): Promise<HcTerminal>;
 }
 
@@ -234,6 +242,9 @@ export function createHcClient(socketPath: string): HcClient {
 		},
 		async label(params) {
 			return (await rpc("terminal.label", params)) as HcTerminal;
+		},
+		async keys(params) {
+			return rpc("terminal.keys", params);
 		},
 		async kill(terminal) {
 			return (await rpc("terminal.kill", { terminal })) as HcTerminal;
