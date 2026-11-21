@@ -4,7 +4,7 @@
 
 ## Language
 
-### Token 用量与速率（pi-token-stats）
+### Token 用量（pi-token-stats）
 
 **输出速率 (Output Rate)**：
 最近一次完成的 assistant 响应的输出 token 数除以该次耗时（`AssistantMessage.durationMs`），单位 token/秒，显示在 footer 状态行的缓存读取与缓存命中率之间。耗时含思考与首字等待，不单算生成窗口。
@@ -14,33 +14,33 @@ _Avoid_: 速度、生成速度、tokens per second、TPS
 扩展上下文里能取到的那部分会话数据，用来驱动内置 `FooterComponent` 渲染——因为 `setFooter` 只能整体替换 footer。
 _Avoid_: 假 session、mock session
 
-**时间窗 (Time Window)**：
-`/token` 的聚合范围，默认过去 1 小时，可用 `3h` / `30m` / `7d` / `all` 等参数指定。窗口覆盖库里的所有会话与所有 pi 进程，不按会话区分，但只统计当前模型。
-_Avoid_: 区间、时间段、period
+**会话记录 (Session Record)**：
+token-stats 里按会话累计的用量与计时，key 是会话 id。每次 `turn_end` 并入一笔响应：轮次、用量、有耗时响应的输出与耗时、测到的首字时间。存在 SQLite 的 `session` 表；`/token` 只展示当前会话，历史会话仅留存。
+_Avoid_: 会话统计条目、session stats
 
-**当前模型 (Current Model)**：
-`/token` 报告里唯一统计的模型，由 `ctx.model` 的 `provider/id` 确定，与 `turn` 表里落盘的 `provider/model` 同形。当前模型没有记录时显示 `No data for ...`，不混入其他模型的数据。
-_Avoid_: 活动模型、默认模型（切换模型后默认值不变）
+**平均首字 (Average TTFT)**：
+会话里测到首字的响应之和除以样本数。首字只能在流式过程中测，样本数可能少于响应数；一次都没测到过的会话显示 `-`。
+_Avoid_: 平均延迟、平均耗时
 
-**时间窗用量 (Window Usage)**：
-当前模型在时间窗内的 `Turns` / `Input`（总输入，含缓存；`CH` 为缓存命中率）/ `Output` / `Cost`。直接由 `turn` 明细的 `input / output / cache_read / cache_write / cost` 聚合，不依赖已删除的 `day_model` / `session`。
-_Avoid_: 用量汇总、usage rollup
-
-**首字延迟 (Time to First Token)**：
-时间窗内当前模型测到首字的响应之和除以样本数。首字只能在流式过程中测，样本数可能少于响应数；没有样本时显示 `-`。
-_Avoid_: 平均延迟、平均耗时、平均首字（与旧会话口径混淆）
-
-**时间窗速率 (Window Output Rate)**：
-时间窗内当前模型有耗时响应的输出 token 之和除以这些响应的耗时之和，单位 token/秒。按 token 加权，不是逐次速率的算术平均；耗时取完整请求时间（含首字等待）。
-_Avoid_: 平均速度、平均 TPS、会话平均速率
+**会话平均速率 (Session Average Output Rate)**：
+该会话有耗时的响应输出 token 之和除以这些响应的耗时之和，单位 token/秒。按 token 加权，不是逐次速率的算术平均。
+_Avoid_: 平均速度、平均 TPS
 
 **明细行 (Turn Record)**：
-SQLite 里 `turn` 表的一行，对应一次 assistant 响应，带时间、会话、模型、用量、耗时与首字。时间窗汇总直接聚合它。
+SQLite 里 `turn` 表的一行，对应一次 assistant 响应。新数据一轮一行，旧 JSON 里没有明细，迁移后只有汇总。
 _Avoid_: 事件、日志行、raw event
 
-**schema 版本 (Schema Version)**：
-记在 `meta.schema_version` 的整数。打开数据库时按它跑迁移；v3 删除旧汇总表，但保留 `turn` 明细里的用量字段，并把版本写回。
-_Avoid_: 数据库版本、migration id
+**日汇总 (Day Rollup)**：
+`day_model` 表里按天 × 模型累计的用量，柱状图与模型汇总读它。旧 JSON 的按天数据迁移到这里。
+_Avoid_: 日聚合、daily stats
+
+**会话汇总 (Session Rollup)**：
+`session` 表里按会话累计的用量与计时，报告只查当前会话。旧 JSON 的 `sessions` 段迁移到这里。
+_Avoid_: 会话记录表、session row
+
+**静默迁移 (Silent Migration)**：
+数据库第一次打开时把旧版 `token-stats.json` 导入 SQLite，动手前先复制成 `token-stats.json.bak` 备份；不提示、不改动旧文件，靠 `meta.legacy_json_imported` 保证只做一次。临时代码，下个版本删除。
+_Avoid_: 数据升级、导入向导、backfill
 
 **写线程 (Writer Worker)**：
 token-stats 独占 SQLite 连接的 worker 线程。主线程只 `postMessage` 一轮响应；建库、迁移、写入、查询都按消息顺序在这里执行，不阻塞 TUI 的事件循环。

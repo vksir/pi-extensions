@@ -6,16 +6,15 @@
  */
 
 import { Worker } from "node:worker_threads";
-import type { TurnInput, WindowModelRow } from "./token-stats-db.ts";
+import type { SessionRecord } from "./session-usage.ts";
+import type { DayModelRow, TurnInput } from "./token-stats-db.ts";
 import type { WorkerReply, WorkerRequest, WorkerStartData } from "./token-stats-worker.ts";
 
 export interface TokenStatsClient {
 	/** 投递一轮响应；worker 未就绪或已失败时静默丢弃。 */
 	recordTurn(turn: TurnInput): void;
-	/** 时间窗内单个模型的聚合；scope 为 DB 里的 `provider/model`，没有记录时 undefined。 */
-	windowRow(since: number, model: string): Promise<WindowModelRow | undefined>;
-	/** 时间窗内最近一次响应用的模型名；没有记录时 undefined。 */
-	latestModel(since: number): Promise<string | undefined>;
+	dayRows(from?: string): Promise<DayModelRow[]>;
+	sessionRecord(id: string): Promise<SessionRecord | undefined>;
 	/** 等 worker 处理完已投递的消息并关闭数据库 */
 	close(): Promise<void>;
 }
@@ -63,7 +62,7 @@ export function openTokenStatsClient(options: TokenStatsClientOptions): TokenSta
 		if (!closed) fail(new Error(`token-stats worker exited with ${code}`));
 	});
 
-	type QueryRequest = { type: "window"; since: number; model: string } | { type: "latest"; since: number };
+	type QueryRequest = { type: "dayRows"; from?: string } | { type: "session"; sessionId: string };
 
 	function request<T>(message: QueryRequest): Promise<T> {
 		if (failure) return Promise.reject(failure);
@@ -84,11 +83,11 @@ export function openTokenStatsClient(options: TokenStatsClientOptions): TokenSta
 				/* worker 已退出：与查询失败同样处理，丢这一轮 */
 			}
 		},
-		windowRow(since: number, model: string): Promise<WindowModelRow | undefined> {
-			return request<WindowModelRow | null>({ type: "window", since, model }).then((value) => value ?? undefined);
+		dayRows(from?: string): Promise<DayModelRow[]> {
+			return request<DayModelRow[]>({ type: "dayRows", from });
 		},
-		latestModel(since: number): Promise<string | undefined> {
-			return request<string | null>({ type: "latest", since }).then((value) => value ?? undefined);
+		sessionRecord(id: string): Promise<SessionRecord | undefined> {
+			return request<SessionRecord | null>({ type: "session", sessionId: id }).then((value) => value ?? undefined);
 		},
 		async close(): Promise<void> {
 			if (closed) return;
