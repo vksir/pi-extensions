@@ -8,16 +8,15 @@
  * 多个 pi 进程共用同一个库：连接开 `busy_timeout`，建库时一次性切到 WAL，
  * 每轮一条 INSERT，后写的语句排队等前一个提交，不会丢增量。
  *
- * schema v1 的 `day_model` / `session` 汇总在打开时改名归档为
- * `archive_day_model` / `archive_session`，不再写入也不再读取；迁移只改表名，
- * 不删数据。schema 版本记在 `meta.schema_version`。
+ * 旧版的 `day_model` / `session` 汇总（以及 v2 一度改名保留的 archive 表）在
+ * schema v3 迁移时直接删除，只留 `turn` 明细。版本记在 `meta.schema_version`。
  */
 
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const SCHEMA_VERSION_KEY = "schema_version";
 
 const SCHEMA = `
@@ -65,7 +64,7 @@ export interface TurnInput {
 	firstTokenMs?: number;
 }
 
-/** 时间窗内按模型聚合的一行；速率样本与首字样本可以少于响应数。 */
+/** 时间窗内单个模型的聚合；速率样本与首字样本可以少于响应数。 */
 export interface WindowModelRow {
 	provider: string;
 	model: string;
@@ -83,8 +82,10 @@ export interface WindowModelRow {
 
 export interface TokenStatsStore {
 	recordTurn(turn: TurnInput): void;
-	/** since 为窗口起点（epoch ms，含）；0 表示全部历史 */
-	windowRows(since: number): WindowModelRow[];
+	/** 时间窗内单个模型的一行；该模型没有记录时返回 undefined */
+	windowRow(since: number, model: string): WindowModelRow | undefined;
+	/** 时间窗内最近一次响应用的模型名；没有记录时返回 undefined */
+	latestModel(since: number): string | undefined;
 	close(): void;
 }
 
@@ -141,17 +142,6 @@ function configure(db: DatabaseSync): void {
 	ensureWal(db);
 }
 
-function tableExists(db: DatabaseSync, name: string): boolean {
-	return db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
-}
-
-/** 旧汇总表改名保留，避免迁移变成不可逆删除。 */
-function archiveTable(db: DatabaseSync, from: string, to: string): void {
-	if (!tableExists(db, from)) return;
-	db.exec(`DROP TABLE IF EXISTS ${to}`);
-	db.exec(`ALTER TABLE ${from} RENAME TO ${to}`);
-}
-
 function readSchemaVersion(db: DatabaseSync): number {
 	const row = db.prepare("SELECT value FROM meta WHERE key = ?").get(SCHEMA_VERSION_KEY) as
 		| { value: string }
@@ -168,7 +158,7 @@ function writeSchemaVersion(db: DatabaseSync): void {
 }
 
 /**
- * v1 → v2：把不再使用的 `day_model` / `session` 归档，建立只含 `turn` 的新 schema。
+ * v1/v2 → v3：旧汇总表与 v2 的归档表都不再保留，直接删除；只留 `turn` 明细。
  * 版本号在事务内复查，多个进程同时首次打开时只有先拿到写锁的那个会真正迁移。
  */
 function migrate(db: DatabaseSync): void {
@@ -177,11 +167,17 @@ function migrate(db: DatabaseSync): void {
 	db.exec("BEGIN IMMEDIATE");
 	try {
 		if (readSchemaVersion(db) < SCHEMA_VERSION) {
-			archiveTable(db, "day_model", "archive_day_model");
-			archiveTable(db, "session", "archive_session");
+			db.exec(`
+				DROP TABLE IF EXISTS day_model;
+				DROP TABLE IF EXISTS session;
+				DROP TABLE IF EXISTS archive_day_model;
+				DROP TABLE IF EXISTS archive_session;
+			`);
 			db.exec(SCHEMA);
 			// v1 为按会话查明细建过索引；现在只按时间窗查
 			db.exec("DROP INDEX IF EXISTS turn_session");
+			// 旧 JSON 导入标记随导入代码一起删除
+			db.exec("DELETE FROM meta WHERE key = 'legacy_json_imported'");
 			writeSchemaVersion(db);
 		}
 		db.exec("COMMIT");
@@ -198,7 +194,8 @@ function migrate(db: DatabaseSync): void {
 class SqliteStore implements TokenStatsStore {
 	private readonly db: DatabaseSync;
 	private readonly insertTurn: StatementSync;
-	private readonly selectWindow: StatementSync;
+	private readonly selectModelWindow: StatementSync;
+	private readonly selectLatestModel: StatementSync;
 
 	constructor(path: string) {
 		mkdirSync(dirname(path), { recursive: true });
@@ -210,16 +207,17 @@ class SqliteStore implements TokenStatsStore {
 			"INSERT INTO turn(at, session_id, session_name, provider, model, input, output, cache_read, cache_write, cost, duration_ms, first_token_ms) " +
 				"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		);
-		this.selectWindow = this.db.prepare(
+		this.selectModelWindow = this.db.prepare(
 			"SELECT COALESCE(provider, '') AS provider, COALESCE(model, 'unknown') AS model, COUNT(*) AS turns, " +
 				"COALESCE(SUM(output), 0) AS output, " +
 				"COALESCE(SUM(CASE WHEN output > 0 AND duration_ms > 0 THEN output ELSE 0 END), 0) AS timed_output, " +
 				"COALESCE(SUM(CASE WHEN output > 0 AND duration_ms > 0 THEN duration_ms ELSE 0 END), 0) AS timed_ms, " +
 				"COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL THEN first_token_ms ELSE 0 END), 0) AS first_token_ms, " +
 				"COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL THEN 1 ELSE 0 END), 0) AS first_token_samples " +
-				"FROM turn WHERE at >= ? " +
-				"GROUP BY COALESCE(provider, ''), COALESCE(model, 'unknown') " +
-				"ORDER BY turns DESC, model",
+				"FROM turn WHERE at >= ? AND model = ?",
+		);
+		this.selectLatestModel = this.db.prepare(
+			"SELECT model FROM turn WHERE model IS NOT NULL AND at >= ? ORDER BY at DESC, id DESC LIMIT 1",
 		);
 	}
 
@@ -242,9 +240,10 @@ class SqliteStore implements TokenStatsStore {
 		);
 	}
 
-	windowRows(since: number): WindowModelRow[] {
-		const rows = this.selectWindow.all(since) as unknown as WindowRow[];
-		return rows.map((row) => ({
+	windowRow(since: number, model: string): WindowModelRow | undefined {
+		const row = this.selectModelWindow.get(since, model) as unknown as WindowRow;
+		if (row.turns === 0) return undefined;
+		return {
 			provider: row.provider ?? "",
 			model: row.model ?? "unknown",
 			turns: row.turns,
@@ -253,7 +252,12 @@ class SqliteStore implements TokenStatsStore {
 			timedMs: row.timed_ms,
 			firstTokenMs: row.first_token_ms,
 			firstTokenSamples: row.first_token_samples,
-		}));
+		};
+	}
+
+	latestModel(since: number): string | undefined {
+		const row = this.selectLatestModel.get(since) as { model: string } | undefined;
+		return row?.model ?? undefined;
 	}
 
 	close(): void {

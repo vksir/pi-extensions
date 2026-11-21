@@ -31,7 +31,7 @@ function turn(overrides: Partial<TurnInput> = {}): TurnInput {
 	};
 }
 
-test("recordTurn：明细落库，windowRows 按模型聚合并按窗口过滤", () => {
+test("recordTurn：明细落库，windowRow 只聚合指定模型并按窗口过滤", () => {
 	const dir = tempDir();
 	const store = openTokenStatsStore(dbPath(dir));
 	try {
@@ -55,9 +55,7 @@ test("recordTurn：明细落库，windowRows 按模型聚合并按窗口过滤",
 			}),
 		);
 
-		const rows = store.windowRows(0);
-		assert.equal(rows.length, 2);
-		assert.deepEqual(rows[0], {
+		assert.deepEqual(store.windowRow(0, "deepseek/deepseek-chat"), {
 			provider: "deepseek",
 			model: "deepseek/deepseek-chat",
 			turns: 2,
@@ -67,12 +65,17 @@ test("recordTurn：明细落库，windowRows 按模型聚合并按窗口过滤",
 			firstTokenMs: 1_400,
 			firstTokenSamples: 2,
 		});
-		assert.equal(rows[1].model, "openai/gpt-5");
-		assert.equal(rows[1].turns, 1);
+		assert.equal(store.windowRow(0, "openai/gpt-5")?.output, 200);
+		// 只返回指定模型，其他模型不会混进来
+		assert.equal(store.windowRow(0, "missing"), undefined);
 
 		// 含窗口起点，排除更早的
-		assert.deepEqual(store.windowRows(2_000).map((row) => row.model), ["deepseek/deepseek-chat", "openai/gpt-5"]);
-		assert.deepEqual(store.windowRows(2_001).map((row) => row.model), ["openai/gpt-5"]);
+		assert.equal(store.windowRow(2_000, "deepseek/deepseek-chat")?.turns, 1);
+		assert.equal(store.windowRow(2_001, "deepseek/deepseek-chat"), undefined);
+
+		// 最近一次响应用的模型，供拿不到 ctx.model 时退回
+		assert.equal(store.latestModel(0), "openai/gpt-5");
+		assert.equal(store.latestModel(3_001), undefined);
 
 		// 原始明细一轮一行
 		const raw = new DatabaseSync(dbPath(dir), { readOnly: true });
@@ -100,7 +103,7 @@ test("recordTurn：没有耗时或没有输出的响应不进速率样本", () =
 				firstTokenMs: 500,
 			}),
 		);
-		const [row] = store.windowRows(0);
+		const row = store.windowRow(0, "deepseek/deepseek-chat");
 		assert.ok(row);
 		assert.equal(row.turns, 2);
 		assert.equal(row.output, 100);
@@ -164,7 +167,27 @@ CREATE TABLE meta (
 );
 `;
 
-test("migrate：v1 的汇总表改名归档，turn 明细保留，版本只写一次", () => {
+function tableNames(path: string): string[] {
+	const db = new DatabaseSync(path, { readOnly: true });
+	try {
+		return (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as Array<{
+			name: string;
+		}>).map((row) => row.name);
+	} finally {
+		db.close();
+	}
+}
+
+function metaValue(path: string, key: string): string | undefined {
+	const db = new DatabaseSync(path, { readOnly: true });
+	try {
+		return (db.prepare("SELECT value FROM meta WHERE key = ?").get(key) as { value: string } | undefined)?.value;
+	} finally {
+		db.close();
+	}
+}
+
+test("migrate：v1 的 day_model / session 直接删除，turn 明细保留", () => {
 	const dir = tempDir();
 	const path = dbPath(dir);
 	mkdirSync(join(dir, "pi-token-stats"), { recursive: true });
@@ -185,41 +208,84 @@ test("migrate：v1 的汇总表改名归档，turn 明细保留，版本只写�
 
 	const store = openTokenStatsStore(path);
 	try {
-		const rows = store.windowRows(0);
-		assert.equal(rows.length, 1);
-		assert.equal(rows[0]?.output, 700);
-		assert.equal(rows[0]?.timedMs, 2_000);
-		assert.equal(rows[0]?.firstTokenSamples, 1);
+		const row = store.windowRow(0, "deepseek/deepseek-chat");
+		assert.equal(row?.output, 700);
+		assert.equal(row?.timedMs, 2_000);
+		assert.equal(row?.firstTokenSamples, 1);
 	} finally {
 		store.close();
 	}
 
-	const raw = new DatabaseSync(path, { readOnly: true });
-	try {
-		const tables = (raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as Array<{ name: string }>).map(
-			(row) => row.name,
-		);
-		assert.ok(tables.includes("archive_day_model"));
-		assert.ok(tables.includes("archive_session"));
-		assert.ok(!tables.includes("day_model"));
-		assert.ok(!tables.includes("session"));
-		// 旧的按会话索引已经不用了
-		assert.equal(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'turn_session'").get(), undefined);
-		assert.equal((raw.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value, "2");
-		assert.equal((raw.prepare("SELECT output FROM archive_day_model").get() as { output: number }).output, 4_200);
-		assert.equal((raw.prepare("SELECT turns FROM archive_session").get() as { turns: number }).turns, 4);
-	} finally {
-		raw.close();
-	}
+	assert.deepEqual(tableNames(path), ["meta", "turn"]);
+	assert.equal(metaValue(path, "schema_version"), "3");
+	// 旧 JSON 导入标记随导入代码一起删除
+	assert.equal(metaValue(path, "legacy_json_imported"), undefined);
 
 	// 再次打开不重复迁移，明细照常可查
 	const reopened = openTokenStatsStore(path);
 	try {
-		assert.equal(reopened.windowRows(0)[0]?.turns, 1);
+		assert.equal(reopened.windowRow(0, "deepseek/deepseek-chat")?.turns, 1);
 	} finally {
 		reopened.close();
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+test("migrate：v2 的 archive 表也直接删除", () => {
+	const dir = tempDir();
+	const path = dbPath(dir);
+	mkdirSync(join(dir, "pi-token-stats"), { recursive: true });
+	const v2 = new DatabaseSync(path);
+	try {
+		v2.exec(`
+			CREATE TABLE turn (
+				id INTEGER PRIMARY KEY,
+				at INTEGER NOT NULL,
+				session_id TEXT NOT NULL,
+				session_name TEXT,
+				provider TEXT,
+				model TEXT,
+				input INTEGER NOT NULL DEFAULT 0,
+				output INTEGER NOT NULL DEFAULT 0,
+				cache_read INTEGER NOT NULL DEFAULT 0,
+				cache_write INTEGER NOT NULL DEFAULT 0,
+				cost REAL NOT NULL DEFAULT 0,
+				duration_ms INTEGER,
+				first_token_ms INTEGER
+			);
+			CREATE INDEX turn_at ON turn(at);
+			CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+			CREATE TABLE archive_day_model (date TEXT, model TEXT, output INTEGER);
+			CREATE TABLE archive_session (id TEXT, turns INTEGER);
+		`);
+		v2.prepare("INSERT INTO turn(at, session_id, provider, model, output, duration_ms, first_token_ms) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+			5_000,
+			"legacy",
+			"deepseek",
+			"deepseek/deepseek-chat",
+			700,
+			2_000,
+			500,
+		);
+		v2.prepare("INSERT INTO archive_day_model(date, model, output) VALUES (?, ?, ?)").run("2026-11-18", "deepseek/deepseek-chat", 4_200);
+		v2.prepare("INSERT INTO archive_session(id, turns) VALUES (?, ?)").run("legacy", 4);
+		v2.prepare("INSERT INTO meta(key, value) VALUES (?, ?)").run("schema_version", "2");
+		v2.prepare("INSERT INTO meta(key, value) VALUES (?, ?)").run("legacy_json_imported", "1");
+	} finally {
+		v2.close();
+	}
+
+	const store = openTokenStatsStore(path);
+	try {
+		assert.equal(store.windowRow(0, "deepseek/deepseek-chat")?.output, 700);
+	} finally {
+		store.close();
+	}
+
+	assert.deepEqual(tableNames(path), ["meta", "turn"]);
+	assert.equal(metaValue(path, "schema_version"), "3");
+	assert.equal(metaValue(path, "legacy_json_imported"), undefined);
+	rmSync(dir, { recursive: true, force: true });
 });
 
 /** 子进程里跑 N 次 recordTurn，制造真实的跨进程写竞争。 */
@@ -267,12 +333,12 @@ test("recordTurn：多个进程同时写同一个库不丢增量", { timeout: 60
 
 		const store = openTokenStatsStore(path);
 		try {
-			const rows = store.windowRows(0);
-			assert.equal(rows.length, 1);
-			assert.equal(rows[0]?.turns, 75);
-			assert.equal(rows[0]?.output, 7_500);
-			assert.equal(rows[0]?.timedMs, 75_000);
-			assert.equal(rows[0]?.firstTokenSamples, 75);
+			const row = store.windowRow(0, "deepseek/deepseek-chat");
+			assert.equal(row?.turns, 75);
+			assert.equal(row?.output, 7_500);
+			assert.equal(row?.timedMs, 75_000);
+			assert.equal(row?.firstTokenSamples, 75);
+			assert.equal(store.latestModel(0), "deepseek/deepseek-chat");
 		} finally {
 			store.close();
 		}

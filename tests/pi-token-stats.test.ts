@@ -190,58 +190,41 @@ function windowRow(overrides: Partial<WindowModelRow> = {}): WindowModelRow {
 	};
 }
 
-test("renderStats：按模型列出平均首字与平均速率，并给出总计", () => {
-	const rows = [
-		windowRow(),
-		windowRow({
-			provider: "openai",
-			model: "gpt-5",
-			turns: 1,
-			output: 500,
-			timedOutput: 500,
-			timedMs: 2_000,
-			firstTokenMs: 1_200,
-			firstTokenSamples: 1,
-		}),
-	];
-	const text = renderStats(rows, { since: 0, label: "1h" }, 120).join("\n");
+test("renderStats：只显示当前模型的平均首字与平均速率", () => {
+	const row = windowRow();
+	const text = renderStats(row, "deepseek/deepseek-chat", { since: 0, label: "1h" }, 120).join("\n");
 
 	assert.match(text, /Token Speed · Last 1h/);
-	assert.match(text, /Model\s+Turns\s+TTFT\s+Rate/);
+	assert.match(text, /Model\s+Avg TTFT\s+Avg Rate/);
 	// provider 已经在模型名里，不重复拼前缀
 	assert.doesNotMatch(text, /deepseek\/deepseek\/deepseek-chat/);
-	assert.match(text, /deepseek\/deepseek-chat\s+2\s+800ms\s+100t\/s/);
-	assert.match(text, /openai\/gpt-5\s+1\s+1\.2s\s+250t\/s/);
-	// 总计按 token 加权：1500 token / 12s = 125 t/s；首字是 2800ms / 3
-	assert.match(text, /All models\s+3\s+933ms\s+125t\/s/);
-	assert.match(text, /TTFT = average time to first token/);
-	assert.match(text, /Rate = output tokens ÷ full request time/);
+	assert.match(text, /deepseek\/deepseek-chat\s+800ms\s+100t\/s/);
+	// 不再有 Turns、All models 或口径说明
+	assert.doesNotMatch(text, /Turns|All models|TTFT =|Rate =/);
 });
 
 test("renderStats：没有计时样本的行显示占位", () => {
 	const text = renderStats(
-		[windowRow({ turns: 1, output: 100, timedOutput: 0, timedMs: 0, firstTokenMs: 0, firstTokenSamples: 0 })],
+		windowRow({ output: 100, timedOutput: 0, timedMs: 0, firstTokenMs: 0, firstTokenSamples: 0 }),
+		"deepseek/deepseek-chat",
 		{ since: 0, label: "3h" },
 		80,
 	).join("\n");
-	assert.match(text, /deepseek\/deepseek-chat\s+1\s+-\s+-/);
+	assert.match(text, /deepseek\/deepseek-chat\s+-\s+-/);
 });
 
-test("renderStats：空窗口与 all 的文案", () => {
-	const empty = renderStats([], { since: 0, label: "1h" }, 80).join("\n");
+test("renderStats：没有数据时说明是哪个模型", () => {
+	const empty = renderStats(undefined, "openai/gpt-5", { since: 0, label: "1h" }, 80).join("\n");
 	assert.match(empty, /Token Speed · Last 1h/);
-	assert.match(empty, /No turns in the last 1h\./);
+	assert.match(empty, /No data for openai\/gpt-5\./);
 
-	const all = renderStats([], { since: 0, label: "all" }, 80).join("\n");
+	const all = renderStats(undefined, "openai/gpt-5", { since: 0, label: "all" }, 80).join("\n");
 	assert.match(all, /Token Speed · All time/);
-	assert.match(all, /No turns recorded yet\./);
 });
 
 test("renderStats：窄终端里截断模型名，不超出宽度", () => {
-	const rows = [
-		windowRow({ provider: "very-long-provider", model: "very-long-provider/a-very-long-model-name-here" }),
-	];
-	const lines = renderStats(rows, { since: 0, label: "1h" }, 60);
+	const row = windowRow({ provider: "very-long-provider", model: "very-long-provider/a-very-long-model-name-here" });
+	const lines = renderStats(row, row.model, { since: 0, label: "1h" }, 60);
 	assert.ok(lines.every((line) => visibleWidth(line) <= 60), lines.join("\n"));
 	assert.match(lines.join("\n"), /…/);
 });
@@ -254,6 +237,7 @@ test("parseTokenWindow：默认 1 小时，支持 m/h/d/all", () => {
 	assert.deepEqual(parseTokenWindow("1d", now), { since: now - 86_400_000, label: "1d" });
 	assert.deepEqual(parseTokenWindow("90m", now), { since: now - 5_400_000, label: "1h30m" });
 	assert.deepEqual(parseTokenWindow("1h 30m", now), { since: now - 5_400_000, label: "1h30m" });
+	assert.deepEqual(parseTokenWindow("7d", now), { since: now - 7 * 86_400_000, label: "7d" });
 	assert.deepEqual(parseTokenWindow("all", now), { since: 0, label: "all" });
 	assert.throws(() => parseTokenWindow("7d?"), /unknown argument/);
 	assert.throws(() => parseTokenWindow("0h"), /greater than 0/);
@@ -262,16 +246,17 @@ test("parseTokenWindow：默认 1 小时，支持 m/h/d/all", () => {
 test("tokenArgumentCompletions：补全保留已写好的参数", () => {
 	const values = (prefix: string) => (tokenArgumentCompletions(prefix) ?? []).map((item) => item.value);
 
-	// 空参数：列出候选，不再有旧的 7d / Out
+	// 空参数：列出候选，旧的 7d 仍保留，Out 已移除
 	assert.ok(values("").includes("1h"));
 	assert.ok(values("").includes("3h"));
+	assert.ok(values("").includes("7d"));
 	assert.ok(values("").includes("all"));
-	assert.ok(!values("").includes("7d"));
 	assert.ok(!values("").includes("Out"));
 	// 单个参数：按前缀过滤
 	assert.deepEqual(values("3"), ["3h"]);
+	assert.deepEqual(values("7"), ["7d"]);
 	// 已写过的参数不再出现在下一条候选里，补全项带上前面的参数
-	assert.deepEqual(values("1h "), ["1h 3h", "1h 6h", "1h 12h", "1h 24h", "1h all"]);
+	assert.deepEqual(values("1h "), ["1h 3h", "1h 6h", "1h 12h", "1h 24h", "1h 7d", "1h all"]);
 	// 多参数：补全项带上前面的参数（pi 补全会整段替换参数文本）
 	assert.deepEqual(values("1h a"), ["1h all"]);
 	// 没有候选

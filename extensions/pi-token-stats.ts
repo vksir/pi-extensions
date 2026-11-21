@@ -4,15 +4,15 @@
  * 全局 Token 用量与耗时统计。每次 turn_end 从事件中提取 usage，写进 agent dir 下的
  * SQLite 库；不做任何 session 文件扫描。
  *
- * `/token` 默认看过去 1 小时，也可以 `/token 3h`、`/token 30m`、`/token all`。
- * 所有会话、所有进程的记录都在同一个库里，按模型汇总成一张表，只列平均首字与
- * 平均输出速率。
+ * `/token` 默认看过去 1 小时，也可以 `/token 3h`、`/token 30m`、`/token 7d`、`/token all`。
+ * 所有会话、所有进程的记录都在同一个库里，但报告只统计**当前模型**：只列平均首字与
+ * 平均输出速率两个指标，不再按模型拆表。
  *
  * footer 状态行里插入最近一次响应的首字时间与输出速率（如 `R1.5M 0.9s 42t/s CH97.1%`），
  * 由 lib/footer-rate.ts 包一层内置 footer 实现。
  *
- * 数据库在 `~/.pi/agent/pi-token-stats/token-stats.db`，只保留 `turn` 明细；schema v2
- * 打开时把旧的 `day_model` / `session` 汇总改名归档，见 lib/token-stats-db.ts。读写都交给
+ * 数据库在 `~/.pi/agent/pi-token-stats/token-stats.db`，只保留 `turn` 明细；schema v3
+ * 打开时删除旧的 `day_model` / `session` 汇总表，见 lib/token-stats-db.ts。读写都交给
  * lib/token-stats-worker.ts 的 worker 线程，主线程只收发消息，不碰 SQLite。entry 渲染在
  * lib/render.ts。
  */
@@ -64,8 +64,8 @@ export interface TokenWindow {
 }
 
 /**
- * 解析 `/token` 参数：空 = 过去 1 小时；`3h` / `30m` / `1d`；可连写（`1h30m` 或
- * `1h 30m`）；`all` = 全部历史。非法参数抛错，由命令处理成通知。
+ * 解析 `/token` 参数：空 = 过去 1 小时；`3h` / `30m` / `7d`；可连写（`1h30m` 或
+ * `1h 30m`）；`all` = 全部历史。旧的 `7d` 仍按「最近 7 天」解释。
  */
 export function parseTokenWindow(args: string, now: number = Date.now()): TokenWindow {
 	const text = args.trim().toLowerCase();
@@ -95,20 +95,10 @@ export function formatWindowLabel(ms: number): string {
 
 // ─── 表格渲染 ───
 
-interface ModelStats {
-	label: string;
-	turns: number;
-	timedOutput: number;
-	timedMs: number;
-	firstTokenMs: number;
-	firstTokenSamples: number;
-}
-
 const INDENT = "  ";
 const GAP = "   ";
-const TURNS_WIDTH = 5;
-const TTFT_WIDTH = 6;
-const RATE_WIDTH = 7;
+const TTFT_WIDTH = 8;
+const RATE_WIDTH = 8;
 
 /** 模型列显示 `provider/model`；模型名已经带 provider 前缀时不重复。 */
 function modelLabel(row: WindowModelRow): string {
@@ -118,37 +108,15 @@ function modelLabel(row: WindowModelRow): string {
 	return `${provider}/${model}`;
 }
 
-function toStats(row: WindowModelRow): ModelStats {
-	return {
-		label: modelLabel(row),
-		turns: row.turns,
-		timedOutput: row.timedOutput,
-		timedMs: row.timedMs,
-		firstTokenMs: row.firstTokenMs,
-		firstTokenSamples: row.firstTokenSamples,
-	};
-}
-
-function totalStats(rows: ModelStats[]): ModelStats {
-	return {
-		label: "All models",
-		turns: rows.reduce((sum, row) => sum + row.turns, 0),
-		timedOutput: rows.reduce((sum, row) => sum + row.timedOutput, 0),
-		timedMs: rows.reduce((sum, row) => sum + row.timedMs, 0),
-		firstTokenMs: rows.reduce((sum, row) => sum + row.firstTokenMs, 0),
-		firstTokenSamples: rows.reduce((sum, row) => sum + row.firstTokenSamples, 0),
-	};
-}
-
-function averageTtft(stats: ModelStats): number | undefined {
-	if (stats.firstTokenSamples <= 0) return undefined;
-	return stats.firstTokenMs / stats.firstTokenSamples;
+function averageTtft(row: WindowModelRow): number | undefined {
+	if (row.firstTokenSamples <= 0) return undefined;
+	return row.firstTokenMs / row.firstTokenSamples;
 }
 
 /** 按 token 加权：输出之和 ÷ 耗时之和，不是逐次速率的算术平均。 */
-function averageRate(stats: ModelStats): number | undefined {
-	if (stats.timedMs <= 0) return undefined;
-	return stats.timedOutput / (stats.timedMs / 1000);
+function averageRate(row: WindowModelRow): number | undefined {
+	if (row.timedMs <= 0) return undefined;
+	return row.timedOutput / (row.timedMs / 1000);
 }
 
 function padCell(text: string, width: number, align: "left" | "right" = "left"): string {
@@ -171,30 +139,14 @@ function clipCell(text: string, width: number): string {
 	return `${out}…`;
 }
 
-function renderCells(cells: [string, string, string, string], modelWidth: number): string {
+function renderCells(cells: [string, string, string], modelWidth: number): string {
 	return (
 		INDENT +
 		padCell(clipCell(cells[0], modelWidth), modelWidth) +
 		GAP +
-		padCell(cells[1], TURNS_WIDTH, "right") +
+		padCell(cells[1], TTFT_WIDTH, "right") +
 		GAP +
-		padCell(cells[2], TTFT_WIDTH, "right") +
-		GAP +
-		padCell(cells[3], RATE_WIDTH, "right")
-	);
-}
-
-function renderStatsRow(stats: ModelStats, modelWidth: number): string {
-	const ttft = averageTtft(stats);
-	const rate = averageRate(stats);
-	return renderCells(
-		[
-			stats.label,
-			String(stats.turns),
-			ttft === undefined ? "-" : formatFirstToken(ttft),
-			rate === undefined ? "-" : formatRate(rate),
-		],
-		modelWidth,
+		padCell(cells[2], RATE_WIDTH, "right")
 	);
 }
 
@@ -203,8 +155,6 @@ function tableRule(modelWidth: number): string {
 		INDENT +
 		"─".repeat(modelWidth) +
 		GAP +
-		"─".repeat(TURNS_WIDTH) +
-		GAP +
 		"─".repeat(TTFT_WIDTH) +
 		GAP +
 		"─".repeat(RATE_WIDTH)
@@ -212,35 +162,42 @@ function tableRule(modelWidth: number): string {
 }
 
 /**
- * 只负责排版：按模型聚合的行由 worker 查好，这里保持纯函数，方便单测。
+ * 只负责排版：单个模型的聚合行由 worker 查好，这里保持纯函数，方便单测。
+ * model 用于没有数据时说明是哪个模型。
  */
-export function renderStats(rows: WindowModelRow[], window: TokenWindow, width = 80): string[] {
+export function renderStats(
+	row: WindowModelRow | undefined,
+	model: string,
+	window: TokenWindow,
+	width = 80,
+): string[] {
 	const title = window.label === "all" ? "📊 Token Speed · All time" : `📊 Token Speed · Last ${window.label}`;
 	const lines: string[] = [`${INDENT}${title}`, ""];
 
-	if (rows.length === 0) {
-		lines.push(
-			INDENT + (window.label === "all" ? "No turns recorded yet." : `No turns in the last ${window.label}.`),
-			"",
-		);
+	if (!row) {
+		lines.push(`${INDENT}No data for ${model}.`, "");
 		return lines;
 	}
 
-	const stats = rows.map(toStats).sort((a, b) => b.turns - a.turns || a.label.localeCompare(b.label));
-	const all = totalStats(stats);
-	const longest = Math.max(...stats.map((row) => visibleWidth(row.label)), visibleWidth("Model"));
-	const available =
-		width - INDENT.length - GAP.length * 3 - TURNS_WIDTH - TTFT_WIDTH - RATE_WIDTH;
+	const label = modelLabel(row);
+	const longest = Math.max(visibleWidth(label), visibleWidth("Model"));
+	const available = width - INDENT.length - GAP.length * 2 - TTFT_WIDTH - RATE_WIDTH;
 	const modelWidth = Math.max(4, Math.min(longest, available));
+	const ttft = averageTtft(row);
+	const rate = averageRate(row);
 
-	lines.push(renderCells(["Model", "Turns", "TTFT", "Rate"], modelWidth));
+	lines.push(renderCells(["Model", "Avg TTFT", "Avg Rate"], modelWidth));
 	lines.push(tableRule(modelWidth));
-	for (const row of stats) lines.push(renderStatsRow(row, modelWidth));
-	lines.push(tableRule(modelWidth));
-	lines.push(renderStatsRow(all, modelWidth));
-	lines.push("");
-	lines.push(`${INDENT}TTFT = average time to first token`);
-	lines.push(`${INDENT}Rate = output tokens ÷ full request time`);
+	lines.push(
+		renderCells(
+			[
+				label,
+				ttft === undefined ? "-" : formatFirstToken(ttft),
+				rate === undefined ? "-" : formatRate(rate),
+			],
+			modelWidth,
+		),
+	);
 	lines.push("");
 	return lines;
 }
@@ -252,6 +209,7 @@ const TOKEN_ARGS: AutocompleteItem[] = [
 	{ value: "6h", label: "6h", description: "过去 6 小时" },
 	{ value: "12h", label: "12h", description: "过去 12 小时" },
 	{ value: "24h", label: "24h", description: "过去 24 小时" },
+	{ value: "7d", label: "7d", description: "过去 7 天（旧默认）" },
 	{ value: "all", label: "all", description: "全部历史" },
 ];
 
@@ -332,17 +290,22 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("token", {
-		description: "过去 1 小时的 Token 速率。参数: 3h / 30m / 24h / all",
+		description: "过去 1 小时的 Token 速率。参数: 3h / 30m / 7d / all",
 		getArgumentCompletions: (prefix) => tokenArgumentCompletions(prefix),
 		handler: async (args, ctx) => {
 			try {
 				const window = parseTokenWindow(args);
-				// 查询走写线程：按 FIFO 一定看得到之前所有已提交的 turn，主线程不被 SQLite 阻塞
-				const rows = await statsClient().windowRows(window.since);
+				const stats = statsClient();
+				// 当前模型与落盘时的 `provider/model` 同形；拿不到时退回窗口内最近一次的模型
+				const current = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+				const model = current ?? (await stats.latestModel(window.since));
+				const row = model ? await stats.windowRow(window.since, model) : undefined;
 				// entry 外层 Box 左右各留 1 格，表格按可用内容宽度排版
 				const columns = (process.stdout as { columns?: number })?.columns || 80;
 				const width = Math.max(20, columns - 2);
-				pi.appendEntry<TokenStatsEntry>("token-stats", { lines: renderStats(rows, window, width) });
+				pi.appendEntry<TokenStatsEntry>("token-stats", {
+					lines: renderStats(row, model ?? "unknown", window, width),
+				});
 			} catch (e) {
 				ctx.ui.notify(`[error] ${(e as Error).message}`, "error");
 			}

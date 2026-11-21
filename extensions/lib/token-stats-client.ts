@@ -12,8 +12,10 @@ import type { WorkerReply, WorkerRequest, WorkerStartData } from "./token-stats-
 export interface TokenStatsClient {
 	/** 投递一轮响应；worker 未就绪或已失败时静默丢弃。 */
 	recordTurn(turn: TurnInput): void;
-	/** 按时间窗聚合，since 为起点（epoch ms，含）；0 表示全部历史。 */
-	windowRows(since: number): Promise<WindowModelRow[]>;
+	/** 时间窗内单个模型的聚合；scope 为 DB 里的 `provider/model`，没有记录时 undefined。 */
+	windowRow(since: number, model: string): Promise<WindowModelRow | undefined>;
+	/** 时间窗内最近一次响应用的模型名；没有记录时 undefined。 */
+	latestModel(since: number): Promise<string | undefined>;
 	/** 等 worker 处理完已投递的消息并关闭数据库 */
 	close(): Promise<void>;
 }
@@ -61,7 +63,9 @@ export function openTokenStatsClient(options: TokenStatsClientOptions): TokenSta
 		if (!closed) fail(new Error(`token-stats worker exited with ${code}`));
 	});
 
-	function request<T>(message: { type: "window"; since: number }): Promise<T> {
+	type QueryRequest = { type: "window"; since: number; model: string } | { type: "latest"; since: number };
+
+	function request<T>(message: QueryRequest): Promise<T> {
 		if (failure) return Promise.reject(failure);
 		if (closed) return Promise.reject(new Error("token-stats client is closed"));
 		const id = nextId++;
@@ -80,8 +84,11 @@ export function openTokenStatsClient(options: TokenStatsClientOptions): TokenSta
 				/* worker 已退出：与查询失败同样处理，丢这一轮 */
 			}
 		},
-		windowRows(since: number): Promise<WindowModelRow[]> {
-			return request<WindowModelRow[]>({ type: "window", since });
+		windowRow(since: number, model: string): Promise<WindowModelRow | undefined> {
+			return request<WindowModelRow | null>({ type: "window", since, model }).then((value) => value ?? undefined);
+		},
+		latestModel(since: number): Promise<string | undefined> {
+			return request<string | null>({ type: "latest", since }).then((value) => value ?? undefined);
 		},
 		async close(): Promise<void> {
 			if (closed) return;

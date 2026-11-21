@@ -18,13 +18,14 @@ export interface WorkerStartData {
 
 export type WorkerRequest =
 	| { type: "turn"; turn: TurnInput }
-	| { type: "window"; id: number; since: number }
+	| { type: "window"; id: number; since: number; model: string }
+	| { type: "latest"; id: number; since: number }
 	| { type: "close" };
 
 export type WorkerReply =
 	| { type: "ready" }
 	| { type: "failed"; message: string }
-	| { type: "result"; id: number; value: WindowModelRow[] }
+	| { type: "result"; id: number; value: WindowModelRow | string | null }
 	| { type: "error"; id: number; message: string };
 
 const port = parentPort;
@@ -57,8 +58,10 @@ port.on("message", (message: WorkerRequest) => {
 	try {
 		if (message.type === "turn") {
 			store.recordTurn(message.turn);
+		} else if (message.type === "window") {
+			port.postMessage({ type: "result", id: message.id, value: store.windowRow(message.since, message.model) ?? null });
 		} else {
-			port.postMessage({ type: "result", id: message.id, value: store.windowRows(message.since) });
+			port.postMessage({ type: "result", id: message.id, value: store.latestModel(message.since) ?? null });
 		}
 	} catch (error) {
 		if ("id" in message) port.postMessage({ type: "error", id: message.id, message: errorMessage(error) });

@@ -15,27 +15,27 @@ _Avoid_: 速度、生成速度、tokens per second、TPS
 _Avoid_: 假 session、mock session
 
 **时间窗 (Time Window)**：
-`/token` 的聚合范围，默认过去 1 小时，可用 `3h` / `30m` / `1d` / `all` 等参数指定。窗口覆盖库里的所有会话与所有 pi 进程，不按会话区分。
+`/token` 的聚合范围，默认过去 1 小时，可用 `3h` / `30m` / `7d` / `all` 等参数指定。窗口覆盖库里的所有会话与所有 pi 进程，不按会话区分，但只统计当前模型。
 _Avoid_: 区间、时间段、period
 
+**当前模型 (Current Model)**：
+`/token` 报告里唯一统计的模型，由 `ctx.model` 的 `provider/id` 确定，与 `turn` 表里落盘的 `provider/model` 同形。当前模型没有记录时显示 `No data for ...`，不混入其他模型的数据。
+_Avoid_: 活动模型、默认模型（切换模型后默认值不变）
+
 **首字延迟 (Time to First Token)**：
-时间窗内测到首字的响应之和除以样本数，按模型展示。首字只能在流式过程中测，样本数可能少于响应数；没有样本时显示 `-`。
+时间窗内当前模型测到首字的响应之和除以样本数。首字只能在流式过程中测，样本数可能少于响应数；没有样本时显示 `-`。
 _Avoid_: 平均延迟、平均耗时、平均首字（与旧会话口径混淆）
 
 **时间窗速率 (Window Output Rate)**：
-时间窗内有耗时响应的输出 token 之和除以这些响应的耗时之和，单位 token/秒。按 token 加权，不是逐次速率的算术平均；耗时取完整请求时间（含首字等待）。
+时间窗内当前模型有耗时响应的输出 token 之和除以这些响应的耗时之和，单位 token/秒。按 token 加权，不是逐次速率的算术平均；耗时取完整请求时间（含首字等待）。
 _Avoid_: 平均速度、平均 TPS、会话平均速率
 
 **明细行 (Turn Record)**：
 SQLite 里 `turn` 表的一行，对应一次 assistant 响应，带时间、会话、模型、用量、耗时与首字。时间窗汇总直接聚合它。
 _Avoid_: 事件、日志行、raw event
 
-**归档表 (Archive Table)**：
-schema v2 迁移时由 v1 的 `day_model` / `session` 改名而来的 `archive_day_model` / `archive_session`。数据保留，不再写入也不再读取。
-_Avoid_: 旧表、废弃表、legacy table
-
 **schema 版本 (Schema Version)**：
-记在 `meta.schema_version` 的整数。打开数据库时按它跑迁移；v2 把旧汇总表归档，并把版本写回。
+记在 `meta.schema_version` 的整数。打开数据库时按它跑迁移；v3 直接删除旧汇总表，并把版本写回。
 _Avoid_: 数据库版本、migration id
 
 **写线程 (Writer Worker)**：
