@@ -6,6 +6,12 @@
  * - `day_model`：按天 × 模型的累计，柱状图与模型汇总读它；
  * - `session`：按会话的累计，当前会话的平均首字/平均速率读它。
  *
+ * `/token rate` 直接聚合 `turn` 的时间窗，不需要额外表。
+ *
+ * 迁移约束：任何改变表结构或删数据的迁移，必须先备份旧数据库
+ * （`VACUUM INTO 'token-stats.db.before-migrate-<timestamp>'`），
+ * 迁移失败时从备份恢复。当前版本没有 schema 迁移。
+ *
  * 多个 pi 进程共用同一个库：连接开 `busy_timeout`，建库时一次性切到 WAL，
  * 每个 turn 用 `BEGIN IMMEDIATE` 事务，后写的事务排队等前一个提交，不会丢增量。
  */
@@ -76,6 +82,15 @@ export interface DayModelRow {
 	cost: number;
 }
 
+/** `/token rate` 的时间窗聚合；速率样本数与首字样本数可能少于 turns。 */
+export interface RateRow {
+	turns: number;
+	timedOutput: number;
+	timedMs: number;
+	firstTokenMs: number;
+	firstTokenSamples: number;
+}
+
 /** 记录一轮响应需要的全部信息。 */
 export interface TurnInput {
 	/** 本地日期 YYYY-MM-DD，与按天汇总的 key 一致 */
@@ -95,6 +110,10 @@ export interface TokenStatsStore {
 	/** from 为空表示全部历史 */
 	dayRows(from?: string): DayModelRow[];
 	sessionRecord(id: string): SessionRecord | undefined;
+	/** 时间窗内某个模型的速率样本；没有记录时返回 undefined */
+	rateRow(since: number, model: string): RateRow | undefined;
+	/** 时间窗内最近一次响应用的模型名；没有记录时返回 undefined */
+	latestModel(since: number): string | undefined;
 	/** 迁移专用：已存在同日同模型时保留现有值，不重复累加 */
 	importDayModel(row: DayModelRow): void;
 	/** 迁移专用：已存在同 id 会话时保留现有值 */
@@ -116,6 +135,14 @@ interface SessionRow {
 	cache_read: number;
 	cache_write: number;
 	cost: number;
+	timed_output: number;
+	timed_ms: number;
+	first_token_ms: number;
+	first_token_samples: number;
+}
+
+interface RateQueryRow {
+	turns: number;
 	timed_output: number;
 	timed_ms: number;
 	first_token_ms: number;
@@ -191,6 +218,8 @@ class SqliteStore implements TokenStatsStore {
 	private readonly selectDayFrom: StatementSync;
 	private readonly selectDayAll: StatementSync;
 	private readonly selectSession: StatementSync;
+	private readonly selectRate: StatementSync;
+	private readonly selectLatestModel: StatementSync;
 	private readonly upsertSession: StatementSync;
 	private readonly insertDayIfAbsent: StatementSync;
 	private readonly insertSessionIfAbsent: StatementSync;
@@ -223,6 +252,17 @@ class SqliteStore implements TokenStatsStore {
 		this.selectSession = this.db.prepare(
 			"SELECT name, first_active_at, last_active_at, turns, input, output, cache_read, cache_write, cost, " +
 				"timed_output, timed_ms, first_token_ms, first_token_samples FROM session WHERE id = ?",
+		);
+		this.selectRate = this.db.prepare(
+			"SELECT COUNT(*) AS turns, " +
+				"COALESCE(SUM(CASE WHEN output > 0 AND duration_ms > 0 THEN output ELSE 0 END), 0) AS timed_output, " +
+				"COALESCE(SUM(CASE WHEN output > 0 AND duration_ms > 0 THEN duration_ms ELSE 0 END), 0) AS timed_ms, " +
+				"COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL THEN first_token_ms ELSE 0 END), 0) AS first_token_ms, " +
+				"COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL THEN 1 ELSE 0 END), 0) AS first_token_samples " +
+				"FROM turn WHERE at >= ? AND model = ?",
+		);
+		this.selectLatestModel = this.db.prepare(
+			"SELECT model FROM turn WHERE model IS NOT NULL AND at >= ? ORDER BY at DESC, id DESC LIMIT 1",
 		);
 		this.upsertSession = this.db.prepare(
 			"INSERT INTO session(id, name, first_active_at, last_active_at, turns, input, output, cache_read, cache_write, cost, " +
@@ -311,6 +351,23 @@ class SqliteStore implements TokenStatsStore {
 	sessionRecord(id: string): SessionRecord | undefined {
 		const row = this.selectSession.get(id) as SessionRow | undefined;
 		return row ? toRecord(row) : undefined;
+	}
+
+	rateRow(since: number, model: string): RateRow | undefined {
+		const row = this.selectRate.get(since, model) as unknown as RateQueryRow;
+		if (row.turns === 0) return undefined;
+		return {
+			turns: row.turns,
+			timedOutput: row.timed_output,
+			timedMs: row.timed_ms,
+			firstTokenMs: row.first_token_ms,
+			firstTokenSamples: row.first_token_samples,
+		};
+	}
+
+	latestModel(since: number): string | undefined {
+		const row = this.selectLatestModel.get(since) as { model: string } | undefined;
+		return row?.model ?? undefined;
 	}
 
 	importDayModel(row: DayModelRow): void {

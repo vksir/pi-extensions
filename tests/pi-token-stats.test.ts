@@ -4,7 +4,8 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { initTheme, type ExtensionContext, type ReadonlyFooterDataProvider, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { createFirstTokenTimer, createRateFooter, formatFirstToken, formatRate, insertRate, outputRate, shrinkPadding } from "../extensions/lib/footer-rate.ts";
 import { averageFirstTokenMs, averageOutputRate, recordSessionTurn, type SessionRecord, type SessionTurn } from "../extensions/lib/session-usage.ts";
-import { renderStats, tokenArgumentCompletions } from "../extensions/pi-token-stats.ts";
+import { parseRateWindow, renderRate, renderStats, tokenArgumentCompletions } from "../extensions/pi-token-stats.ts";
+import type { RateRow } from "../extensions/lib/token-stats-db.ts";
 
 // 内置 FooterComponent 渲染时会取当前主题的颜色。
 initTheme("dark");
@@ -282,12 +283,64 @@ test("renderStats：当前会话没测到首字时显示占位", () => {
 	assert.match(text, /平均速率 100t\/s/);
 });
 
+test("parseRateWindow：默认 1 小时，支持 m/h/d/all", () => {
+	const now = 1_000_000_000;
+	assert.deepEqual(parseRateWindow("", now), { since: now - 3_600_000, label: "1h" });
+	assert.deepEqual(parseRateWindow("3h", now), { since: now - 3 * 3_600_000, label: "3h" });
+	assert.deepEqual(parseRateWindow("30m", now), { since: now - 1_800_000, label: "30m" });
+	assert.deepEqual(parseRateWindow("1d", now), { since: now - 86_400_000, label: "1d" });
+	assert.deepEqual(parseRateWindow("90m", now), { since: now - 5_400_000, label: "1h30m" });
+	assert.deepEqual(parseRateWindow("1h 30m", now), { since: now - 5_400_000, label: "1h30m" });
+	assert.deepEqual(parseRateWindow("all", now), { since: 0, label: "all" });
+	assert.throws(() => parseRateWindow("7x"), /unknown rate window/);
+	assert.throws(() => parseRateWindow("0h"), /greater than 0/);
+});
+
+function rateRow(overrides: Partial<RateRow> = {}): RateRow {
+	return {
+		turns: 2,
+		timedOutput: 1_000,
+		timedMs: 10_000,
+		firstTokenMs: 1_600,
+		firstTokenSamples: 2,
+		...overrides,
+	};
+}
+
+test("renderRate：当前模型的平均首字与平均速率", () => {
+	const text = renderRate(rateRow(), "new-api/opencode-go/deepseek-v4.1-flash", { since: 0, label: "1h" }).join("\n");
+	assert.match(text, /Token Rate · Last 1h/);
+	assert.match(text, /new-api\/opencode-go\/deepseek-v4\.1-flash/);
+	assert.match(text, /Avg TTFT\s+800ms/);
+	assert.match(text, /Avg Rate\s+100t\/s/);
+});
+
+test("renderRate：没有数据与没有计时样本的占位", () => {
+	const empty = renderRate(undefined, "openai/gpt-5", { since: 0, label: "3h" }).join("\n");
+	assert.match(empty, /Token Rate · Last 3h/);
+	assert.match(empty, /No data for openai\/gpt-5\./);
+
+	const noTiming = renderRate(
+		rateRow({ timedOutput: 0, timedMs: 0, firstTokenMs: 0, firstTokenSamples: 0 }),
+		"deepseek/deepseek-chat",
+		{ since: 0, label: "1h" },
+	).join("\n");
+	assert.match(noTiming, /Avg TTFT\s+-/);
+	assert.match(noTiming, /Avg Rate\s+-/);
+});
+
 test("tokenArgumentCompletions：补全保留已写好的参数", () => {
 	const values = (prefix: string) => (tokenArgumentCompletions(prefix) ?? []).map((item) => item.value);
 
-	// 空参数：全部候选，没有已删除的 Sessions
+	// 空参数：列出候选，旧的 7d / Out 仍在，新增 rate
 	assert.ok(values("").includes("7d"));
-	assert.ok(!values("").includes("Sessions"));
+	assert.ok(values("").includes("rate"));
+	assert.ok(values("").includes("Out"));
+	// rate 子命令的窗口补全
+	assert.deepEqual(values("r"), ["rate"]);
+	assert.deepEqual(values("rate "), ["rate 1h", "rate 3h", "rate 6h", "rate 12h", "rate 24h", "rate 7d", "rate all"]);
+	assert.deepEqual(values("rate 3"), ["rate 3h"]);
+	assert.equal(tokenArgumentCompletions("rate 1h "), null);
 	// 单个参数：按前缀过滤
 	assert.deepEqual(values("o"), ["Out"]);
 	// 多参数：补全项带上前面的参数（pi 补全会整段替换参数文本）

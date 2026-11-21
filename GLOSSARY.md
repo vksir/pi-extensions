@@ -38,6 +38,22 @@ _Avoid_: 日聚合、daily stats
 `session` 表里按会话累计的用量与计时，报告只查当前会话。旧 JSON 的 `sessions` 段迁移到这里。
 _Avoid_: 会话记录表、session row
 
+**速率视图 (Rate View)**：
+`/token rate [窗口]` 的输出，只列当前模型的 `Avg TTFT` 与 `Avg Rate`，不显示用量；默认过去 1 小时。与 `/token` 用量报告是同一个命令的两个分支。
+_Avoid_: 性能报告、speed command
+
+**时间窗 (Time Window)**：
+速率视图的聚合范围，默认过去 1 小时，可用 `30m` / `3h` / `7d` / `all` 指定。窗口从查询时刻向前滚，不按自然小时切。
+_Avoid_: 区间、时间段、period
+
+**当前模型 (Current Model)**：
+速率视图唯一统计的模型，由 `ctx.model` 的 `provider/id` 确定，与 `turn` 表里落盘的 `provider/model` 同形。没有记录时显示 `No data for ...`，不混入其他模型。
+_Avoid_: 活动模型、默认模型
+
+**迁移备份 (Migration Backup)**：
+任何改变表结构或删数据的迁移，动手前必须先 `VACUUM INTO 'token-stats.db.before-migrate-<timestamp>'` 备份旧数据库；迁移失败从备份恢复。`/token rate` 只用 `turn` 明细，没有 schema 迁移。
+_Avoid_: 导出、dump
+
 **静默迁移 (Silent Migration)**：
 数据库第一次打开时把旧版 `token-stats.json` 导入 SQLite，动手前先复制成 `token-stats.json.bak` 备份；不提示、不改动旧文件，靠 `meta.legacy_json_imported` 保证只做一次。临时代码，下个版本删除。
 _Avoid_: 数据升级、导入向导、backfill

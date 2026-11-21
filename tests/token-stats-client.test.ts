@@ -44,6 +44,14 @@ test("client：写请求立即返回，查询按投递顺序看到已提交数�
 		assert.ok(session);
 		assert.equal(session.turns, 50);
 		assert.equal(session.firstTokenSamples, 50);
+		assert.deepEqual(await client.rateRow(0, "deepseek/deepseek-chat"), {
+			turns: 50,
+			timedOutput: 5_000,
+			timedMs: 50_000,
+			firstTokenMs: 25_000,
+			firstTokenSamples: 50,
+		});
+		assert.equal(await client.latestModel(0), "deepseek/deepseek-chat");
 	} finally {
 		await client.close();
 		rmSync(dir, { recursive: true, force: true });
@@ -85,5 +93,7 @@ test("client：关闭后的写请求静默丢弃，查询报错", async () => {
 	await client.close();
 	assert.doesNotThrow(() => client.recordTurn(turn(100)));
 	await assert.rejects(client.dayRows(), /closed/);
+	await assert.rejects(client.rateRow(0, "deepseek/deepseek-chat"), /closed/);
+	await assert.rejects(client.latestModel(0), /closed/);
 	rmSync(dir, { recursive: true, force: true });
 });

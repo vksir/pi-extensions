@@ -22,7 +22,7 @@ node --test tests/*.test.ts
 | [pi-balance](extensions/pi-balance.ts) | 查询 AI 模型提供商余额/额度（支持 DeepSeek、Moonshot、OpenRouter、OpenAI Codex、OpenCode Go、智谱 GLM）；`/balance` 列支持的 Provider，`/balance all` 查全部，`/balance <provider>` 查单个 |
 | [pi-notify](extensions/pi-notify.ts) | 任务完成后发送桌面通知（支持 iTerm2、Kitty、Ghostty、WezTerm、Windows Terminal）；需 Pi ≥ 1.3.0 |
 | [pi-title](extensions/pi-title.ts) | Agent 运行时在窗口标题显示旋转动画，结束后恢复原标题；herdr 环境（两代）不修改窗口标题，`/name` 更名与会话启动（resume / `/reload` / 切换会话）时同步重命名所在标签（旧 herdr 经 CLI 直接寻址，herdr app 经 herdr-app CLI ls 寻址）；进程内子 agent 会话（ctx.mode 非 "tui"）不参与标题与标签管理 |
-| [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 用量（`/token`），写入 SQLite，按天/模型出图并给出当前会话的平均首字与平均输出速率；footer 状态行里插入最近一次响应的首字时间与输出速率（`R1.5M 0.9s 42t/s CH97.1%`） |
+| [pi-token-stats](extensions/pi-token-stats.ts) | 统计 Token 用量（`/token`），写入 SQLite，按天/模型出图并给出当前会话的平均首字与平均输出速率；`/token rate [1h|3h|...]` 看当前模型时间窗速率；footer 状态行里插入最近一次响应的首字时间与输出速率（`R1.5M 0.9s 42t/s CH97.1%`） |
 | [pi-context](extensions/pi-context.ts) | `/context` 触发一次空转请求，导出这次请求的系统提示词与工具声明（含 codemode 动态描述），两者同源 |
 | [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron [间隔] [once] <prompt>`（省略间隔按 `15m`）、`/cron list`、`/cron delete [id]` |
 | [pi-btw](extensions/pi-btw.ts) | 顺带分派：仅在 herdr / herdr app 环境注册 `/btw <消息>`，新开一个标签，fork 当前会话启动 pi 并把消息作为首条消息递交；本轮还在跑时先把 fork 源截到上一个完整轮次，避免新会话继承半截 turn（见 [ADR-0008](docs/adr/0008-btw-forks-at-turn-boundary.md)） |
@@ -63,6 +63,16 @@ pi 没有给 footer 留插槽，`setFooter` 只能整体替换，所以 `lib/foo
 - 多个进程同时首次打开时，切 WAL 那个 PRAGMA 要短暂独占，代码里自带重试；始终抢不到就退回默认日志模式，功能不受影响。
 
 旧版 `~/.pi/agent/token-stats.json` 会在数据库第一次打开时**静默迁移**一次（按天汇总 + 会话汇总）：动手前先复制成 `token-stats.json.bak` 备份，旧文件本身保持原样、不删除也不改写；数据库 `meta.legacy_json_imported` 记下已迁移，重开不会重复累加。迁移代码是临时的，集中在 `lib/token-stats-legacy.ts`，**下个版本连同 `pi-token-stats.ts` 里的唯一调用一起删除**。
+
+### 速率视图（/token rate）
+
+`/token` 仍是原来的用量报告；`/token rate` 是同一命令的另一个分支，只看速率：
+
+- 默认过去 1 小时；可写 `/token rate 3h`、`/token rate 30m`、`/token rate 7d`、`/token rate all`
+- 只统计当前模型（`ctx.model` 的 `provider/id`），所有会话、所有 pi 进程的 `turn` 明细都参与
+- 表格只列 `Avg TTFT` 与 `Avg Rate`，不显示用量；用量仍看 `/token`
+- `Avg Rate` = 窗口内有耗时响应的 output 之和 ÷ 耗时之和，按 token 加权；`Avg TTFT` = 测到首字的样本均值
+- 直接聚合 `turn` 明细，不需要新表，也没有 schema 迁移。**任何会改表或删数据的迁移，动手前必须先备份数据库**（`VACUUM INTO 'token-stats.db.before-migrate-<timestamp>'`），迁移失败从备份恢复
 
 回归测试（Node.js 24+）：
 

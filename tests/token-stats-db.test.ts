@@ -66,6 +66,18 @@ test("recordTurn：一轮同时写明细、按天汇总与会话汇总", () => {
 		assert.equal(averageOutputRate(session), 100);
 		assert.equal(averageFirstTokenMs(session), 700);
 
+		// 速率视图只看 turn 明细的时间窗，不受 day_model 影响
+		assert.deepEqual(store.rateRow(0, "deepseek/deepseek-chat"), {
+			turns: 2,
+			timedOutput: 400,
+			timedMs: 4_000,
+			firstTokenMs: 1_400,
+			firstTokenSamples: 2,
+		});
+		assert.equal(store.rateRow(0, "missing"), undefined);
+		assert.equal(store.latestModel(0), "deepseek/deepseek-chat");
+		assert.equal(store.latestModel(2_001), undefined);
+
 		// 原始明细一轮一行
 		const raw = new DatabaseSync(dbPath(dir), { readOnly: true });
 		try {
@@ -73,6 +85,32 @@ test("recordTurn：一轮同时写明细、按天汇总与会话汇总", () => {
 		} finally {
 			raw.close();
 		}
+	} finally {
+		store.close();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("rateRow：没有耗时或没有输出的响应不进速率样本", () => {
+	const dir = tempDir();
+	const store = openTokenStatsStore(dbPath(dir));
+	try {
+		store.recordTurn(turn({ at: 1_000, durationMs: undefined, firstTokenMs: undefined }));
+		store.recordTurn(
+			turn({
+				at: 2_000,
+				usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+				durationMs: 2_000,
+				firstTokenMs: 500,
+			}),
+		);
+		assert.deepEqual(store.rateRow(0, "deepseek/deepseek-chat"), {
+			turns: 2,
+			timedOutput: 0,
+			timedMs: 0,
+			firstTokenMs: 500,
+			firstTokenSamples: 1,
+		});
 	} finally {
 		store.close();
 		rmSync(dir, { recursive: true, force: true });

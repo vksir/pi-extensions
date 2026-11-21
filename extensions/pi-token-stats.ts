@@ -13,6 +13,7 @@
  *   /token all         — 全部历史统计（/token 0d 亦可）
  *   /token 3d          — 近 3 天（Nd 任意天数）
  *   /token out         — 显示 Output 柱状图（可与天数组合，如 /token 7d Out）
+ *   /token rate [1h]   — 当前模型的时间窗速率（默认 1h，可写 3h / 7d / all）
  *
  * footer 状态行里插入最近一次响应的首字时间与输出速率（如 `R1.5M 0.9s 42t/s CH97.1%`），
  * 由 lib/footer-rate.ts 包一层内置 footer 实现。
@@ -30,7 +31,7 @@ import { createFirstTokenTimer, createRateFooter, formatFirstToken, formatRate }
 import { renderDimLines } from "./lib/render.ts";
 import { averageFirstTokenMs, averageOutputRate, type SessionRecord, type SessionUsageTotals } from "./lib/session-usage.ts";
 import { openTokenStatsClient, type TokenStatsClient } from "./lib/token-stats-client.ts";
-import type { DayModelRow } from "./lib/token-stats-db.ts";
+import type { DayModelRow, RateRow } from "./lib/token-stats-db.ts";
 
 // ─── 存储 ───
 
@@ -123,6 +124,69 @@ function shortDate(date?: Date): string {
 function hitRate(cacheRead: number, totalInput: number): string {
 	if (totalInput === 0) return "-";
 	return `CH${((cacheRead / totalInput) * 100).toFixed(2)}%`;
+}
+
+// ─── 速率视图 ───
+
+const RATE_DEFAULT_MS = 3_600_000;
+const RATE_UNIT_MS: Record<string, number> = { m: 60_000, h: 3_600_000, d: 86_400_000 };
+
+export interface RateWindow {
+	/** 窗口起点（epoch ms，含）；0 表示全部历史 */
+	since: number;
+	/** 显示用标签：1h / 3h / 7d / 1h30m / all */
+	label: string;
+}
+
+/** `/token rate` 的窗口参数：空 = 过去 1 小时；支持 m/h/d、可连写，或 all。 */
+export function parseRateWindow(args: string, now: number = Date.now()): RateWindow {
+	const text = args.trim().toLowerCase();
+	if (!text) return { since: now - RATE_DEFAULT_MS, label: "1h" };
+	if (text === "all") return { since: 0, label: "all" };
+
+	let ms = 0;
+	for (const part of text.split(/\s+/)) {
+		if (!/^(?:\d+[mhd])+$/.test(part)) throw new Error(`unknown rate window '${part}'`);
+		for (const match of part.matchAll(/(\d+)([mhd])/g)) {
+			ms += Number(match[1]) * RATE_UNIT_MS[match[2]!]!;
+		}
+	}
+	if (ms <= 0) throw new Error("rate window must be greater than 0");
+	return { since: now - ms, label: formatRateWindowLabel(ms) };
+}
+
+/** 把毫秒写成紧凑标签：`30m`、`3h`、`1d`、`1h30m`。 */
+export function formatRateWindowLabel(ms: number): string {
+	const totalMinutes = Math.round(ms / 60_000);
+	if (totalMinutes < 60) return `${totalMinutes}m`;
+	const days = Math.floor(totalMinutes / 1440);
+	const hours = Math.floor((totalMinutes % 1440) / 60);
+	const minutes = totalMinutes % 60;
+	return `${days > 0 ? `${days}d` : ""}${hours > 0 ? `${hours}h` : ""}${minutes > 0 ? `${minutes}m` : ""}`;
+}
+
+const RATE_METRIC_WIDTH = 10;
+const RATE_VALUE_WIDTH = 8;
+
+/** `/token rate` 的排版：当前模型的时间窗平均首字与平均输出速率。 */
+export function renderRate(row: RateRow | undefined, model: string, window: RateWindow): string[] {
+	const title = window.label === "all" ? "📊 Token Rate · All time" : `📊 Token Rate · Last ${window.label}`;
+	const lines: string[] = [`  ${title}`, "", `  ${model}`, ""];
+	if (!row) {
+		lines.push(`  No data for ${model}.`, "");
+		return lines;
+	}
+
+	const ttft = row.firstTokenSamples > 0 ? row.firstTokenMs / row.firstTokenSamples : undefined;
+	const rate = row.timedMs > 0 ? row.timedOutput / (row.timedMs / 1000) : undefined;
+	const metric = (label: string, value: string): string =>
+		`  ${label.padEnd(RATE_METRIC_WIDTH)}  ${value.padStart(RATE_VALUE_WIDTH)}`;
+	lines.push(metric("Metric", "Value"));
+	lines.push(`  ${"─".repeat(RATE_METRIC_WIDTH)}  ${"─".repeat(RATE_VALUE_WIDTH)}`);
+	lines.push(metric("Avg TTFT", ttft === undefined ? "-" : formatFirstToken(ttft)));
+	lines.push(metric("Avg Rate", rate === undefined ? "-" : formatRate(rate)));
+	lines.push("");
+	return lines;
 }
 
 // ─── 柱状图渲染 ───
@@ -295,6 +359,19 @@ const TOKEN_ARGS: AutocompleteItem[] = [
 	{ value: "Out", label: "Out", description: "改看 Output 柱状图" },
 ];
 
+const RATE_COMMAND: AutocompleteItem = { value: "rate", label: "rate", description: "当前模型速率（默认 1h）" };
+
+/** `/token rate` 的窗口候选。 */
+const RATE_ARGS: AutocompleteItem[] = [
+	{ value: "1h", label: "1h", description: "过去 1 小时（默认）" },
+	{ value: "3h", label: "3h", description: "过去 3 小时" },
+	{ value: "6h", label: "6h", description: "过去 6 小时" },
+	{ value: "12h", label: "12h", description: "过去 12 小时" },
+	{ value: "24h", label: "24h", description: "过去 24 小时" },
+	{ value: "7d", label: "7d", description: "过去 7 天" },
+	{ value: "all", label: "all", description: "全部历史" },
+];
+
 /**
  * 只补正在输入的最后一个参数，并排除已写过的。补全项的 `value` 带上前面已写好的参数：
  * pi 的参数补全会整段替换参数文本，不带上的话 `/token all o` 补完会变成 `/token Out`，
@@ -305,8 +382,18 @@ export function tokenArgumentCompletions(prefix: string): AutocompleteItem[] | n
 	const parts = prefix.split(/\s+/);
 	const current = (parts.pop() ?? "").toLowerCase();
 	const done = parts.filter(Boolean);
+
+	// `/token rate <窗口>`：只补一个窗口，补完就停
+	if (done[0]?.toLowerCase() === "rate") {
+		if (done.length > 1) return null;
+		const items = RATE_ARGS.filter((item) => item.value.toLowerCase().startsWith(current));
+		if (items.length === 0) return null;
+		return items.map((item) => ({ ...item, value: `rate ${item.value}` }));
+	}
+
 	const used = new Set(done.map((part) => part.toLowerCase()));
-	const items = TOKEN_ARGS.filter(
+	const candidates = done.length === 0 ? [RATE_COMMAND, ...TOKEN_ARGS] : TOKEN_ARGS;
+	const items = candidates.filter(
 		(item) => !used.has(item.value.toLowerCase()) && item.value.toLowerCase().startsWith(current),
 	);
 	if (items.length === 0) return null;
@@ -373,10 +460,24 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("token", {
-		description: "Token 用量统计。默认近7天。参数: all/Nd(天数) / Output|Out",
+		description: "Token 用量统计。默认近7天。参数: rate [1h|3h|...], all/Nd, Output|Out",
 		getArgumentCompletions: (prefix) => tokenArgumentCompletions(prefix),
 		handler: async (args, ctx) => {
 			try {
+				const tokens = args.trim().split(/\s+/).filter(Boolean);
+				if (tokens[0]?.toLowerCase() === "rate") {
+					const window = parseRateWindow(tokens.slice(1).join(" "));
+					const stats = statsClient();
+					// 当前模型与落盘时的 `provider/model` 同形；拿不到时退回窗口内最近一次的模型
+					const current = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+					const model = current ?? (await stats.latestModel(window.since));
+					const row = model ? await stats.rateRow(window.since, model) : undefined;
+					pi.appendEntry<TokenStatsEntry>("token-stats", {
+						lines: renderRate(row, model ?? "unknown", window),
+					});
+					return;
+				}
+
 				const parts = args.trim().split(/\s+/);
 				// 默认近 7 天；all / 0d 表示全部历史
 				let days = 7;

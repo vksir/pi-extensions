@@ -7,7 +7,7 @@
 
 import { Worker } from "node:worker_threads";
 import type { SessionRecord } from "./session-usage.ts";
-import type { DayModelRow, TurnInput } from "./token-stats-db.ts";
+import type { DayModelRow, RateRow, TurnInput } from "./token-stats-db.ts";
 import type { WorkerReply, WorkerRequest, WorkerStartData } from "./token-stats-worker.ts";
 
 export interface TokenStatsClient {
@@ -15,6 +15,10 @@ export interface TokenStatsClient {
 	recordTurn(turn: TurnInput): void;
 	dayRows(from?: string): Promise<DayModelRow[]>;
 	sessionRecord(id: string): Promise<SessionRecord | undefined>;
+	/** 时间窗内某个模型的速率样本；没有记录时 undefined */
+	rateRow(since: number, model: string): Promise<RateRow | undefined>;
+	/** 时间窗内最近一次响应用的模型名；没有记录时 undefined */
+	latestModel(since: number): Promise<string | undefined>;
 	/** 等 worker 处理完已投递的消息并关闭数据库 */
 	close(): Promise<void>;
 }
@@ -62,7 +66,11 @@ export function openTokenStatsClient(options: TokenStatsClientOptions): TokenSta
 		if (!closed) fail(new Error(`token-stats worker exited with ${code}`));
 	});
 
-	type QueryRequest = { type: "dayRows"; from?: string } | { type: "session"; sessionId: string };
+	type QueryRequest =
+		| { type: "dayRows"; from?: string }
+		| { type: "session"; sessionId: string }
+		| { type: "rate"; since: number; model: string }
+		| { type: "latest"; since: number };
 
 	function request<T>(message: QueryRequest): Promise<T> {
 		if (failure) return Promise.reject(failure);
@@ -88,6 +96,12 @@ export function openTokenStatsClient(options: TokenStatsClientOptions): TokenSta
 		},
 		sessionRecord(id: string): Promise<SessionRecord | undefined> {
 			return request<SessionRecord | null>({ type: "session", sessionId: id }).then((value) => value ?? undefined);
+		},
+		rateRow(since: number, model: string): Promise<RateRow | undefined> {
+			return request<RateRow | null>({ type: "rate", since, model }).then((value) => value ?? undefined);
+		},
+		latestModel(since: number): Promise<string | undefined> {
+			return request<string | null>({ type: "latest", since }).then((value) => value ?? undefined);
 		},
 		async close(): Promise<void> {
 			if (closed) return;
