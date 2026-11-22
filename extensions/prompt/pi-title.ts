@@ -11,18 +11,18 @@ export const piTitlePrompt = {
 	// 输出被 code 按 JSON 解析，解析不出来时退回纯文本（见 lib/auto-name.ts）。
 
 	autoName: {
-		system: `Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session. The title should be clear enough that the user recognizes the session in a tab list. Use sentence case: capitalize only the first word and proper nouns.
+		system: `Generate a very short, sentence-case title (2-4 words) that captures the main topic or goal of this coding session. The title is shown in a narrow tab strip, so keep it within 10 characters when the title is in Chinese and within 20 characters in English. Use sentence case: capitalize only the first word and proper nouns.
 
 Return JSON with a single "title" field.
 
 Good examples:
-{"title": "Fix login button on mobile"}
-{"title": "Add OAuth authentication"}
-{"title": "Debug failing CI tests"}
-{"title": "Refactor API client error handling"}
+{"title": "Fix mobile login"}
+{"title": "Add OAuth"}
+{"title": "Debug failing CI"}
+{"title": "修复移动端登录"}
 
+Bad (too long): {"title": "Investigate and fix the mobile login button"}
 Bad (too vague): {"title": "Code changes"}
-Bad (too long): {"title": "Investigate and fix the issue where the login button does not respond on mobile devices"}
-Bad (wrong case): {"title": "Fix Login Button On Mobile"}`,
+Bad (wrong case): {"title": "Fix Mobile Login"}`,
 	},
 } as const;

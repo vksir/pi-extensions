@@ -1,13 +1,14 @@
 # herdr app 的 tab 名用短标题模型自动生成
 
-herdr app 的 tab 没名字时按序号显示（1、2、…），一个 space 里开几个 pi 就只有一排数字；旧 herdr 的未命名标签显示终端标题 `π - <会话名> - <cwd>`，herdr app 不会。因此没有 `/name` 的新会话在窗口里毫无辨识度。决策：herdr app 下给新建会话的 tab 自动起名——把第一条人类消息交给短标题模型，生成 3-7 词、句子式的标题写进 tab 名，一个会话只试一次。
+herdr app 的 tab 没名字时按序号显示（1、2、…），一个 space 里开几个 pi 就只有一排数字；旧 herdr 的未命名标签显示终端标题 `π - <会话名> - <cwd>`，herdr app 不会。因此没有 `/name` 的新会话在窗口里毫无辨识度。决策：herdr app 下给新建会话的 tab 自动起名——把第一条人类消息交给短标题模型，生成一句 2-4 词的标题写进 tab 名，并按显示宽度硬截到 20 列，一个会话只试一次。
 
 ## 决策
 
 - **只管 herdr app**（`HC_TERMINAL_ID`）。旧 herdr 的未命名标签已经有终端标题（含 cwd），再覆盖会丢信息。
 - **触发点唯一**：`input` 事件里第一个「人类消息」——`source !== "extension"`（pi-cron、herdr-agent peer 走 `sendUserMessage`）、非纯空白、不以 `/` 开头（`/skill:…`、prompt 模板在展开前就到这里），且会话还没有会话名。满足后立即消耗掉唯一一次机会，无论成败。
 - **只认新建会话**：判据是会话里还没有真人消息（`session_start` 时查 `getEntries()`），且启动原因不是 `fork`。不能只看 `session_start` 的 `reason`：`pi -c` 在扩展加载之前就把旧会话打开了，它发出的事件也是 `startup`。所以 `resume` / `fork` / `reload` 出来的有历史的会话一律不回溯命名，tab 保持原样。
-- **名字来源是模型**：`ctx.modelRegistry.complete` + `extensions/prompt/pi-title.ts` 里的系统提示词（3-7 词、sentence case、JSON `{"title"}`，口径照 Claude Code 的 `generateSessionTitle`）。模型默认用 `ctx.model`，可用 `pi-title.autoNameModel`（`provider/id`）指定便宜模型，解析失败回落会话模型。
+- **名字来源是模型**：`ctx.modelRegistry.complete` + `extensions/prompt/pi-title.ts` 里的系统提示词（2-4 词、sentence case、中文 ≤ 10 字 / 英文 ≤ 20 字符、JSON `{"title"}`，口径照 Claude Code 的 `generateSessionTitle`）。模型默认用 `ctx.model`，可用 `pi-title.autoNameModel`（`provider/id`）指定便宜模型，解析失败回落会话模型。
+- **长度硬截到 20 列**（中文 1 字 = 2 列）：herdr app 的 tab 条给标签 `max_w(170)`、侧边栏 agents 行给名字 `max_w(200)`（带 `·` 细节时 120），超出就是省略号，等于把人要看的字藏起来。实测模型不守「短」这个约束，所以提示词之外再按显示宽度截一次：中文 10 字 ≈ 130px，英文 20 字符 ≈ 128px，两边都落在 170px 的预算里。按空格与中英文标点回退，不切半个词，截完去尾部标点；找不到合适的断点（或断点丢掉一半以上）就硬切。
 - **不传推理选项**：pi-ai 的 Anthropic 适配器在 `thinkingEnabled` 未设置时根本不在请求里带 thinking，等同 Claude Code `queryHaiku` 的 `thinkingConfig: { type: "disabled" }`；OpenAI 兼容适配器用 provider 默认。`ThinkingLevel` 里没有 `off`，所以不走 `streamSimple({ reasoning })`。
 - **重试**：同一次触发内最多 3 次，第 2、3 次前分别退避 1s / 3s；抛错、空标题都算失败；全败就放弃，这个会话不再尝试。每次尝试前和拿到标题后都重查会话名——生成期间被 `/name` 抢先就丢弃结果。
 - **优先级**：会话名（`/name`、`--name`）> 自动标签名 > 序号。会话名被清空时直接清空标签回序号，不回落到内存里的自动标题，也等于放弃这次机会。注意 TUI 的 `/name ""` 不算清空——pi 的 `handleNameCommand` 只在参数非空时设置名字，`""` 会被当成字面名字存下；真正的清空来自 RPC `set_session_name` 传空串或扩展调 `pi.setSessionName("")`。
@@ -23,7 +24,7 @@ herdr app 的 tab 没名字时按序号显示（1、2、…），一个 space �
 - **用 `pi.setSessionName` 写回会话名**：会连带改 `/resume` 列表、终端标题和 OSC 7501 状态消息，超出 tab 显示的范围，也污染 `/name` 的语义（人以为是自己命名过的会话）。
 - **给 tab 名加 `⠂`/`⠐` 动画前缀**（Claude Code 的终端标题做法）：herdr app 改一次名要 spawn `herdr-app ls` + `do tab.rename` 两个进程，960ms 一次跑满整个 turn 不可接受；tab 名是给人扫读的，抖起来更糟。
 - **检测「人手动改过 tab 名」后跳过**：`herdr-app ls` 不返回 `named` 标记，只能靠「名字不是纯数字」猜；`/new` 之后上一会话的自动名不是数字，会被误判成人命名而永远不覆盖。代价（偶尔盖掉一次手动改名）比这个 bug 小，且人可以用 `/name` 固定名字。
-- **硬截断模型输出**：靠 prompt 的 3-7 词约束；Claude Code 同样不校验、不截断。模型不守规矩就照写，丑了用 `/name` 收拾。
+- **只靠 prompt 约束长度，不在代码里截**（Claude Code 的做法：它不校验、不截断）：Claude Code 的标题只进终端标题栏，而 herdr app 的 tab 条与侧边栏都是定宽格子，超了直接省成省略号；初版 prompt 写「3-7 词」实测出了 20+ 字符的标题，字段被截得只剩前半句。
 
 ## 后果
 

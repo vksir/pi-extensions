@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { sanitizeTitle } from "../extensions/lib/auto-name.ts";
+import { fitTitle, sanitizeTitle } from "../extensions/lib/auto-name.ts";
 import { piTitlePrompt } from "../extensions/prompt/pi-title.ts";
 
 type Handler = (event: unknown, ctx: FakeCtx) => unknown;
@@ -655,4 +655,17 @@ test("标题清洗：JSON、代码围栏、引号、空白", () => {
 	assert.equal(sanitizeTitle("Just a title"), "Just a title");
 	assert.equal(sanitizeTitle('{"name": "wrong field"}'), '{"name": "wrong field"}');
 	assert.equal(sanitizeTitle("   \n  "), undefined);
+});
+
+test("标题截断：按显示宽度 20 列（中文 10 字 / 英文 20 字符）", () => {
+	assert.equal(fitTitle("设置页添加深色模式开关"), "设置页添加深色模式开");
+	assert.equal(fitTitle("给设置页加一个深色模式开关，顺便修一下翻页"), "给设置页加一个深色模");
+	// 中英混排：在空格处断开，不切掉半个词
+	assert.equal(fitTitle("CI 缓存改为 pnpm store"), "CI 缓存改为 pnpm");
+	assert.equal(fitTitle("Fix unresponsive login button on mobile"), "Fix unresponsive");
+	// 中文标点处断开，末尾标点不留
+	assert.equal(fitTitle("修复登录按钮，顺便重构一遍"), "修复登录按钮");
+	// 没超宽、或没有可断的地方就不动 / 硬切
+	assert.equal(fitTitle("Fix mobile login"), "Fix mobile login");
+	assert.equal(fitTitle("Supercalifragilisticexpialidocious"), "Supercalifragilistic");
 });

@@ -9,9 +9,10 @@
  * herdr app 经 herdr-app CLI 先 ls 寻址再改名。窗口未开等失败静默放弃。
  *
  * herdr app 额外做 tab 自动命名：新建会话的第一条人类消息交给短标题模型起名
- * （3-7 词），写进 tab 名。会话一旦有名字（`/name`、`--name`）就让位；resume /
- * fork / reload 出来的会话不做回溯命名；同一触发内最多尝试三次。自动标题只用于
- * 显示，不进会话名、不写会话文件（见 ADR-0012）。
+ * （2-4 词，按 20 列硬截 = 中文 ≤ 10 字 / 英文 ≤ 20 字符），写进 tab 名。会话
+ * 一旦有名字（`/name`、`--name`）就让位；resume / fork 出来的会话不做回溯
+ * 命名；同一触发内最多尝试三次。自动标题只用于显示，不进会话名、不写会话
+ * 文件（见 ADR-0012）。
  *
  * 会话启动（resume、/reload、切换会话）后 pi 会把终端标题重写成
  * `π - <会话名> - <cwd>`，而 herdr 在标签未命名时就显示这个标题，于是恢复出来的
@@ -23,7 +24,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { runAutoName, sanitizeTitle } from "./lib/auto-name.ts";
+import { fitTitle, runAutoName, sanitizeTitle } from "./lib/auto-name.ts";
 import { createTabRenamer, inHerdrApp, inHerdrEnv } from "./lib/herdr.ts";
 import { readExtensionSettings } from "./lib/settings.ts";
 import { basename } from "./lib/text.ts";
@@ -96,7 +97,7 @@ function cleanup(ctx: ExtensionContext): void {
 // ─── 自动标签名（仅 herdr app） ───
 
 const SETTINGS_KEY = "pi-title";
-/** 标题模型的输出上限：3-7 词的标题用不到这么多，留出 OpenAI 系轻量推理的余量。 */
+/** 标题模型的输出上限：20 列的标题远用不到这么多，留出 OpenAI 系轻量推理的余量。 */
 const AUTO_NAME_MAX_TOKENS = 1024;
 
 interface PiTitleSettings {
@@ -157,7 +158,9 @@ async function generateAutoName(
 		.filter((block) => block.type === "text")
 		.map((block) => block.text)
 		.join("\n");
-	return sanitizeTitle(text);
+	// 提示词只是软约束（实测会超长），再按 tab 宽度硬截一次：中文 ≤ 10 字 / 英文 ≤ 20 字符。
+	const title = sanitizeTitle(text);
+	return title ? fitTitle(title) : undefined;
 }
 
 // ─── 扩展入口 ───
