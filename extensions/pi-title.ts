@@ -8,6 +8,11 @@
  * 标签（env 探测与更名命令在 lib/herdr.ts）：旧 herdr 的 HERDR_TAB_ID 直接寻址，
  * herdr app 经 herdr-app CLI 先 ls 寻址再改名。窗口未开等失败静默放弃。
  *
+ * herdr app 额外做 tab 自动命名：新建会话的第一条人类消息交给短标题模型起名
+ * （3-7 词），写进 tab 名。会话一旦有名字（`/name`、`--name`）就让位；resume /
+ * fork / reload 出来的会话不做回溯命名；同一触发内最多尝试三次。自动标题只用于
+ * 显示，不进会话名、不写会话文件（见 ADR-0012）。
+ *
  * 会话启动（resume、/reload、切换会话）后 pi 会把终端标题重写成
  * `π - <会话名> - <cwd>`，而 herdr 在标签未命名时就显示这个标题，于是恢复出来的
  * 命名会话会变成 `π - abc - <cwd>`。因此会话名存在时，启动后把标签重新对齐到它。
@@ -18,8 +23,11 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createTabRenamer, inHerdrEnv } from "./lib/herdr.ts";
+import { runAutoName, sanitizeTitle } from "./lib/auto-name.ts";
+import { createTabRenamer, inHerdrApp, inHerdrEnv } from "./lib/herdr.ts";
+import { readExtensionSettings } from "./lib/settings.ts";
 import { basename } from "./lib/text.ts";
+import { piTitlePrompt } from "./prompt/pi-title.ts";
 
 const FRAMES = ["⠂", "⠐"];
 const INTERVAL_MS = 960;
@@ -85,6 +93,73 @@ function cleanup(ctx: ExtensionContext): void {
 	frame = 0;
 }
 
+// ─── 自动标签名（仅 herdr app） ───
+
+const SETTINGS_KEY = "pi-title";
+/** 标题模型的输出上限：3-7 词的标题用不到这么多，留出 OpenAI 系轻量推理的余量。 */
+const AUTO_NAME_MAX_TOKENS = 1024;
+
+interface PiTitleSettings {
+	/** herdr app 里按首条消息自动命名 tab；缺失即开启。 */
+	autoName?: boolean;
+	/** 生成标题用的模型 `provider/id`；缺失或解析失败时用当前会话模型。 */
+	autoNameModel?: string;
+}
+
+/**
+ * 会话里是否已有真人消息。判断「新会话」不能只看 `session_start` 的 reason：
+ * `pi -c` 在进程启动时加载旧会话，发出的事件也是 "startup"（session 在扩展
+ * 加载之前就打开了，见 agent-session.js 的默认 sessionStartEvent）。
+ */
+function hasUserMessages(ctx: ExtensionContext): boolean {
+	return ctx.sessionManager
+		.getEntries()
+		.some((entry) => entry.type === "message" && entry.message.role === "user");
+}
+
+/** 标题用哪个模型：配置的能解析就用，否则回落当前会话模型。 */
+function resolveAutoNameModel(ctx: ExtensionContext, settings: PiTitleSettings): ExtensionContext["model"] {
+	const reference = settings.autoNameModel?.trim();
+	if (reference) {
+		// `provider/id`：模型 id 自身可能带斜杠（如 openrouter 的 meta/…），只切第一个。
+		const slash = reference.indexOf("/");
+		if (slash > 0) {
+			const configured = ctx.modelRegistry.find(reference.slice(0, slash), reference.slice(slash + 1));
+			if (configured) return configured;
+		}
+		// 写错（模型不存在、provider 未配置）就回落，而不是把功能关掉。
+	}
+	return ctx.model;
+}
+
+/**
+ * 让短标题模型给首条消息起个标题。不传任何推理选项：pi-ai 的 Anthropic
+ * 适配器在 thinkingEnabled 未设置时根本不在请求里带 thinking（等同 Claude Code
+ * 的 thinking disabled），OpenAI 兼容适配器则用 provider 默认。
+ */
+async function generateAutoName(
+	ctx: ExtensionContext,
+	settings: PiTitleSettings,
+	prompt: string,
+): Promise<string | undefined> {
+	const model = resolveAutoNameModel(ctx, settings);
+	if (!model) return undefined;
+
+	const response = await ctx.modelRegistry.complete(
+		model,
+		{
+			systemPrompt: piTitlePrompt.autoName.system,
+			messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
+		},
+		{ maxTokens: AUTO_NAME_MAX_TOKENS, cacheRetention: "none" },
+	);
+	const text = response.content
+		.filter((block) => block.type === "text")
+		.map((block) => block.text)
+		.join("\n");
+	return sanitizeTitle(text);
+}
+
 // ─── 扩展入口 ───
 
 export default function (pi: ExtensionAPI) {
@@ -107,8 +182,20 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.mode !== "tui") return;
 			align(event.name?.trim() ?? ""); // /name 清除会话名时同步清空标签
 		});
-		pi.on("session_start", (_event, ctx) => {
+
+		// 自动命名只对全新会话的第一条人类消息生效：已经有对话的会话（含 `pi -c`
+		// resume、`--fork` 带进来的历史）一律不回溯命名，fork 出来的新会话也不参与
+		// （见 ADR-0012）。
+		let autoNamePending = false;
+		// 当前主会话的 sessionManager。自动命名的模型调用是 fire-and-forget，
+		// 期间切了会话（/new、/resume）就不能再拿旧会话的结果去改新会话的 tab。
+		let activeSession: ExtensionContext["sessionManager"] | undefined;
+
+		pi.on("session_start", (event, ctx) => {
 			if (ctx.mode !== "tui") return;
+			activeSession = ctx.sessionManager;
+			autoNamePending = event.reason !== "fork" && !hasUserMessages(ctx);
+
 			// resume / /reload / 切换会话后，pi 的内置标题会变回 `π - <会话名> - <cwd>`；
 			// 标签未命名时 herdr 显示的就是这个标题。会话名存在就把标签对齐回去，
 			// herdr 里只留下会话名。无名会话不动标签：既不洗掉人为改的名，也不凭空
@@ -116,6 +203,32 @@ export default function (pi: ExtensionAPI) {
 			const name = ctx.sessionManager.getSessionName()?.trim() ?? "";
 			if (name) align(name);
 		});
+
+		if (inHerdrApp()) {
+			pi.on("input", (event, ctx) => {
+				if (ctx.mode !== "tui" || !autoNamePending) return;
+				// 扩展投递的消息（pi-cron、herdr-agent 的 peer 消息）不是人说的第一句。
+				if (event.source === "extension") return;
+				// 斜杠命令在 skill / 模板展开之前就到这里；没有自然语言可起名，
+				// 保留资格等下一条。
+				const prompt = event.text.trim();
+				if (!prompt || prompt.startsWith("/")) return;
+				// 已有会话名：自动名永远让位。
+				if (ctx.sessionManager.getSessionName()?.trim()) return;
+
+				const settings = readExtensionSettings<PiTitleSettings>(pi, SETTINGS_KEY);
+				if (settings.autoName === false) return;
+
+				autoNamePending = false; // 一次性：同一会话无论成败都不再触发
+				const session = ctx.sessionManager;
+				void runAutoName({
+					attempt: () => generateAutoName(ctx, settings, prompt),
+					// 会话切走、或生成期间被 /name 抢先，都丢弃这轮结果。
+					isNamed: () => session !== activeSession || Boolean(session.getSessionName()?.trim()),
+					apply: align,
+				}).catch(() => undefined); // 自动命名是锦上添花，任何意外都不往外抛
+			});
+		}
 		return;
 	}
 

@@ -34,6 +34,8 @@ export const piBgPrompt = {
 };
 ```
 
+这四段只覆盖**进主 agent 上下文**的文案。扩展自己发起的辅助模型调用（如 pi-title 给 tab 起名的标题模型）不属于主 agent 的那四段，但在本目录里开一个独立段落（`piTitlePrompt.autoName`），同样英文、同样不得内联在扩展里。
+
 扩展代码只从这里取文案，不在扩展里内联任何模型可见字符串。
 
 ## 怎么写
@@ -52,6 +54,7 @@ export const piBgPrompt = {
 | 「有这个工具」这句索引 | `promptSnippet` |
 | 跨调用的行为规则（如「长命令用后台工具」） | `promptGuidelines` |
 | 只在这次调用才需要的结果 | 工具返回 |
+| 扩展自己发起的辅助模型调用的提示词 | 独立段落，标注「每次调用·…模型系统提示词」 |
 
 - **一条规则只写一处**。动作的语义写在工具 `description` 里，`action` 只列可选值；其余参数的语义写在参数 `description` 里，`description` 不复述。
 - **`promptGuidelines` 只对声明给模型的工具生效**：`prepareLoadout` 隐藏工具即消失，不需要额外条件判断。

@@ -60,9 +60,14 @@ function inLegacyHerdr(): boolean {
 	return process.env.HERDR_ENV?.trim() === "1";
 }
 
+/** 是否处于 herdr app（herdr-core 注入 HC_TERMINAL_ID）。窗口没开时变量仍在。 */
+export function inHerdrApp(): boolean {
+	return envValue("HC_TERMINAL_ID") !== undefined;
+}
+
 /** 是否处于任一代 herdr 环境。 */
 export function inHerdrEnv(): boolean {
-	return inLegacyHerdr() || envValue("HC_TERMINAL_ID") !== undefined;
+	return inLegacyHerdr() || inHerdrApp();
 }
 
 /** 旧 herdr CLI 命令：优先注入的 HERDR_BIN_PATH（Windows 下绝对路径才可靠）。 */

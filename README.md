@@ -105,7 +105,35 @@ node --test 'tests/pi-context.test.ts'
 - **旧 herdr**（`HERDR_ENV=1`）：`HERDR_TAB_ID` 直接给出标签 id，经 `herdr` CLI（或注入的 `HERDR_BIN_PATH`）`tab rename` 更名。
 - **herdr app**（`HC_TERMINAL_ID`）：标签 id 不在 env 里，先 `herdr-app ls` 找到装着本终端的 tab，再 `herdr-app do tab.rename` 改名（空名恢复按序号命名）。窗口未开、终端不在窗口里等失败静默放弃，详见 ADR-0005。
 
-会话启动（`pi -c` resume、`/reload`、切换会话）后 pi 会把终端标题重写成 `π - <会话名> - <cwd>`，而 herdr 在标签没有名字时显示的就是这个标题——恢复出来的命名会话因此会显示成 `π - abc - <cwd>`。所以会话名存在时，启动后同样把标签对齐到会话名，herdr 里仍旧只有 `abc`；无名会话启动时不动标签，既不洗掉人为改的标签名，也不把上一会话的名字留在新会话上。
+会话启动（`pi -c` resume、`/reload`、切换会话）后 pi 会把终端标题重写成 `π - <会话名> - <cwd>`；旧 herdr 在标签没有名字时显示的就是这个标题——恢复出来的命名会话因此会显示成 `π - abc - <cwd>`。所以会话名存在时，启动后同样把标签对齐到会话名，herdr 里仍旧只有 `abc`；无名会话启动时不动标签，既不洗掉人为改的标签名，也不把上一会话的名字留在新会话上。
+
+**tab 自动命名**（只 herdr app）：新建会话的第一条人类消息交给模型生成一个 3-7 词、句子式的标题，写进 tab 名。
+
+- **会话名永远优先**：`/name`、`--name` 启动的会话连模型都不调用；会话名被清空（`session_info_changed` 带 `undefined`）后 tab 回序号，已经花掉的自动命名机会不再补。
+- **只认新建会话**：判据是会话里还没有真人消息（不能只看 `session_start` 的 reason——`pi -c` 的启动事件也是 `startup`），且不是 `fork`；resume / fork / reload 出来的有历史的会话不回溯命名，tab 保持原样。
+- **一次触发内最多试 3 次**（0s / 1s / 3s 退避），全失败就放弃；生成期间被 `/name` 抢先则丢弃结果。
+- **只是显示**：自动标题不写会话名、不进 `/resume` 列表；更名失败（窗口没开）静默放弃。斜杠命令、扩展投递的消息（pi-cron、herdr-agent peer）不算「第一条人类消息」。
+- 旧 herdr 不参与：它未命名的标签里已经有终端标题（含 cwd）。
+
+`settings.json` 配置：不想要自动命名时关掉；想换便宜的标题模型时指定 `provider/id`（缺省或解析失败时用当前会话模型）。
+
+```json
+{
+	"pi-title": {
+		"autoName": false
+	}
+}
+```
+
+```json
+{
+	"pi-title": {
+		"autoNameModel": "anthropic/claude-haiku-4-5"
+	}
+}
+```
+
+`autoName` 只关自动命名，`/name` 的同步更名照旧。决策过程见 [ADR-0012](docs/adr/0012-herdr-tab-auto-name-via-llm.md)。
 
 回归测试：
 
@@ -231,6 +259,7 @@ pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式�
 | 模块 | 职责 |
 |------|------|
 | `lib/herdr.ts` | 两代 herdr 环境探测、标签更名、新标签启动 |
+| `lib/auto-name.ts` | 自动标签名：标题清洗与最多三次尝试的重试循环 |
 | `lib/hc.ts` | herdr-core 的 JSON-RPC 客户端（命名管道、一行一条） |
 | `lib/agent-protocol.ts` | 子 agent 的消息信封、名称校验、结果截断（纯函数） |
 | `lib/output-file.ts` | 超长结果落临时文件（与 pi 内置输出文件同套约定） |

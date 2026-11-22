@@ -155,8 +155,16 @@ _Avoid_: herdr CLI 环境、herdr v1
 _Avoid_: herdr-core 环境、HC 环境
 
 **标签更名 (tab rename)**：
-`/name` 更名会话时把 pi 所在的窗口标签同步改名；会话启动（resume、`/reload`、切换会话）后按已有会话名再对齐一次，免得 herdr 在未命名标签上回落到 pi 的 `π - <会话名> - <cwd>` 标题。两代 herdr 命令不同（`herdr tab rename` / `herdr-app do tab.rename`），失败一律静默放弃。
+`/name` 更名会话时把 pi 所在的窗口标签同步改名；会话启动（resume、`/reload`、切换会话）后按已有会话名再对齐一次。旧 herdr 的未命名标签显示的是 pi 的 `π - <会话名> - <cwd>` 标题，不对齐就会在 herdr 里多出一层包装；herdr app 的未命名标签按序号显示。两代 herdr 命令不同（`herdr tab rename` / `herdr-app do tab.rename`），失败一律静默放弃。
 _Avoid_: 重命名窗口、title rename
+
+**会话名 (session name)**：
+`/name`、`--name` 写入会话的正式名字，存在会话文件的 `session_info` 条目里，`/resume` 列表显示它，所以是持久、跨进程的。自动标签名永远让位于它。
+_Avoid_: 标题、title、自定义名
+
+**自动标签名 (auto tab name)**：
+herdr app 下由短标题模型给新会话的 tab 起的名字：新建会话的第一条人类消息 → 3-7 词、句子式标题，只用于显示。不写会话名、不进 `/resume` 列表；一个会话只尝试一次（内部最多 3 次、0/1/3s 退避），已有对话的会话（resume、`--fork`）不回溯命名，会话名被清空后 tab 回序号且不再补（见 ADR-0012）。
+_Avoid_: 自动会话名、AI 标题、tab title
 
 ### 后台任务（pi-bg）
 

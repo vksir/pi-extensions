@@ -1,34 +1,104 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { sanitizeTitle } from "../extensions/lib/auto-name.ts";
+import { piTitlePrompt } from "../extensions/prompt/pi-title.ts";
 
 type Handler = (event: unknown, ctx: FakeCtx) => unknown;
 
+interface ModelRef {
+	provider: string;
+	id: string;
+}
+
+interface CompleteContext {
+	systemPrompt?: string;
+	messages: { role: "user"; content: { type: "text"; text: string }[]; timestamp: number }[];
+}
+
+interface CompleteOptions {
+	maxTokens?: number;
+	cacheRetention?: string;
+}
+
+interface AssistantLike {
+	role: "assistant";
+	content: { type: "text"; text: string }[];
+	stopReason: "stop";
+}
+
 interface FakeCtx {
 	mode: "tui" | "print" | undefined;
-	sessionManager: { getSessionName: () => string | undefined };
+	sessionManager: {
+		getSessionName: () => string | undefined;
+		getEntries: () => { type: "message"; message: { role: string } }[];
+	};
 	ui: { setTitle: (title: string) => void };
+	model: ModelRef | undefined;
+	modelRegistry: {
+		find: (provider: string, id: string) => ModelRef | undefined;
+		complete: (model: ModelRef, context: CompleteContext, options?: CompleteOptions) => Promise<AssistantLike>;
+	};
+}
+
+interface ModelCall {
+	model: ModelRef;
+	context: CompleteContext;
+	options: CompleteOptions | undefined;
+}
+
+interface SetupOptions {
+	variant?: "legacy" | "app";
+	/** 初始会话名；默认 "sess"。 */
+	sessionName?: string;
+	/** 会话里已有的真人消息条数；默认 0（全新会话）。 */
+	userMessages?: number;
+	/** 当前会话模型；默认 { provider: "main", id: "big" }。 */
+	model?: ModelRef | undefined;
+	/** `autoNameModel` 的解析结果。 */
+	find?: (provider: string, id: string) => ModelRef | undefined;
+	/** 假模型调用；默认返回 {"title": "Refactor auth module"}。 */
+	complete?: (context: CompleteContext) => Promise<AssistantLike>;
+	/** settings.json 内容；默认空。 */
+	settings?: Record<string, unknown>;
 }
 
 interface Setup {
 	/** 触发已注册事件 */
 	fire: (event: string, event_: unknown, ctx?: FakeCtx) => unknown;
-	/** renameHerdrTab 发出的 herdr CLI 调用（先等待串行队列消化完） */
+	/** 等待模型调用、更名队列与 exec 记录全部消化完 */
+	settle: () => Promise<void>;
+	/** 返回队列消化后新发出的 herdr CLI 调用（取后即清） */
 	execCalls: () => Promise<{ command: string; args: string[] }[]>;
+	/** 模型调用记录（取后即清） */
+	modelCalls: () => ModelCall[];
+	/** 改会话名，模拟 /name 后 ctx 的视图 */
+	setSessionName: (name: string | undefined) => void;
 	/** 恢复 setup 改动的进程环境变量 */
 	restoreEnv: () => void;
 	ctx: FakeCtx;
 	titles: string[];
 }
 
+const assistant = (text: string): AssistantLike => ({
+	role: "assistant",
+	content: [{ type: "text", text }],
+	stopReason: "stop",
+});
+
+/** 等若干轮宏任务，让 runAutoName 的链表、renameQueue 与 exec 记录都落地。 */
+async function settle(): Promise<void> {
+	for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve));
+}
+
 /**
  * 假 herdr CLI：所有命令记录调用并返回成功。
  *
- * 扩展是带模块级状态（动画定时器、更名队列）的单例；
+ * 扩展是带模块级状态（动画定时器、更名队列、自动命名资格）的单例；
  * 查询串导入让每个 setup 拿到全新实例，测试互不污染。
  */
 let moduleSeq = 0;
-async function setup(options: { variant?: "legacy" | "app" } = {}): Promise<Setup> {
+async function setup(options: SetupOptions = {}): Promise<Setup> {
 	const { default: titleExtension } = await import(`../extensions/pi-title.ts?run=${moduleSeq++}`);
 	const herdrEnvKeys = ["HERDR_ENV", "HERDR_TAB_ID", "HERDR_BIN_PATH", "HC_TERMINAL_ID"] as const;
 	const previous = new Map(herdrEnvKeys.map((k) => [k, process.env[k]]));
@@ -46,8 +116,11 @@ async function setup(options: { variant?: "legacy" | "app" } = {}): Promise<Setu
 
 	const handlers = new Map<string, Handler>();
 	const execs: { command: string; args: string[] }[] = [];
+	const calls: ModelCall[] = [];
+	const model = "model" in options ? options.model : { provider: "main", id: "big" };
 	const pi = {
 		on: (event: string, handler: Handler) => { handlers.set(event, handler); },
+		getSettings: () => options.settings ?? {},
 		exec: async (command: string, args: string[]) => {
 			execs.push({ command, args });
 			// herdr app 的更名先 ls 寻址：返回一份装着 t1（variant "app" 所用终端）的清单
@@ -60,20 +133,41 @@ async function setup(options: { variant?: "legacy" | "app" } = {}): Promise<Setu
 	};
 	titleExtension(pi as unknown as ExtensionAPI);
 
+	const session = {
+		name: "sessionName" in options ? options.sessionName : "sess",
+		userMessages: options.userMessages ?? 0,
+	};
 	const titles: string[] = [];
 	const ctx: FakeCtx = {
 		mode: "tui",
-		sessionManager: { getSessionName: () => "sess" },
+		sessionManager: {
+			getSessionName: () => session.name,
+			getEntries: () =>
+				Array.from({ length: session.userMessages }, () => ({
+					type: "message" as const,
+					message: { role: "user" },
+				})),
+		},
 		ui: { setTitle: (title) => { titles.push(title); } },
+		model,
+		modelRegistry: {
+			find: (provider, id) => options.find?.(provider, id),
+			complete: async (calledModel, context, completeOptions) => {
+				calls.push({ model: calledModel, context, options: completeOptions });
+				return options.complete?.(context) ?? assistant('{"title": "Refactor auth module"}');
+			},
+		},
 	};
 
 	return {
 		fire: (event, event_, eventCtx) => handlers.get(event)?.(event_, eventCtx ?? ctx),
-		/** 返回队列消化后新发出的 herdr-app CLI 调用（取后即清） */
+		settle,
 		execCalls: async () => {
-			await new Promise((resolve) => setImmediate(resolve));
+			await settle();
 			return execs.splice(0, execs.length);
 		},
+		modelCalls: () => calls.splice(0, calls.length),
+		setSessionName: (name) => { session.name = name; },
 		ctx,
 		titles,
 		restoreEnv: () => {
@@ -91,6 +185,13 @@ function shutdown(setup_: Setup) {
 	// 模块级状态靠查询串导入隔离，这里无需手工还原
 	setup_.fire("session_shutdown", { type: "session_shutdown" }, { ...setup_.ctx, mode: "tui" });
 	setup_.restoreEnv();
+}
+
+/** 新建一个无名会话并送来第一条人类消息。 */
+function startFresh(s: Setup, prompt: string) {
+	s.setSessionName(undefined);
+	s.fire("session_start", { type: "session_start", reason: "startup" });
+	s.fire("input", { type: "input", text: prompt, source: "interactive" });
 }
 
 test("旧 herdr：HERDR_TAB_ID 直接更名", async () => {
@@ -210,7 +311,7 @@ test("herdr 两代：无名会话启动时不动标签", async () => {
 		try {
 			s.fire("session_start", { type: "session_start", reason: "startup" }, {
 				...s.ctx,
-				sessionManager: { getSessionName: () => undefined },
+				sessionManager: { ...s.ctx.sessionManager, getSessionName: () => undefined },
 			});
 			assert.deepEqual(await s.execCalls(), []);
 		} finally {
@@ -255,4 +356,303 @@ test("普通终端：子 agent 会话不参与标题动画", async () => {
 	} finally {
 		shutdown(s);
 	}
+});
+
+// ─── 自动标签名（仅 herdr app） ───
+
+test("自动命名：新会话首条消息交给模型起名并写进 tab", async () => {
+	const s = await setup({ variant: "app" });
+	try {
+		startFresh(s, "把认证模块重构一下");
+		const calls = s.modelCalls();
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0].context.systemPrompt, piTitlePrompt.autoName.system);
+		assert.equal(calls[0].context.messages[0].content[0].text, "把认证模块重构一下");
+		assert.equal(calls[0].options?.cacheRetention, "none");
+		assert.deepEqual(calls[0].model, { provider: "main", id: "big" });
+
+		assert.deepEqual(await s.execCalls(), [
+			{ command: "herdr-app", args: ["ls"] },
+			{ command: "herdr-app", args: ["do", "tab.rename", "--id", "tb-1", "--name", "Refactor auth module"] },
+		]);
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("自动命名：resume / fork / reload 不回溯命名", async () => {
+	for (const reason of ["resume", "fork", "reload"] as const) {
+		const s = await setup({ variant: "app", sessionName: undefined, userMessages: 1 });
+		try {
+			s.fire("session_start", { type: "session_start", reason });
+			s.fire("input", { type: "input", text: "接着干", source: "interactive" });
+			await s.settle();
+			assert.deepEqual(s.modelCalls(), []);
+			assert.deepEqual(await s.execCalls(), []);
+		} finally {
+			shutdown(s);
+		}
+	}
+});
+
+test("自动命名：pi -c 的启动事件也是 startup，已有对话就不命名", async () => {
+	// session 在扩展加载前就打开，`pi -c` 不会报 resume；只能靠会话里有没有真人消息判断
+	const s = await setup({ variant: "app", sessionName: undefined, userMessages: 2 });
+	try {
+		s.fire("session_start", { type: "session_start", reason: "startup" });
+		s.fire("input", { type: "input", text: "继续，把日志写在错误分支里", source: "interactive" });
+		await s.settle();
+		assert.deepEqual(s.modelCalls(), []);
+		assert.deepEqual(await s.execCalls(), []);
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("自动命名：fork 出来的空会话也不参与", async () => {
+	const s = await setup({ variant: "app", sessionName: undefined });
+	try {
+		s.fire("session_start", { type: "session_start", reason: "fork" });
+		s.fire("input", { type: "input", text: "接着干", source: "interactive" });
+		await s.settle();
+		assert.deepEqual(s.modelCalls(), []);
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("自动命名：斜杠命令、扩展来源、空文本不消耗唯一一次机会", async () => {
+	const s = await setup({ variant: "app" });
+	try {
+		s.setSessionName(undefined);
+		s.fire("session_start", { type: "session_start", reason: "startup" });
+
+		s.fire("input", { type: "input", text: "/skill:pdf-tools extract", source: "interactive" });
+		s.fire("input", { type: "input", text: "定时任务的正文", source: "extension" });
+		s.fire("input", { type: "input", text: "   ", source: "interactive" });
+		await s.settle();
+		assert.deepEqual(s.modelCalls(), []);
+
+		// 真正的人类第一句才触发，且只触发一次
+		s.fire("input", { type: "input", text: "修一下登录按钮", source: "interactive" });
+		s.fire("input", { type: "input", text: "再补充一句", source: "interactive" });
+		await s.settle();
+		assert.equal(s.modelCalls().length, 1);
+		assert.deepEqual(await s.execCalls(), [
+			{ command: "herdr-app", args: ["ls"] },
+			{ command: "herdr-app", args: ["do", "tab.rename", "--id", "tb-1", "--name", "Refactor auth module"] },
+		]);
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("自动命名：会话已有名字时不调用模型", async () => {
+	const s = await setup({ variant: "app", sessionName: "sess" });
+	try {
+		s.fire("session_start", { type: "session_start", reason: "startup" });
+		s.fire("input", { type: "input", text: "随便说一句", source: "interactive" });
+		await s.settle();
+		assert.deepEqual(s.modelCalls(), []);
+		// 启动时的对齐照常发生，且只有那一次
+		assert.deepEqual(await s.execCalls(), [
+			{ command: "herdr-app", args: ["ls"] },
+			{ command: "herdr-app", args: ["do", "tab.rename", "--id", "tb-1", "--name", "sess"] },
+		]);
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("自动命名：模型连续失败三次后放弃，后续消息不再尝试", async () => {
+	const s = await setup({
+		variant: "app",
+		complete: async () => {
+			throw new Error("model down");
+		},
+	});
+	mock.timers.enable({ apis: ["setTimeout"] });
+	try {
+		startFresh(s, "第一次就失败了");
+		await s.settle();
+		assert.equal(s.modelCalls().length, 1, "第一次尝试");
+
+		mock.timers.tick(1000);
+		await s.settle();
+		assert.equal(s.modelCalls().length, 1, "第二次尝试（1s 退避后）");
+
+		mock.timers.tick(3000);
+		await s.settle();
+		assert.equal(s.modelCalls().length, 1, "第三次尝试（再 3s 退避后）");
+		assert.deepEqual(await s.execCalls(), []);
+
+		// 一次性：后续消息不再花模型调用
+		s.fire("input", { type: "input", text: "再试一次", source: "interactive" });
+		await s.settle();
+		assert.deepEqual(s.modelCalls(), []);
+	} finally {
+		mock.timers.reset();
+		shutdown(s);
+	}
+});
+
+test("自动命名：第一次失败、第二次成功也能落定", async () => {
+	let attempts = 0;
+	const s = await setup({
+		variant: "app",
+		complete: async () => {
+			attempts += 1;
+			if (attempts === 1) throw new Error("rate limited");
+			return assistant('```json\n{"title": "Fix the login button"}\n```');
+		},
+	});
+	mock.timers.enable({ apis: ["setTimeout"] });
+	try {
+		startFresh(s, "登录按钮点不动");
+		await s.settle();
+
+		mock.timers.tick(1000);
+		await s.settle();
+		assert.deepEqual(await s.execCalls(), [
+			{ command: "herdr-app", args: ["ls"] },
+			{ command: "herdr-app", args: ["do", "tab.rename", "--id", "tb-1", "--name", "Fix the login button"] },
+		]);
+	} finally {
+		mock.timers.reset();
+		shutdown(s);
+	}
+});
+
+test("自动命名：生成期间 /name 抢先时不覆盖人名", async () => {
+	let resolveComplete: ((message: AssistantLike) => void) | undefined;
+	const s = await setup({
+		variant: "app",
+		complete: () => new Promise<AssistantLike>((resolve) => { resolveComplete = resolve; }),
+	});
+	try {
+		startFresh(s, "重构认证模块");
+
+		// 模型还在飞的时候用户 /name
+		s.setSessionName("人工命名");
+		s.fire("session_info_changed", { type: "session_info_changed", name: "人工命名" });
+		resolveComplete?.(assistant('{"title": "Refactor auth module"}'));
+		await s.settle();
+
+		assert.deepEqual(await s.execCalls(), [
+			{ command: "herdr-app", args: ["ls"] },
+			{ command: "herdr-app", args: ["do", "tab.rename", "--id", "tb-1", "--name", "人工命名"] },
+		]);
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("自动命名：生成期间切了会话，不拿旧会话的结果改新 tab", async () => {
+	let resolveComplete: ((message: AssistantLike) => void) | undefined;
+	const s = await setup({
+		variant: "app",
+		sessionName: undefined,
+		complete: () => new Promise<AssistantLike>((resolve) => { resolveComplete = resolve; }),
+	});
+	try {
+		startFresh(s, "旧会话的任务");
+
+		// /new：换一个 sessionManager 并发出 session_start
+		const next = { name: undefined as string | undefined };
+		s.ctx.sessionManager = {
+			getSessionName: () => next.name,
+			getEntries: () => [],
+		};
+		s.fire("session_start", { type: "session_start", reason: "new" });
+		await s.settle();
+
+		resolveComplete?.(assistant('{"title": "Old session title"}'));
+		await s.settle();
+		assert.deepEqual(await s.execCalls(), []);
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("自动命名：autoName=false 时不调用模型，/name 同步照旧", async () => {
+	const s = await setup({ variant: "app", settings: { "pi-title": { autoName: false } } });
+	try {
+		startFresh(s, "随便说一句");
+		await s.settle();
+		assert.deepEqual(s.modelCalls(), []);
+		assert.deepEqual(await s.execCalls(), []);
+
+		s.fire("session_info_changed", { type: "session_info_changed", name: "重构认证模块" });
+		assert.deepEqual(await s.execCalls(), [
+			{ command: "herdr-app", args: ["ls"] },
+			{ command: "herdr-app", args: ["do", "tab.rename", "--id", "tb-1", "--name", "重构认证模块"] },
+		]);
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("自动命名：autoNameModel 能解析就用它", async () => {
+	const cheap = { provider: "anthropic", id: "haiku" };
+	const s = await setup({
+		variant: "app",
+		settings: { "pi-title": { autoNameModel: "anthropic/haiku" } },
+		find: (provider, id) => (provider === "anthropic" && id === "haiku" ? cheap : undefined),
+	});
+	try {
+		startFresh(s, "起个名字");
+		assert.deepEqual(s.modelCalls()[0].model, cheap);
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("自动命名：autoNameModel 解析失败时回落当前会话模型", async () => {
+	const s = await setup({
+		variant: "app",
+		settings: { "pi-title": { autoNameModel: "nope/missing" } },
+		find: () => undefined,
+	});
+	try {
+		startFresh(s, "起个名字");
+		assert.deepEqual(s.modelCalls()[0].model, { provider: "main", id: "big" });
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("自动命名：旧 herdr 不参与", async () => {
+	const s = await setup({ variant: "legacy", sessionName: undefined });
+	try {
+		s.fire("session_start", { type: "session_start", reason: "startup" });
+		s.fire("input", { type: "input", text: "重构认证模块", source: "interactive" });
+		await s.settle();
+		assert.deepEqual(s.modelCalls(), []);
+		assert.deepEqual(await s.execCalls(), []);
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("自动命名：子会话（非 tui）不触发模型", async () => {
+	const s = await setup({ variant: "app", sessionName: undefined });
+	try {
+		s.fire("session_start", { type: "session_start", reason: "startup" }, { ...s.ctx, mode: "print" });
+		s.fire("input", { type: "input", text: "探查一下", source: "interactive" }, { ...s.ctx, mode: "print" });
+		await s.settle();
+		assert.deepEqual(s.modelCalls(), []);
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("标题清洗：JSON、代码围栏、引号、空白", () => {
+	assert.equal(sanitizeTitle('{"title": "Add OAuth authentication"}'), "Add OAuth authentication");
+	assert.equal(sanitizeTitle('```json\n{"title":"Fix login"}\n```'), "Fix login");
+	assert.equal(sanitizeTitle('  "Debug failing CI tests"  '), "Debug failing CI tests");
+	assert.equal(sanitizeTitle("Refactor\n\nAPI   client"), "Refactor API client");
+	// 不是 JSON 标题字段就按纯文本用；洗不出内容才算失败
+	assert.equal(sanitizeTitle("Just a title"), "Just a title");
+	assert.equal(sanitizeTitle('{"name": "wrong field"}'), '{"name": "wrong field"}');
+	assert.equal(sanitizeTitle("   \n  "), undefined);
 });
