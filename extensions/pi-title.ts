@@ -21,6 +21,9 @@
  * 子会话：进程内子 agent（如 @tintinweb/pi-subagents）会在同一进程里为子会话
  * 重新加载本扩展，并触发各自的 agent 与更名事件；其 ctx.mode 不是 "tui"。
  * 全部 handler 据此忽略子会话，标题与标签只由主 TUI 会话管理。
+ *
+ * herdr-agent 拉起的子 agent 是独立进程、ctx.mode 也是 "tui"，靠注入的
+ * PI_AGENT_ID 认出：它们的 tab 名由拉起方的 `--name` 决定，不参与自动命名。
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -105,6 +108,15 @@ interface PiTitleSettings {
 	autoName?: boolean;
 	/** 生成标题用的模型 `provider/id`；缺失或解析失败时用当前会话模型。 */
 	autoNameModel?: string;
+}
+
+/**
+ * 是否为 herdr-agent 拉起的子 agent（拉起时注入 `PI_AGENT_ID`）。子 agent 的 tab 名
+ * 由拉起方的 `--name` 决定，自动命名只会跟它抢名字；根 agent 没有这个变量。
+ * 进程内子 agent（pi-subagents）走另一条判据：它们的 `ctx.mode` 不是 "tui"。
+ */
+function inSubAgentSession(): boolean {
+	return Boolean(process.env.PI_AGENT_ID?.trim());
 }
 
 /**
@@ -197,7 +209,7 @@ export default function (pi: ExtensionAPI) {
 		pi.on("session_start", (event, ctx) => {
 			if (ctx.mode !== "tui") return;
 			activeSession = ctx.sessionManager;
-			autoNamePending = event.reason !== "fork" && !hasUserMessages(ctx);
+			autoNamePending = event.reason !== "fork" && !inSubAgentSession() && !hasUserMessages(ctx);
 
 			// resume / /reload / 切换会话后，pi 的内置标题会变回 `π - <会话名> - <cwd>`；
 			// 标签未命名时 herdr 显示的就是这个标题。会话名存在就把标签对齐回去，

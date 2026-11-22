@@ -7,6 +7,7 @@ herdr app 的 tab 没名字时按序号显示（1、2、…），一个 space �
 - **只管 herdr app**（`HC_TERMINAL_ID`）。旧 herdr 的未命名标签已经有终端标题（含 cwd），再覆盖会丢信息。
 - **触发点唯一**：`input` 事件里第一个「人类消息」——`source !== "extension"`（pi-cron、herdr-agent peer 走 `sendUserMessage`）、非纯空白、不以 `/` 开头（`/skill:…`、prompt 模板在展开前就到这里），且会话还没有会话名。满足后立即消耗掉唯一一次机会，无论成败。
 - **只认新建会话**：判据是会话里还没有真人消息（`session_start` 时查 `getEntries()`），且启动原因不是 `fork`。不能只看 `session_start` 的 `reason`：`pi -c` 在扩展加载之前就把旧会话打开了，它发出的事件也是 `startup`。所以 `resume` / `fork` / `reload` 出来的有历史的会话一律不回溯命名，tab 保持原样。
+- **子 agent 不参与**：进程内子 agent（pi-subagents）的 `ctx.mode` 不是 `tui`，已经在所有 handler 里被过滤；herdr-agent 拉起的子 agent 是独立进程、`ctx.mode` 也是 `tui`，靠注入的 `PI_AGENT_ID` 认出来（根 agent 没有这个变量）。它们的 tab 名由拉起方的 `--name` 决定，自动命名只会跟它抢名字。
 - **名字来源是模型**：`ctx.modelRegistry.complete` + `extensions/prompt/pi-title.ts` 里的系统提示词（2-4 词、sentence case、中文 ≤ 10 字 / 英文 ≤ 20 字符、JSON `{"title"}`，口径照 Claude Code 的 `generateSessionTitle`）。模型默认用 `ctx.model`，可用 `pi-title.autoNameModel`（`provider/id`）指定便宜模型，解析失败回落会话模型。
 - **长度硬截到 20 列**（中文 1 字 = 2 列）：herdr app 的 tab 条给标签 `max_w(170)`、侧边栏 agents 行给名字 `max_w(200)`（带 `·` 细节时 120），超出就是省略号，等于把人要看的字藏起来。实测模型不守「短」这个约束，所以提示词之外再按显示宽度截一次：中文 10 字 ≈ 130px，英文 20 字符 ≈ 128px，两边都落在 170px 的预算里。按空格与中英文标点回退，不切半个词，截完去尾部标点；找不到合适的断点（或断点丢掉一半以上）就硬切。
 - **不传推理选项**：pi-ai 的 Anthropic 适配器在 `thinkingEnabled` 未设置时根本不在请求里带 thinking，等同 Claude Code `queryHaiku` 的 `thinkingConfig: { type: "disabled" }`；OpenAI 兼容适配器用 provider 默认。`ThinkingLevel` 里没有 `off`，所以不走 `streamSimple({ reasoning })`。

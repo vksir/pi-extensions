@@ -112,6 +112,7 @@ node --test 'tests/pi-context.test.ts'
 - **长度硬限制 20 列**（中文 1 字 = 2 列，即中文 ≤ 10 字 / 英文 ≤ 20 字符）：提示词只是软约束，实测会超；herdr app 的 tab 条最多 170px、侧边栏行最多 200px（带 `·` 细节时 120px），超了就变省略号，所以代码里再截一次。
 - **会话名永远优先**：`/name`、`--name` 启动的会话连模型都不调用；会话名被清空（`session_info_changed` 带 `undefined`）后 tab 回序号，已经花掉的自动命名机会不再补。
 - **只认新建会话**：判据是会话里还没有真人消息（不能只看 `session_start` 的 reason——`pi -c` 的启动事件也是 `startup`），且不是 `fork`；resume / fork / reload 出来的有历史的会话不回溯命名，tab 保持原样。
+- **子 agent 不参与**：进程内子 agent 的 `ctx.mode` 不是 `tui`；herdr-agent 拉起的子 agent 是独立进程，靠注入的 `PI_AGENT_ID` 认出来——它们的 tab 名由拉起方的 `--name` 决定。
 - **一次触发内最多试 3 次**（0s / 1s / 3s 退避），全失败就放弃；生成期间被 `/name` 抢先则丢弃结果。
 - **只是显示**：自动标题不写会话名、不进 `/resume` 列表；更名失败（窗口没开）静默放弃。斜杠命令、扩展投递的消息（pi-cron、herdr-agent peer）不算「第一条人类消息」。
 - 旧 herdr 不参与：它未命名的标签里已经有终端标题（含 cwd）。

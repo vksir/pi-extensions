@@ -61,6 +61,8 @@ interface SetupOptions {
 	complete?: (context: CompleteContext) => Promise<AssistantLike>;
 	/** settings.json 内容；默认空。 */
 	settings?: Record<string, unknown>;
+	/** 是否扮演 herdr-agent 拉起的子 agent（设 PI_AGENT_ID）；默认否。 */
+	subAgent?: boolean;
 }
 
 interface Setup {
@@ -100,8 +102,10 @@ async function settle(): Promise<void> {
 let moduleSeq = 0;
 async function setup(options: SetupOptions = {}): Promise<Setup> {
 	const { default: titleExtension } = await import(`../extensions/pi-title.ts?run=${moduleSeq++}`);
-	const herdrEnvKeys = ["HERDR_ENV", "HERDR_TAB_ID", "HERDR_BIN_PATH", "HC_TERMINAL_ID"] as const;
-	const previous = new Map(herdrEnvKeys.map((k) => [k, process.env[k]]));
+	const envKeys = ["HERDR_ENV", "HERDR_TAB_ID", "HERDR_BIN_PATH", "HC_TERMINAL_ID", "PI_AGENT_ID"] as const;
+	const previous = new Map(envKeys.map((k) => [k, process.env[k]]));
+	delete process.env.PI_AGENT_ID;
+	if (options.subAgent) process.env.PI_AGENT_ID = "a1b2c3";
 	if (options.variant === "legacy") {
 		process.env.HERDR_ENV = "1";
 		process.env.HERDR_TAB_ID = "tab-1";
@@ -111,7 +115,7 @@ async function setup(options: SetupOptions = {}): Promise<Setup> {
 		for (const k of ["HERDR_ENV", "HERDR_TAB_ID", "HERDR_BIN_PATH"] as const) delete process.env[k];
 		process.env.HC_TERMINAL_ID = "t1";
 	} else {
-		for (const k of herdrEnvKeys) delete process.env[k];
+		for (const k of envKeys) delete process.env[k];
 	}
 
 	const handlers = new Map<string, Handler>();
@@ -626,6 +630,19 @@ test("自动命名：旧 herdr 不参与", async () => {
 	try {
 		s.fire("session_start", { type: "session_start", reason: "startup" });
 		s.fire("input", { type: "input", text: "重构认证模块", source: "interactive" });
+		await s.settle();
+		assert.deepEqual(s.modelCalls(), []);
+		assert.deepEqual(await s.execCalls(), []);
+	} finally {
+		shutdown(s);
+	}
+});
+
+test("自动命名：herdr 子 agent 会话不命名（PI_AGENT_ID）", async () => {
+	const s = await setup({ variant: "app", sessionName: undefined, subAgent: true });
+	try {
+		s.fire("session_start", { type: "session_start", reason: "startup" });
+		s.fire("input", { type: "input", text: "探索一下这个仓库", source: "interactive" });
 		await s.settle();
 		assert.deepEqual(s.modelCalls(), []);
 		assert.deepEqual(await s.execCalls(), []);
