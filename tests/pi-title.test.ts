@@ -59,7 +59,7 @@ interface SetupOptions {
 	find?: (provider: string, id: string) => ModelRef | undefined;
 	/** 假模型调用；默认返回 {"title": "Refactor auth module"}。 */
 	complete?: (context: CompleteContext) => Promise<AssistantLike>;
-	/** settings.json 内容；默认空。 */
+	/** settings.json 内容；默认显式打开自动命名（只有专门验默认值的用例才传空）。 */
 	settings?: Record<string, unknown>;
 	/** 是否扮演 herdr-agent 拉起的子 agent（设 PI_AGENT_ID）；默认否。 */
 	subAgent?: boolean;
@@ -87,6 +87,9 @@ const assistant = (text: string): AssistantLike => ({
 	content: [{ type: "text", text }],
 	stopReason: "stop",
 });
+
+/** 自动命名默认关闭，需要它的用例显式打开。 */
+const AUTO_NAME_ON = { "pi-title": { autoName: true } };
 
 /** 等若干轮宏任务，让 runAutoName 的链表、renameQueue 与 exec 记录都落地。 */
 async function settle(): Promise<void> {
@@ -124,7 +127,7 @@ async function setup(options: SetupOptions = {}): Promise<Setup> {
 	const model = "model" in options ? options.model : { provider: "main", id: "big" };
 	const pi = {
 		on: (event: string, handler: Handler) => { handlers.set(event, handler); },
-		getSettings: () => options.settings ?? {},
+		getSettings: () => options.settings ?? AUTO_NAME_ON,
 		exec: async (command: string, args: string[]) => {
 			execs.push({ command, args });
 			// herdr app 的更名先 ls 寻址：返回一份装着 t1（variant "app" 所用终端）的清单
@@ -578,6 +581,18 @@ test("自动命名：生成期间切了会话，不拿旧会话的结果改新 t
 	}
 });
 
+test("自动命名：默认关闭，没配 autoName 时不调用模型", async () => {
+	const s = await setup({ variant: "app", sessionName: undefined, settings: {} });
+	try {
+		startFresh(s, "重构认证模块");
+		await s.settle();
+		assert.deepEqual(s.modelCalls(), []);
+		assert.deepEqual(await s.execCalls(), []);
+	} finally {
+		shutdown(s);
+	}
+});
+
 test("自动命名：autoName=false 时不调用模型，/name 同步照旧", async () => {
 	const s = await setup({ variant: "app", settings: { "pi-title": { autoName: false } } });
 	try {
@@ -600,7 +615,7 @@ test("自动命名：autoNameModel 能解析就用它", async () => {
 	const cheap = { provider: "anthropic", id: "haiku" };
 	const s = await setup({
 		variant: "app",
-		settings: { "pi-title": { autoNameModel: "anthropic/haiku" } },
+		settings: { "pi-title": { autoName: true, autoNameModel: "anthropic/haiku" } },
 		find: (provider, id) => (provider === "anthropic" && id === "haiku" ? cheap : undefined),
 	});
 	try {
@@ -614,7 +629,7 @@ test("自动命名：autoNameModel 能解析就用它", async () => {
 test("自动命名：autoNameModel 解析失败时回落当前会话模型", async () => {
 	const s = await setup({
 		variant: "app",
-		settings: { "pi-title": { autoNameModel: "nope/missing" } },
+		settings: { "pi-title": { autoName: true, autoNameModel: "nope/missing" } },
 		find: () => undefined,
 	});
 	try {

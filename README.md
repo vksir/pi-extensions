@@ -117,12 +117,12 @@ node --test 'tests/pi-context.test.ts'
 - **只是显示**：自动标题不写会话名、不进 `/resume` 列表；更名失败（窗口没开）静默放弃。斜杠命令、扩展投递的消息（pi-cron、herdr-agent peer）不算「第一条人类消息」。
 - 旧 herdr 不参与：它未命名的标签里已经有终端标题（含 cwd）。
 
-`settings.json` 配置：不想要自动命名时关掉；想换便宜的标题模型时指定 `provider/id`（缺省或解析失败时用当前会话模型）。
+`settings.json` 配置：默认**关闭**，要显式打开；想换便宜的标题模型时指定 `provider/id`（缺省或解析失败时用当前会话模型）。
 
 ```json
 {
 	"pi-title": {
-		"autoName": false
+		"autoName": true
 	}
 }
 ```
@@ -135,7 +135,7 @@ node --test 'tests/pi-context.test.ts'
 }
 ```
 
-`autoName` 只关自动命名，`/name` 的同步更名照旧。决策过程见 [ADR-0012](docs/adr/0012-herdr-tab-auto-name-via-llm.md)。
+`autoName` 只控制自动命名，`/name` 的同步更名总是生效。决策过程见 [ADR-0012](docs/adr/0012-herdr-tab-auto-name-via-llm.md)。
 
 回归测试：
 

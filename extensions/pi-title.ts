@@ -8,11 +8,11 @@
  * 标签（env 探测与更名命令在 lib/herdr.ts）：旧 herdr 的 HERDR_TAB_ID 直接寻址，
  * herdr app 经 herdr-app CLI 先 ls 寻址再改名。窗口未开等失败静默放弃。
  *
- * herdr app 额外做 tab 自动命名：新建会话的第一条人类消息交给短标题模型起名
- * （2-4 词，按 20 列硬截 = 中文 ≤ 10 字 / 英文 ≤ 20 字符），写进 tab 名。会话
- * 一旦有名字（`/name`、`--name`）就让位；resume / fork 出来的会话不做回溯
- * 命名；同一触发内最多尝试三次。自动标题只用于显示，不进会话名、不写会话
- * 文件（见 ADR-0012）。
+ * herdr app 额外做 tab 自动命名（默认关闭，要显式打开）：新建会话的第一条
+ * 人类消息交给短标题模型起名（2-4 词，按 20 列硬截 = 中文 ≤ 10 字 / 英文
+ * ≤ 20 字符），写进 tab 名。会话一旦有名字（`/name`、`--name`）就让位；
+ * resume / fork 出来的会话不做回溯命名；同一触发内最多尝试三次。自动标题
+ * 只用于显示，不进会话名、不写会话文件（见 ADR-0012）。
  *
  * 会话启动（resume、/reload、切换会话）后 pi 会把终端标题重写成
  * `π - <会话名> - <cwd>`，而 herdr 在标签未命名时就显示这个标题，于是恢复出来的
@@ -104,7 +104,7 @@ const SETTINGS_KEY = "pi-title";
 const AUTO_NAME_MAX_TOKENS = 1024;
 
 interface PiTitleSettings {
-	/** herdr app 里按首条消息自动命名 tab；缺失即开启。 */
+	/** herdr app 里按首条消息自动命名 tab；默认关闭，必须显式设为 true。 */
 	autoName?: boolean;
 	/** 生成标题用的模型 `provider/id`；缺失或解析失败时用当前会话模型。 */
 	autoNameModel?: string;
@@ -232,7 +232,7 @@ export default function (pi: ExtensionAPI) {
 				if (ctx.sessionManager.getSessionName()?.trim()) return;
 
 				const settings = readExtensionSettings<PiTitleSettings>(pi, SETTINGS_KEY);
-				if (settings.autoName === false) return;
+				if (settings.autoName !== true) return; // 默认关闭，要显式打开
 
 				autoNamePending = false; // 一次性：同一会话无论成败都不再触发
 				const session = ctx.sessionManager;

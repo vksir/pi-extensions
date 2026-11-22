@@ -14,7 +14,7 @@ herdr app 的 tab 没名字时按序号显示（1、2、…），一个 space �
 - **重试**：同一次触发内最多 3 次，第 2、3 次前分别退避 1s / 3s；抛错、空标题都算失败；全败就放弃，这个会话不再尝试。每次尝试前和拿到标题后都重查会话名——生成期间被 `/name` 抢先就丢弃结果。
 - **优先级**：会话名（`/name`、`--name`）> 自动标签名 > 序号。会话名被清空时直接清空标签回序号，不回落到内存里的自动标题，也等于放弃这次机会。注意 TUI 的 `/name ""` 不算清空——pi 的 `handleNameCommand` 只在参数非空时设置名字，`""` 会被当成字面名字存下；真正的清空来自 RPC `set_session_name` 传空串或扩展调 `pi.setSessionName("")`。
 - **只是显示**：不调 `pi.setSessionName`、不写会话文件、不进 `/resume` 列表；更名失败（窗口没开）静默放弃，不重试。
-- **配置**：`settings.json` 的 `pi-title` 段，`autoName`（默认 `true`）、`autoNameModel`（可选）。不加 `/` 命令。
+- **配置**：`settings.json` 的 `pi-title` 段，`autoName`（**默认 `false`**，需显式打开）、`autoNameModel`（可选）。默认关闭的理由：它会花一次模型调用并改写 tab 名，而 tab 名也可能是人自己改过的；默认行为不惊动任何人。不加 `/` 命令。
 
 ## 被否决的选项
 
@@ -36,3 +36,4 @@ herdr app 的 tab 没名字时按序号显示（1、2、…），一个 space �
 - 提醒 ADR-0005 的一处措辞：「herdr 在标签没有名字时显示终端标题」只对旧 herdr 成立，herdr app 实测按序号显示。所以本决策不是修显示回落，而是新增信息。
 - 「新会话」的判据踩过一次坑：`pi -c` 的 `session_start` reason 是 `startup` 而不是 `resume`（会话在扩展加载前就打开了），只看 reason 会把 resume 出来的会话重新命名。
 - 依赖 `ctx.model` 或 `autoNameModel` 所在 provider 已配置认证；都没配时每次尝试都会抛错，三次后放弃，tab 停在序号（静默）。
+- 默认关闭意味着没配置的机器上不会花任何模型调用、也不会改写 tab 名；打开后才生效，且只对打开之后新建的会话生效（老会话已经过了「首条消息」那一刻）。
