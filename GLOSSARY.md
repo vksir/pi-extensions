@@ -227,7 +227,7 @@ agent 忙着时，非派活人发来的消息不进它的上下文，按发送�
 _Avoid_: 等待队列、backlog、待办
 
 **销毁倒计时 (destroy countdown)**：
-子 agent 空闲满 `destroyAfterSeconds`（默认 180 秒）后自行退出、由 hc 删掉终端的机制；`0` 表示永不销毁。只有「安静」时才计时——还有活着的子终端、运行中的后台任务、进程内子 agent、cron job，或排队里还有没处理的消息，都不算安静。任何新入站立即清零。销毁只回收终端与进程，会话文件仍在磁盘上，可按 id resume。
+子 agent 空闲满 `destroy_time`（默认 180 秒）后自行退出、由 hc 删掉终端的机制；`0` 表示永不销毁。只有「安静」时才计时——还有活着的子终端、运行中的后台任务、进程内子 agent、cron job，或排队里还有没处理的消息，都不算安静。任何新入站立即清零。销毁只回收终端与进程，会话文件仍在磁盘上，可按 id resume。
 _Avoid_: TTL、超时、idle timeout、GC、回收
 
 **消息首行 (agent source line)**：

@@ -19,8 +19,8 @@ import {
 	formatRows,
 	isDescendant,
 	lastAssistantText,
-	normalizeDestroyAfter,
-	parseDestroyAfter,
+	normalizeDestroyTime,
+	parseDestroyTime,
 	readSessionFacts,
 	rewriteDoneStatus,
 	rootIdOf,
@@ -37,7 +37,7 @@ interface ToolCallResult {
 }
 
 interface FakePi {
-	tools: Map<string, { name: string; description: string; execute: (...args: unknown[]) => Promise<ToolCallResult> }>;
+	tools: Map<string, { name: string; description: string; parameters?: unknown; execute: (...args: unknown[]) => Promise<ToolCallResult> }>;
 	handlers: Map<string, ((...args: unknown[]) => unknown)[]>;
 	commands: Map<string, (args: string, ctx: unknown) => Promise<void> | void>;
 	entries: { type: string; data: any }[];
@@ -47,6 +47,7 @@ interface FakePi {
 	registerTool: (definition: {
 		name: string;
 		description: string;
+		parameters?: unknown;
 		execute: (...args: unknown[]) => Promise<ToolCallResult>;
 	}) => void;
 	on: (event: string, handler: (...args: unknown[]) => unknown) => void;
@@ -269,6 +270,13 @@ test("root registers agent and agent_job; depth 2 registers only agent_job", asy
 	assert.deepEqual([...grandchild.pi.tools.keys()], ["agent_job"]);
 });
 
+test("agent tool exposes destroy_time and no longer the old parameter name", async () => {
+	const { pi } = await setup();
+	const schema = pi.tools.get("agent")?.parameters as { properties: Record<string, { description?: string }> };
+	assert.deepEqual(Object.keys(schema.properties).sort(), ["destroy_time", "model", "name", "prompt", "resume", "thinking"]);
+	assert.match(schema.properties.destroy_time.description ?? "", /^Seconds of idleness before the agent's terminal is destroyed/);
+});
+
 test("守则挂在 agent_job 上（深度 2 也有），agent 不再带守则", async () => {
 	const { pi } = await setup();
 	const agent = pi.tools.get("agent") as unknown as { promptGuidelines?: string[] };
@@ -312,7 +320,7 @@ test("agent launches pi with identity env, labels and ask envelope", async () =>
 		PI_AGENT_PARENT: "t4m",
 		PI_AGENT_ROOT: "t4m",
 		PI_AGENT_DEPTH: "1",
-		PI_AGENT_DESTROY_AFTER: "180",
+		PI_AGENT_DESTROY_TIME: "180",
 	});
 	assert.ok(argv.includes("--model") && argv.includes("p/m2"));
 	assert.ok(argv.includes("--thinking") && argv.includes("low"));
@@ -767,11 +775,11 @@ async function tickOnce(tick: (() => void) | undefined): Promise<void> {
 	await new Promise((resolve) => setImmediate(resolve));
 }
 
-function childEnv(destroyAfterSeconds: string): Record<string, string> {
-	return { PI_AGENT_ID: "abcd", PI_AGENT_DEPTH: "1", PI_AGENT_DESTROY_AFTER: destroyAfterSeconds };
+function childEnv(destroyTime: string): Record<string, string> {
+	return { PI_AGENT_ID: "abcd", PI_AGENT_DEPTH: "1", PI_AGENT_DESTROY_TIME: destroyTime };
 }
 
-test("a quiet child shuts itself down after destroyAfterSeconds", async () => {
+test("a quiet child shuts itself down after destroy_time", async () => {
 	const hc = new FakeHc();
 	const clock = { value: 0 };
 	const scheduler = manualSchedule();
@@ -888,7 +896,7 @@ test("new input cancels the pending countdown", async () => {
 	assert.deepEqual(shutdowns, []);
 });
 
-test("destroyAfterSeconds 0 and a missing env disable the countdown", async () => {
+test("destroy_time 0 and a missing env disable the countdown", async () => {
 	const scheduler = manualSchedule();
 	const zero = await setup({ env: childEnv("0"), now: () => 0, schedule: scheduler.schedule });
 	await zero.pi.emit("agent_settled", { type: "agent_settled", aborted: false }, context());
@@ -921,22 +929,22 @@ test("an unreadable terminal list keeps the agent alive", async () => {
 	assert.deepEqual(shutdowns, []);
 });
 
-test("destroyAfterSeconds is normalized and injected into the child env", async () => {
+test("destroy_time is normalized and injected into the child env", async () => {
 	const hc = new FakeHc();
 	const { pi } = await setup({ hc });
 	const tool = pi.tools.get("agent")!;
 
-	await tool.execute("call", { prompt: "x", destroyAfterSeconds: 0 }, undefined, undefined, context());
-	await tool.execute("call", { prompt: "x", destroyAfterSeconds: 42.9 }, undefined, undefined, context());
-	await tool.execute("call", { prompt: "x", destroyAfterSeconds: -5 }, undefined, undefined, context());
+	await tool.execute("call", { prompt: "x", destroy_time: 0 }, undefined, undefined, context());
+	await tool.execute("call", { prompt: "x", destroy_time: 42.9 }, undefined, undefined, context());
+	await tool.execute("call", { prompt: "x", destroy_time: -5 }, undefined, undefined, context());
 
 	assert.deepEqual(
-		hc.callsOf("run").map((call) => call.params.env.PI_AGENT_DESTROY_AFTER),
+		hc.callsOf("run").map((call) => call.params.env.PI_AGENT_DESTROY_TIME),
 		["0", "42", "180"],
 	);
 });
 
-test("resume applies destroyAfterSeconds from the call, not from the session", async () => {
+test("resume applies destroy_time from the call, not from the session", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-herdr-agent-"));
 	const file = join(dir, "2026-01-01T00-00-00-000Z_pi-aaaa.jsonl");
 	const lines = [
@@ -951,9 +959,9 @@ test("resume applies destroyAfterSeconds from the call, not from the session", a
 		const { pi } = await setup({ hc, sessionDir: dir });
 		const result = await pi.tools
 			.get("agent")!
-			.execute("call", { prompt: "again", resume: "aaaa", destroyAfterSeconds: 0 }, undefined, undefined, context());
+			.execute("call", { prompt: "again", resume: "aaaa", destroy_time: 0 }, undefined, undefined, context());
 		assert.match(toolResultText(result), /^Resumed agent aaaa/);
-		assert.equal(hc.callsOf("run")[0].params.env.PI_AGENT_DESTROY_AFTER, "0");
+		assert.equal(hc.callsOf("run")[0].params.env.PI_AGENT_DESTROY_TIME, "0");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -1316,18 +1324,18 @@ test("subagent done OSC is rewritten to idle", () => {
 	assert.equal(rewriteDoneStatus("hello"), "hello");
 });
 
-test("destroyAfterSeconds normalizes tool input and parses the child env", () => {
-	assert.equal(normalizeDestroyAfter(undefined), 180);
-	assert.equal(normalizeDestroyAfter(0), 0);
-	assert.equal(normalizeDestroyAfter(42.9), 42);
-	assert.equal(normalizeDestroyAfter(-1), 180);
-	assert.equal(normalizeDestroyAfter(Number.NaN), 180);
+test("destroy_time normalizes tool input and parses the child env", () => {
+	assert.equal(normalizeDestroyTime(undefined), 180);
+	assert.equal(normalizeDestroyTime(0), 0);
+	assert.equal(normalizeDestroyTime(42.9), 42);
+	assert.equal(normalizeDestroyTime(-1), 180);
+	assert.equal(normalizeDestroyTime(Number.NaN), 180);
 
-	assert.equal(parseDestroyAfter(undefined), 0);
-	assert.equal(parseDestroyAfter("0"), 0);
-	assert.equal(parseDestroyAfter(" 90 "), 90);
-	assert.equal(parseDestroyAfter("-5"), 0);
-	assert.equal(parseDestroyAfter("abc"), 0);
+	assert.equal(parseDestroyTime(undefined), 0);
+	assert.equal(parseDestroyTime("0"), 0);
+	assert.equal(parseDestroyTime(" 90 "), 90);
+	assert.equal(parseDestroyTime("-5"), 0);
+	assert.equal(parseDestroyTime("abc"), 0);
 });
 
 test("busy probes are keyed by name and swallow failures", () => {

@@ -15,7 +15,7 @@
  * - `name` 是 hc 终端名（herdr-app 侧边栏显示的那个），创建时固定，只作显示；寻址一律用 id。
  * - 拉起时注入 `PI_AGENT_ID` / `PI_AGENT_NAME` / `PI_AGENT_PARENT` / `PI_AGENT_ROOT` /
  *   `PI_AGENT_DEPTH`，子进程的扩展据此知道自己是谁、在树里的哪一层；另外注入
- *   `PI_AGENT_DESTROY_AFTER`（空闲销毁秒数，0 = 不销毁）。
+ *   `PI_AGENT_DESTROY_TIME`（空闲销毁秒数，0 = 不销毁）。
  *
  * 消息（派发规则）：
  * - `agent_job ask` 不检查对方状态：忙就排队或插入，闲就起一轮。
@@ -35,7 +35,7 @@
  * shutdown 完成）。子终端的程序就是 pi 本身，所以子进程硬死时 hc 原生级联会接管；
  * 只有 root 那层（前台是 shell）需要显式处理。
  *
- * 空闲销毁：子 agent 在 settle 之后进入倒计时（`destroyAfterSeconds`，默认 180 秒，
+ * 空闲销毁：子 agent 在 settle 之后进入倒计时（`destroy_time`，默认 180 秒，
  * 0 = 永不），满钟后自己 `ctx.shutdown()`，pi 退出即由 hc 删掉终端；会话文件仍在磁盘上，
  * 可以按 id resume 回来。倒计时只在「安静」时走：还有活的子终端、后台任务、进程内
  * 子 agent 或 cron job 就不计时（后两者经 lib/activity.ts 的忙探测登记表汇总），任何新
@@ -93,7 +93,7 @@ const MAX_DEPTH = 2;
 const READY_TIMEOUT_S = 60;
 
 /** 空闲销毁的默认时长（秒）。 */
-const DEFAULT_DESTROY_AFTER_S = 180;
+const DEFAULT_DESTROY_TIME_S = 180;
 
 /** 空闲销毁的检查节拍（秒）：销毁最多迟到一拍。 */
 const DESTROY_TICK_S = 30;
@@ -105,7 +105,7 @@ const STOP_GRACE_S = 5;
 const STOP_POLL_MS = 250;
 
 /** 子进程从 env 读自己的空闲销毁秒数；0 或缺省表示不销毁。 */
-const DESTROY_ENV = "PI_AGENT_DESTROY_AFTER";
+const DESTROY_ENV = "PI_AGENT_DESTROY_TIME";
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
@@ -151,7 +151,7 @@ interface AgentParams {
 	model?: string;
 	thinking?: (typeof THINKING_LEVELS)[number];
 	resume?: string;
-	destroyAfterSeconds?: number;
+	destroy_time?: number;
 }
 
 interface AgentJobParams {
@@ -211,7 +211,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	let myRoot = env.PI_AGENT_ROOT?.trim() || myId;
 	const myDepth = Number.parseInt(env.PI_AGENT_DEPTH ?? "0", 10) || 0;
 	// 空闲销毁：根 agent 没有这个 env（0 = 不销毁），子 agent 的秒数由拉起者按参数注入。
-	const destroyAfterSeconds = parseDestroyAfter(env[DESTROY_ENV]);
+	const destroyTime = parseDestroyTime(env[DESTROY_ENV]);
 	const now = options.now ?? (() => Date.now());
 	const schedule = options.schedule ?? defaultSchedule;
 	/** `stop` 每次按键后的宽限；测试可缩短。 */
@@ -560,7 +560,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 
 			const stamp = now();
 			if (destroyQuietSince === undefined) destroyQuietSince = stamp;
-			if (stamp - destroyQuietSince < destroyAfterSeconds * 1000) return;
+			if (stamp - destroyQuietSince < destroyTime * 1000) return;
 
 			stopDestroyCountdown();
 			ctx.shutdown();
@@ -571,7 +571,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 
 	/** settle 之后武装倒计时；根 agent（env 缺省）与 `0` 都不做任何事。 */
 	const armDestroyCountdown = async (ctx: ExtensionContext): Promise<void> => {
-		if (destroyAfterSeconds <= 0) return;
+		if (destroyTime <= 0) return;
 		stopDestroyCountdown();
 		const generation = destroyGeneration;
 		destroyQuietSince = (await isQuiet(ctx)) ? now() : undefined;
@@ -615,8 +615,8 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 				resume: Type.Optional(
 					Type.String({ description: piHerdrAgentPrompt.declarations.agent.parameters.resume }),
 				),
-				destroyAfterSeconds: Type.Optional(
-					Type.Number({ description: piHerdrAgentPrompt.declarations.agent.parameters.destroyAfterSeconds }),
+				destroy_time: Type.Optional(
+					Type.Number({ description: piHerdrAgentPrompt.declarations.agent.parameters.destroy_time }),
 				),
 			}),
 
@@ -658,7 +658,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			thinking,
 			prompt: params.prompt,
 			ctx,
-			destroyAfterSeconds: normalizeDestroyAfter(params.destroyAfterSeconds),
+			destroyTime: normalizeDestroyTime(params.destroy_time),
 		});
 		return ok(piHerdrAgentPrompt.results.startedAgent(id, name), {
 			action: "start",
@@ -717,7 +717,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			thinking: params.thinking,
 			prompt: params.prompt,
 			ctx,
-			destroyAfterSeconds: normalizeDestroyAfter(params.destroyAfterSeconds),
+			destroyTime: normalizeDestroyTime(params.destroy_time),
 		});
 		return ok(piHerdrAgentPrompt.results.resumedAgent(id, name), {
 			action: "resume",
@@ -735,11 +735,11 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		prompt: string;
 		ctx: ExtensionContext;
 		/** 空闲销毁秒数；0 = 永不。 */
-		destroyAfterSeconds: number;
+		destroyTime: number;
 	}
 
 	const launch = async (launchOptions: LaunchOptions): Promise<void> => {
-		const { id, name, cwd, model, thinking, prompt, ctx, destroyAfterSeconds } = launchOptions;
+		const { id, name, cwd, model, thinking, prompt, ctx, destroyTime } = launchOptions;
 		const argv = ["pi", "--session-id", `pi-${id}`, "--name", name];
 		if (model) argv.push("--model", model);
 		if (thinking) argv.push("--thinking", thinking);
@@ -758,7 +758,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 					PI_AGENT_PARENT: myId,
 					PI_AGENT_ROOT: myRoot,
 					PI_AGENT_DEPTH: String(myDepth + 1),
-					[DESTROY_ENV]: String(destroyAfterSeconds),
+					[DESTROY_ENV]: String(destroyTime),
 				},
 				no_notify: true,
 				rm: true,
@@ -1014,13 +1014,13 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 /**
  * 工具参数 → 实际秒数：小数向下取整，非法值 / 负数回到默认；`0` 保留为「永不销毁」。
  */
-export function normalizeDestroyAfter(value: number | undefined): number {
-	if (value === undefined || !Number.isFinite(value) || value < 0) return DEFAULT_DESTROY_AFTER_S;
+export function normalizeDestroyTime(value: number | undefined): number {
+	if (value === undefined || !Number.isFinite(value) || value < 0) return DEFAULT_DESTROY_TIME_S;
 	return Math.floor(value);
 }
 
 /** 子 agent 从 env 读自己的空闲销毁秒数；缺省 / 非法 / `<= 0` 都是 `0`（不销毁）。 */
-export function parseDestroyAfter(raw: string | undefined): number {
+export function parseDestroyTime(raw: string | undefined): number {
 	if (raw === undefined) return 0;
 	const value = Number.parseInt(raw.trim(), 10);
 	return Number.isFinite(value) && value > 0 ? value : 0;

@@ -29,7 +29,7 @@ export const piHerdrAgentPrompt = {
 				thinking: "Thinking level. Defaults to yours.",
 				resume:
 					"Agent id whose exited session to continue instead of starting a new one. Model and thinking must match the session. A destroyed agent can be resumed by its id.",
-				destroyAfterSeconds:
+				destroy_time:
 					"Seconds of idleness before the agent's terminal is destroyed. Default 180. 0 never destroys it.",
 			},
 		},
