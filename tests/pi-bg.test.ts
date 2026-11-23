@@ -702,14 +702,14 @@ test("金样：覆盖目标的 schema 与 outputSchema 仍与内置 bash 一致"
 	]);
 });
 
-test("长命令用后台工具的规则随预算走，关闭时退回默认 5 分钟；两条都禁止 sleep 等结果", () => {
+test("长命令用后台工具的规则随预算走，关闭时退回默认 3 分钟；两条都禁止 sleep 等结果", () => {
 	const off = setup({ promoteAfterSeconds: 0 });
 	assert.deepEqual(off.tools.get("bash_bg").promptGuidelines, [
-		"Use bash_bg for commands that may take over 5 minutes, unless their result blocks the next step.",
+		"Use bash_bg for commands that may take over 3 minutes, unless their result blocks the next step.",
 		"Do not sleep to wait for a bash_bg job; its output arrives as a message when it finishes.",
 	]);
 	assert.deepEqual(off.tools.get("codemode_bg").promptGuidelines, [
-		"Use codemode_bg for scripts that may take over 5 minutes, unless their result blocks the next step.",
+		"Use codemode_bg for scripts that may take over 3 minutes, unless their result blocks the next step.",
 		"Do not sleep to wait for a codemode_bg job; its result arrives as a message when it finishes.",
 	]);
 

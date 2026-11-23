@@ -26,7 +26,7 @@ node --test tests/*.test.ts
 | [pi-context](extensions/pi-context.ts) | `/context` 触发一次空转请求，导出这次请求的系统提示词与工具声明（含 codemode 动态描述），两者同源 |
 | [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron [间隔] [once] <prompt>`（省略间隔按 `15m`）、`/cron list`、`/cron delete [id]` |
 | [pi-btw](extensions/pi-btw.ts) | 顺带分派：仅在 herdr / herdr app 环境注册 `/btw <消息>`，新开一个标签，fork 当前会话启动 pi 并把消息作为首条消息递交；本轮还在跑时先把 fork 源截到上一个完整轮次，避免新会话继承半截 turn（见 [ADR-0008](docs/adr/0008-btw-forks-at-turn-boundary.md)） |
-| [pi-bg](extensions/pi-bg.ts) | 后台运行：`bash_bg` / `codemode_bg` 立即返回，结束后把结果作为消息回发；前台 `bash` / `codemode` 超过等待预算（默认 5 分钟）自动转成后台任务；`bg_job` 工具（list / show / kill）与 `/bg` 命令查看/终止，并与内置工具的启用状态联动 |
+| [pi-bg](extensions/pi-bg.ts) | 后台运行：`bash_bg` / `codemode_bg` 立即返回，结束后把结果作为消息回发；前台 `bash` / `codemode` 超过等待预算（默认 3 分钟）自动转成后台任务；`bg_job` 工具（list / show / kill）与 `/bg` 命令查看/终止，并与内置工具的启用状态联动 |
 | [pi-herdr-agent](extensions/pi-herdr-agent.ts) | 用 herdr-core（hc）的终端树跑子 agent：`agent` 拉起、`agent_job` 管理（list / ask / stop），按「派活人 + 排队」派发、收工自动回发；`/agent list` 显示 agent 树；仅 herdr app + hc 环境生效 |
 
 `/balance codex` 需要先通过 `/login openai-codex` 登录 ChatGPT Plus/Pro 订阅。`/balance opencode` 查 OpenCode Go 的 5 小时/周/月额度，需要先配置 `opencode-go` 的 API Key。
@@ -174,7 +174,7 @@ node --test 'tests/herdr.test.ts' 'tests/pi-btw.test.ts' 'tests/session-snapshot
   - 模型显式给的 `timeout` 照旧透传给内置实现：到点仍然失败，只是不再让整轮陪它卡住。
   - 晋升不受并发上限限制；`bash_bg` / `codemode_bg` 仍受 64 上限。
   - 晋升后父轮 Esc 不再连坐（与后台任务一致）。
-  - 等待预算 = `settings.json` 的 `pi-bg.promoteAfterSeconds`（默认 `300`，`<= 0` 关闭；关闭时连覆盖版都不注册）。
+  - 等待预算 = `settings.json` 的 `pi-bg.promoteAfterSeconds`（默认 `180`，`<= 0` 关闭；关闭时连覆盖版都不注册）。
 - **任务 id 一律写成 `bg_job <id>`**：启动返回、完成消息、列表、`bg_job kill` 的回显都是 `bg_job a3307cb8 started in background` 这种形式。裸 8 位十六进制 id 与子 Agent 的 id 同形，模型会误调 `get_subagent_result`，所以 id 从不单独出现。
 - `bg_job` 工具与 `/bg` 命令：列出在跑任务与最近 20 条已完成记录；`bg_job show <id>`（或 `/bg show <id>`）打印命令/脚本、状态与输出（在跑任务给已产出的部分）；`bg_job kill <id>`（或 `/bg kill`）中止任务，连带杀掉它的进程树。`bash_bg` / `codemode_bg` 同时最多 64 个任务，超出直接拒绝（转后台的不占这个名额）。
 - **没有 `wait`**：任务结束后结果**只**以 `pi-bg` 消息回传，收尾在后台完成，不阻塞任何一轮。提示词里因此各有一条 `Do not sleep to wait for a bash_bg / codemode_bg job` 的规则——sleep 干等既拿不到更快的答案，又白占一轮。

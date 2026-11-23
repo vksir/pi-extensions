@@ -16,7 +16,7 @@
  *     `model-only`，`ctx.executeTool` 根本调不到它（只认 direct / codemode / deferred），
  *     而 pi 只导出工厂、不导出沙箱，所以用一个吞掉 `registerTool` 的 shim 把真定义接住。
  *
- * 前台 bash / codemode 有**等待预算**（`pi-bg.promoteAfterSeconds`，默认 300 秒，<= 0 关闭）：
+ * 前台 bash / codemode 有**等待预算**（`pi-bg.promoteAfterSeconds`，默认 180 秒，<= 0 关闭）：
  * 到点还没结束就把执行中的命令/脚本转成后台任务，立刻把控制权交还模型，进程/沙箱不重启
  * （ADR-0010）。实现方式是用同名注册覆盖内置工具，只换 `execute` 与 `renderResult`：
  *   - 传给它的是**自己的** AbortController，晋升前把父轮 Esc 转发下去，晋升时摘掉监听；
@@ -89,8 +89,8 @@ import { truncate } from "./lib/text.ts";
 const CUSTOM_TYPE = "pi-bg";
 const INFO_TYPE = "pi-bg-info";
 const SETTINGS_KEY = "pi-bg";
-/** 不配置时前台工具的等待预算：5 分钟。 */
-const DEFAULT_PROMOTE_SECONDS = 300;
+/** 不配置时前台工具的等待预算：3 分钟。 */
+const DEFAULT_PROMOTE_SECONDS = 180;
 /** 嵌套调用的 toolCallId 形状：`<调用方 id>/<n>`。 */
 const NESTED_ID = /\//;
 
