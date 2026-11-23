@@ -274,7 +274,7 @@ test("agent tool exposes destroy_time and no longer the old parameter name", asy
 	const { pi } = await setup();
 	const schema = pi.tools.get("agent")?.parameters as { properties: Record<string, { description?: string }> };
 	assert.deepEqual(Object.keys(schema.properties).sort(), ["destroy_time", "model", "name", "prompt", "resume", "thinking"]);
-	assert.match(schema.properties.destroy_time.description ?? "", /^Seconds of idleness before the agent's terminal is destroyed/);
+	assert.match(schema.properties.destroy_time.description ?? "", /^Seconds of idleness before the agent process is destroyed/);
 });
 
 test("守则挂在 agent_job 上（深度 2 也有），agent 不再带守则", async () => {

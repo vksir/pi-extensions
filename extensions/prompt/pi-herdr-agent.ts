@@ -30,7 +30,7 @@ export const piHerdrAgentPrompt = {
 				resume:
 					"Agent id whose exited session to continue instead of starting a new one. Model and thinking must match the session. A destroyed agent can be resumed by its id.",
 				destroy_time:
-					"Seconds of idleness before the agent's terminal is destroyed. Default 180. 0 never destroys it.",
+					"Seconds of idleness before the agent process is destroyed. Default 180. 0 never destroys it.",
 			},
 		},
 		agentJob: {
