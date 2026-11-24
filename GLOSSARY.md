@@ -199,7 +199,7 @@ _Avoid_: 进程级、全局、persistent
 ### 子 agent（pi-herdr-agent）
 
 **轮次 (round)**：
-agent 从空闲被一条消息叫醒，经过一个或多个模型请求（每次含工具调用），到收工（`agent_settled`）为止的整段。一条入站消息起一个轮次，**这条消息的发送方就是这个轮次的发起人**；轮次进行中只有发起人再发来的消息算插话（不另起轮次），其他人的消息排队，各自起一个轮次、各自收工。pi 自己的 `turn`（一次 assistant 响应 + 它引发的工具调用）与 `run`（一次提交到不再需要新请求）都比轮次细或不等长，不要借用。
+agent 从空闲被一条消息叫醒，经过一个或多个模型请求（每次含工具调用），到收工（`agent_settled`）为止的整段。一条入站消息起一个轮次；忙着时收到的消息不再排队，直接交给 pi 按 steering / follow-up 模式插进当前轮。pi 自己的 `turn`（一次 assistant 响应 + 它引发的工具调用）与 `run`（一次提交到不再需要新请求）都比轮次细或不等长，不要借用。
 _Avoid_: 一次运行、run、回合、T、轮
 
 **herdr 子 agent (agent)**：
@@ -214,28 +214,20 @@ _Avoid_: 会话 id、uuid、handle、agent 名
 子 agent 的 hc 终端名，创建时固定，herdr-app 侧边栏显示的就是它；1–32 位 `[a-z0-9._-]`，活终端间唯一，非法或重名直接报错。根 agent 没有自己的 hc 名，`/agent list` 里的显示名取 pi 终端标题（`/name` 的会话名，未命名时 `π - <cwd>`），不取 hc 终端名。只作显示，寻址一律用 agent id。
 _Avoid_: label、别名、标题、会话名
 
-**发起人 (owner)**：
-叫醒当前这一轮的那条消息的发送方。一轮只有一个发起人，只活在接收方进程内存里，决定两件事：它再发来的消息直接插进当前轮（steer），别人的排队。它**不**决定回信：回不回、回给谁，由模型自己用 `agent_job send` 决定。
-_Avoid_: 派活人、调用方、提问者、asker、requester、父 agent（归属关系与当轮发起是两件事）
-
 **回信 (reply)**：
 agent 收到消息后自己调用 `agent_job send` 发回去的回应。扩展不代发、不代收、不判断一条消息该不该回。发起一条新任务与回一条消息是同一个动作，只差在模型怎么想。
 _Avoid_: 自动回发、回调、completion、汇报、result
 
 **等回信 (pending reply)**：
-本进程发过消息、还没收到回信的目标。收到该目标的任何消息就销账；目标整棵子树都退出了还没回信，扩展补一条 `Agent <id> ("<name>") exited without replying.`，免得发消息的一方永远等下去。只在有账时每 10 秒查一次。
+本进程发过消息、还没收到回信的目标。发几条记几笔；只有收到 `type="reply"` 才销一笔，`task` 是新活、不销账。目标整棵子树都退出了账还没清，扩展补一条 `type="notice"` 消息 `It exited without replying.`，免得发消息的一方永远等下去。只在有账时每 10 秒查一次。
 _Avoid_: 超时、TTL、watchdog、崩溃通知
 
-**排队 (queue)**：
-agent 忙着时，非发起人发来的消息不进它的上下文，按发送方攒在扩展内存里，各自起一个轮次。**按发送方聚合**：同一个发送方在排队里最多只有一条，新消息并进他那一条，位置不变。
-_Avoid_: 等待队列、backlog、待办
-
 **销毁倒计时 (destroy countdown)**：
-子 agent 空闲满 `destroy_time`（默认 180 秒）后自行退出、由 hc 删掉终端的机制；`0` 表示永不销毁。只有「安静」时才计时——还有活着的子终端、运行中的后台任务、进程内子 agent、cron job，或排队里还有没处理的消息，都不算安静。任何新入站立即清零。销毁只回收终端与进程，会话文件仍在磁盘上，可按 id resume。
+子 agent 空闲满 `destroy_time`（默认 180 秒）后自行退出、由 hc 删掉终端的机制；`0` 表示永不销毁。只有「安静」时才计时——还有活着的子终端、运行中的后台任务、进程内子 agent、cron job，都不算安静。任何新入站立即清零。销毁只回收终端与进程，会话文件仍在磁盘上，可按 id resume。
 _Avoid_: TTL、超时、idle timeout、GC、回收
 
-**消息首行 (agent source line)**：
-每条 agent 消息正文的第一行，`<agent 7f3a "reviewer">`；正文末尾固定挂一个 `<reply to="7f3a">…</reply>` 元素，说明输出不会自动回到发送方、要回就用 `agent_job send`。接收方的模型据此知道是谁发的（回信就用这个 id）以及要不要回。不再剥离，也不写发送方地址：寻址一律用 id。
+**消息信封 (agent message)**：
+agent 之间的一条消息，单一根元素 `<agent_message from="7f3a" name="reviewer" type="task">`，`type` 为 `task` / `reply` / `notice`；正文在 `<content>` 里（统一缩进 4 格，解析剥回）；`task` 再带 `<note>` 说明输出不会自动回传、要回就用 `agent_job send`。不写发送方地址：寻址一律用 id。
 _Avoid_: 信封、header、前缀、metadata、标记、result
 
 **会话推导 (derived session id)**：

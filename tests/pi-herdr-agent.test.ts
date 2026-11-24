@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
-	agentSourceLine,
 	formatAgentEnvelope,
 	parseAgentEnvelope,
 	stripHcTransport,
@@ -23,8 +22,8 @@ import {
 	rewriteDoneStatus,
 	rootIdOf,
 	type AgentRow,
-	type TreeLine,
 } from "../extensions/pi-herdr-agent.ts";
+import { type TreeLine } from "../extensions/lib/tui/agent-tree.ts";
 import { HcError, type HcClient, type HcLabelParams, type HcRunParams, type HcRunResult, type HcSendParams, type HcSendResult, type HcTerminal, type HcWaitParams, type HcWaitResult } from "../extensions/lib/hc.ts";
 
 // ─── 测试替身 ───
@@ -35,11 +34,22 @@ interface ToolCallResult {
 }
 
 interface FakePi {
-	tools: Map<string, { name: string; description: string; parameters?: unknown; execute: (...args: unknown[]) => Promise<ToolCallResult> }>;
+	tools: Map<
+		string,
+		{
+			name: string;
+			description: string;
+			parameters?: unknown;
+			execute: (...args: unknown[]) => Promise<ToolCallResult>;
+			renderCall?: (args: any, theme: any, context: any) => { render(width: number): string[] };
+		}
+	>;
 	handlers: Map<string, ((...args: unknown[]) => unknown)[]>;
 	commands: Map<string, (args: string, ctx: unknown) => Promise<void> | void>;
 	entries: { type: string; data: any }[];
 	userMessages: string[];
+	messages: { message: { customType?: string; content?: unknown; details?: unknown }; options?: unknown }[];
+	messageRenderers: Map<string, (message: any, options: any, theme: any) => { render(width: number): string[] } | undefined>;
 	settings: { steeringMode?: "all" | "one-at-a-time"; followUpMode?: "all" | "one-at-a-time" };
 	getSettings: () => { steeringMode?: "all" | "one-at-a-time"; followUpMode?: "all" | "one-at-a-time" };
 	registerTool: (definition: {
@@ -47,12 +57,15 @@ interface FakePi {
 		description: string;
 		parameters?: unknown;
 		execute: (...args: unknown[]) => Promise<ToolCallResult>;
+		renderCall?: (args: any, theme: any, context: any) => { render(width: number): string[] };
 	}) => void;
 	on: (event: string, handler: (...args: unknown[]) => unknown) => void;
 	registerCommand: (name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> | void }) => void;
 	registerEntryRenderer: () => void;
+	registerMessageRenderer: (customType: string, renderer: any) => void;
 	appendEntry: (type: string, data: unknown) => void;
 	sendUserMessage: (content: unknown) => void;
+	sendMessage: (message: any, options?: unknown) => void;
 	emit: (event: string, ...args: unknown[]) => Promise<unknown>;
 }
 
@@ -62,6 +75,8 @@ function createFakePi(): FakePi {
 	const commands: FakePi["commands"] = new Map();
 	const entries: FakePi["entries"] = [];
 	const userMessages: string[] = [];
+	const messages: FakePi["messages"] = [];
+	const messageRenderers: FakePi["messageRenderers"] = new Map();
 	const settings: { steeringMode?: "all" | "one-at-a-time"; followUpMode?: "all" | "one-at-a-time" } = {
 		steeringMode: "all",
 	};
@@ -71,6 +86,8 @@ function createFakePi(): FakePi {
 		commands,
 		entries,
 		userMessages,
+		messages,
+		messageRenderers,
 		settings,
 		getSettings: () => settings,
 		registerTool(definition) {
@@ -83,11 +100,17 @@ function createFakePi(): FakePi {
 			commands.set(name, options.handler);
 		},
 		registerEntryRenderer() {},
+		registerMessageRenderer(customType, renderer) {
+			messageRenderers.set(customType, renderer);
+		},
 		appendEntry(type, data) {
 			entries.push({ type, data });
 		},
 		sendUserMessage(content) {
 			userMessages.push(String(content));
+		},
+		sendMessage(message, options) {
+			messages.push({ message, options });
 		},
 		async emit(event, ...args) {
 			let last: unknown;
@@ -327,13 +350,15 @@ test("agent launches pi with identity env, labels and the source line", async ()
 	assert.equal(send.caller, "t4m");
 	const envelope = parseAgentEnvelope(String(send.text));
 	assert.equal(envelope?.from, "t4m");
+	assert.equal(envelope?.type, "task");
 	assert.equal(envelope?.name, undefined); // 根没有注入的名字，会话也未命名
 	assert.equal(envelope?.body, "do the thing");
 	assert.ok(text.includes(id));
 });
 
-test("every delivered message carries the reply hint", async () => {
+test("task messages carry the note; reply messages do not", async () => {
 	const hc = new FakeHc();
+	hc.terminals = [terminal({ address: "t10", name: "kid", labels: { "pi.agent": "aaaa" } })];
 	const { pi } = await setup({ hc });
 
 	await pi.tools.get("agent")!.execute("call", { prompt: "x" }, undefined, undefined, context());
@@ -341,9 +366,85 @@ test("every delivered message carries the reply hint", async () => {
 	const sent = String(hc.callsOf("send")[0].params.text);
 	assert.equal(
 		sent,
-		'<agent t4m>\nx\n\n<reply to="t4m">Your output is not sent back automatically. Use agent_job send to reply.</reply>',
+		[
+			'<agent_message from="t4m" type="task">',
+			"  <content>",
+			"    x",
+			"  </content>",
+			"  <note>",
+			'    Your output is not returned automatically. Use agent_job send with type="reply" to reply.',
+			"  </note>",
+			"</agent_message>",
+		].join("\n"),
 	);
-	assert.equal(parseAgentEnvelope(sent)?.body, "x");
+
+	const reply = await pi.tools
+		.get("agent_job")!
+		.execute("call", { action: "send", id: "aaaa", message: "done", type: "reply" }, undefined, undefined, context());
+	assert.match(toolResultText(reply), /^Sent to aaaa/);
+	const replyText = String(hc.callsOf("send")[1].params.text);
+	assert.ok(!replyText.includes("<note>"));
+	assert.equal(parseAgentEnvelope(replyText)?.type, "reply");
+});
+
+test("agent messages render as a card, collapsed when long", async () => {
+	const { pi } = await setup();
+	const renderer = pi.messageRenderers.get("pi-herdr-agent");
+	assert.ok(renderer);
+
+	const theme = {
+		fg: (_token: string, text: string) => text,
+		bg: (_token: string, text: string) => text,
+		bold: (text: string) => text,
+	};
+	const render = (expanded: boolean): string[] => {
+		const body = Array.from({ length: 8 }, (_, index) => `line ${index + 1}`).join("\n");
+		const box = renderer!(
+			{
+				customType: "pi-herdr-agent",
+				content: "<xml/>",
+				display: true,
+				details: { from: "aaaa", name: "kid", type: "reply", body },
+			},
+			{ expanded, outputPad: 0 },
+			theme,
+		);
+		assert.ok(box);
+		return box.render(80).map((line) => line.trim());
+	};
+
+	const collapsed = render(false);
+	assert.ok(collapsed.some((line) => line.includes("agent_message")));
+	assert.ok(collapsed.some((line) => line.includes("kid (aaaa) · reply")));
+	assert.equal(collapsed.filter((line) => /^line \d+$/.test(line)).length, 4);
+	assert.ok(collapsed.some((line) => line.includes("4 more lines")));
+
+	const expanded = render(true);
+	assert.equal(expanded.filter((line) => /^line \d+$/.test(line)).length, 8);
+	assert.ok(!expanded.some((line) => line.includes("more lines")));
+});
+
+test("agent_job send renders the message under a bold header, collapsed when long", async () => {
+	const { pi } = await setup();
+	const tool = pi.tools.get("agent_job")!;
+	assert.ok(tool.renderCall);
+
+	const theme = { fg: (_token: string, text: string) => text, bold: (text: string) => text };
+	const body = Array.from({ length: 6 }, (_, index) => `line ${index + 1}`).join("\n");
+	const render = (args: Record<string, unknown>, expanded: boolean): string[] =>
+		tool
+			.renderCall!(args, theme, { expanded, keyHint: (_id: string, description: string) => `ctrl+o ${description}` })
+			.render(80)
+			.map((line) => line.trim());
+
+	const collapsed = render({ action: "send", id: "aaaa", message: body }, false);
+	assert.equal(collapsed[0], "agent_job send aaaa");
+	assert.equal(collapsed.filter((line) => /^line \d+$/.test(line)).length, 3);
+	assert.ok(collapsed.some((line) => line.includes("3 more lines")));
+
+	const expanded = render({ action: "send", id: "aaaa", message: body }, true);
+	assert.equal(expanded.filter((line) => /^line \d+$/.test(line)).length, 6);
+	assert.deepEqual(render({ action: "list" }, false), ["agent_job list"]);
 });
 
 test("agent defaults model and thinking to the caller's", async () => {
@@ -426,7 +527,8 @@ test("send never checks the target's status", async () => {
 	assert.equal(send.if, undefined); // 不再带状态前置条件
 	const envelope = parseAgentEnvelope(String(send.text));
 	assert.equal(envelope?.body, "hi");
-	assert.match(String(send.text), /<reply to="t4m">Your output is not sent back automatically/);
+	assert.equal(envelope?.type, "task"); // 没给 type：按 task
+	assert.match(String(send.text), /<note>/);
 });
 
 test("stop only reaches descendants, and asks first before killing", async () => {
@@ -503,74 +605,38 @@ test("list hides anything outside self, parent, children and siblings", async ()
 	assert.ok(!rows.some((row) => row.id === "dddd" || row.id === "eeee"));
 });
 
-test("dispatch: idle starts a round, the owner steers, others queue and merge", async () => {
+test("every inbound agent message is passed through, busy or idle", async () => {
 	const hc = new FakeHc();
 	hc.terminals = [
 		terminal({ address: "t7", labels: { "pi.agent": "aaaa" } }),
 		terminal({ address: "t8", labels: { "pi.agent": "bbbb" } }),
-		terminal({ address: "t9", labels: { "pi.agent": "dddd" } }),
 	];
 	const { pi } = await setup({ hc, env: { PI_AGENT_ID: "cccc", PI_AGENT_DEPTH: "1" } });
 
-	// 空闲：第一条放行，发起人 = aaaa。
-	const firstText = formatAgentEnvelope({ from: "aaaa", body: "task A" });
-	assert.deepEqual(await pi.emit("input", { type: "input", text: firstText }), {
-		action: "transform",
-		text: firstText,
-	});
+	// 空闲：原文被吞掉，转成自定义消息（triggerTurn 起一轮）。
+	const first = formatAgentEnvelope({ from: "aaaa", body: "task A" });
+	assert.deepEqual(await pi.emit("input", { type: "input", text: first }), { action: "handled" });
+	assert.equal(pi.messages.length, 1);
+	assert.equal(pi.messages[0].message.content, first);
+	assert.deepEqual(pi.messages[0].options, { deliverAs: "steer", triggerTurn: true });
 	await pi.emit("agent_start");
 
-	// 发起人插话：放行（pi 原生 steer）。
-	const moreText = formatAgentEnvelope({ from: "aaaa", body: "more" });
+	// 忙时同样转成自定义消息：插不插队交给 pi。
+	const more = formatAgentEnvelope({ from: "bbbb", type: "reply", body: "task B" });
 	assert.deepEqual(
-		await pi.emit("input", { type: "input", text: moreText, streamingBehavior: "steer" }),
-		{ action: "transform", text: moreText },
+		await pi.emit("input", { type: "input", text: more, streamingBehavior: "steer" }),
+		{ action: "handled" },
 	);
+	assert.equal(pi.messages.length, 2);
+	assert.equal(pi.messages[1].message.content, more);
 
-	// 别人：吞掉并排队。
-	assert.deepEqual(
-		await pi.emit("input", {
-			type: "input",
-			text: formatAgentEnvelope({ from: "bbbb", body: "task B1" }),
-			streamingBehavior: "steer",
-		}),
-		{ action: "handled" },
-	);
-	assert.deepEqual(
-		await pi.emit("input", {
-			type: "input",
-			text: formatAgentEnvelope({ from: "dddd", body: "task Z" }),
-			streamingBehavior: "steer",
-		}),
-		{ action: "handled" },
-	);
-	// 同一个发送方再发：合进他那一条，位置还在 Z 前面。
-	assert.deepEqual(
-		await pi.emit("input", {
-			type: "input",
-			text: formatAgentEnvelope({ from: "bbbb", body: "task B2" }),
-			streamingBehavior: "steer",
-		}),
-		{ action: "handled" },
-	);
-
-	// 收工：扩展一条消息也不发，只起队首（bbbb 的合并消息）。
+	// 收工：扩展一条消息也不发，也不自己起下一轮。
 	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, context());
 	assert.equal(hc.callsOf("send").length, 0);
-
-	assert.equal(pi.userMessages.length, 1);
-	const next = parseAgentEnvelope(pi.userMessages[0]);
-	assert.equal(next?.from, "bbbb");
-	assert.equal(next?.body, "task B1\n\ntask B2");
-	assert.match(String(pi.userMessages[0]), /<reply to="bbbb">Your output is not sent back automatically/);
-
-	// 下一轮收工：起 Z。
-	await pi.emit("agent_start");
-	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, context());
-	assert.equal(parseAgentEnvelope(pi.userMessages[1])?.from, "dddd");
+	assert.deepEqual(pi.userMessages, []);
 });
 
-test("a message arriving while the previous round is settling still starts afterwards", async () => {
+test("a message arriving while the previous round is settling is still passed through", async () => {
 	const hc = new FakeHc();
 	hc.terminals = [
 		terminal({ address: "t7", labels: { "pi.agent": "aaaa" } }),
@@ -581,18 +647,14 @@ test("a message arriving while the previous round is settling still starts after
 	await pi.emit("input", { type: "input", text: formatAgentEnvelope({ from: "aaaa", body: "task A" }) });
 	await pi.emit("agent_start");
 
-	// 收工处理期间进来的消息按「忙」处理，排进队列。
 	const settled = pi.emit("agent_settled", { type: "agent_settled", aborted: false }, context());
-	const arriving = await pi.emit("input", {
-		type: "input",
-		text: formatAgentEnvelope({ from: "bbbb", body: "task B" }),
-	});
+	const arrivingText = formatAgentEnvelope({ from: "bbbb", body: "task B" });
+	const arriving = await pi.emit("input", { type: "input", text: arrivingText });
 	assert.deepEqual(arriving, { action: "handled" });
 
 	await settled;
 	assert.equal(hc.callsOf("send").length, 0);
-	assert.equal(pi.userMessages.length, 1);
-	assert.equal(parseAgentEnvelope(pi.userMessages[0])?.from, "bbbb");
+	assert.deepEqual(pi.userMessages, []);
 });
 
 test("settling never messages anyone on its own: replies only happen through send", async () => {
@@ -641,12 +703,17 @@ test("an ask without a reply is reported once the target's whole subtree is gone
 		terminal({ address: "t11", name: "grandkid", labels: { "pi.agent": "bbbb" }, parent: "t10" }),
 	];
 	await tickOnce(scheduler.ticks.shift());
-	assert.deepEqual(pi.userMessages, []);
+	assert.equal(pi.messages.length, 0);
 
 	// 整个子树都没了：给本地 agent 补一条。
 	hc.terminals = [terminal({ address: "t4m", labels: {} })];
 	await tickOnce(scheduler.ticks.shift());
-	assert.deepEqual(pi.userMessages, ['Agent aaaa ("kid") exited without replying.']);
+	assert.equal(pi.messages.length, 1);
+	const notice = parseAgentEnvelope(String(pi.messages[0].message.content));
+	assert.equal(notice?.type, "notice");
+	assert.equal(notice?.from, "aaaa");
+	assert.equal(notice?.name, "kid");
+	assert.equal(notice?.body, "It exited without replying.");
 	assert.equal(scheduler.ticks.length, 0); // 账销了，不再盯
 });
 
@@ -662,11 +729,71 @@ test("a reply cancels the pending death notice", async () => {
 	await pi.tools
 		.get("agent_job")!
 		.execute("call", { action: "send", id: "aaaa", message: "hi" }, undefined, undefined, context());
-	await pi.emit("input", { type: "input", text: formatAgentEnvelope({ from: "aaaa", name: "kid", body: "done" }) });
+	await pi.emit("input", {
+		type: "input",
+		text: formatAgentEnvelope({ from: "aaaa", name: "kid", type: "reply", body: "done" }),
+	});
 
 	hc.terminals = [terminal({ address: "t4m", labels: {} })];
 	await tickOnce(scheduler.ticks.shift());
-	assert.deepEqual(pi.userMessages, []);
+	// 只剩那条入站 reply，没有 notice。
+	assert.ok(pi.messages.every((entry) => parseAgentEnvelope(String(entry.message.content))?.type === "reply"));
+});
+
+test("a task from the target does not clear the pending ask", async () => {
+	const hc = new FakeHc();
+	hc.terminals = [
+		terminal({ address: "t4m", labels: {} }),
+		terminal({ address: "t10", name: "kid", labels: { "pi.agent": "aaaa" }, parent: "t4m" }),
+	];
+	const scheduler = manualSchedule();
+	const { pi } = await setup({ hc, schedule: scheduler.schedule });
+
+	await pi.tools
+		.get("agent_job")!
+		.execute("call", { action: "send", id: "aaaa", message: "hi" }, undefined, undefined, context());
+	// 对方发来的是新活，不是对我那条的回答：账不销。
+	await pi.emit("input", {
+		type: "input",
+		text: formatAgentEnvelope({ from: "aaaa", name: "kid", type: "task", body: "another job" }),
+	});
+
+	hc.terminals = [terminal({ address: "t4m", labels: {} })];
+	await tickOnce(scheduler.ticks.shift());
+	assert.equal(
+		pi.messages.filter((entry) => parseAgentEnvelope(String(entry.message.content))?.type === "notice").length,
+		1,
+	);
+});
+
+test("each send needs its own reply before the ledger is clear", async () => {
+	const hc = new FakeHc();
+	hc.terminals = [
+		terminal({ address: "t4m", labels: {} }),
+		terminal({ address: "t10", name: "kid", labels: { "pi.agent": "aaaa" }, parent: "t4m" }),
+	];
+	const scheduler = manualSchedule();
+	const { pi } = await setup({ hc, schedule: scheduler.schedule });
+
+	const send = async (): Promise<void> => {
+		await pi.tools
+			.get("agent_job")!
+			.execute("call", { action: "send", id: "aaaa", message: "hi" }, undefined, undefined, context());
+	};
+	await send();
+	await send();
+
+	// 只回了一条：还剩一笔账，对方挂了仍要通知。
+	await pi.emit("input", {
+		type: "input",
+		text: formatAgentEnvelope({ from: "aaaa", name: "kid", type: "reply", body: "done" }),
+	});
+	hc.terminals = [terminal({ address: "t4m", labels: {} })];
+	await tickOnce(scheduler.ticks.shift());
+	assert.equal(
+		pi.messages.filter((entry) => parseAgentEnvelope(String(entry.message.content))?.type === "notice").length,
+		1,
+	);
 });
 
 test("only quit tears down direct children", async () => {
@@ -908,26 +1035,49 @@ test("envelope round-trips and rejects foreign text", () => {
 	const text = formatAgentEnvelope({ from: "a7k2", name: "reviewer", body: "hi\nthere" });
 	assert.equal(
 		text,
-		'<agent a7k2 "reviewer">\nhi\nthere\n\n<reply to="a7k2">Your output is not sent back automatically. Use agent_job send to reply.</reply>',
+		[
+			'<agent_message from="a7k2" name="reviewer" type="task">',
+			"  <content>",
+			"    hi",
+			"    there",
+			"  </content>",
+			"  <note>",
+			'    Your output is not returned automatically. Use agent_job send with type="reply" to reply.',
+			"  </note>",
+			"</agent_message>",
+		].join("\n"),
 	);
 	assert.deepEqual(parseAgentEnvelope(text), {
 		from: "a7k2",
 		name: "reviewer",
+		type: "task",
 		body: "hi\nthere",
 	});
+
+	const reply = formatAgentEnvelope({ from: "a7k2", type: "reply", body: "done" });
+	assert.equal(
+		reply,
+		[
+			'<agent_message from="a7k2" type="reply">',
+			"  <content>",
+			"    done",
+			"  </content>",
+			"</agent_message>",
+		].join("\n"),
+	);
+	assert.deepEqual(parseAgentEnvelope(reply), { from: "a7k2", name: undefined, type: "reply", body: "done" });
 
 	assert.equal(parseAgentEnvelope("hello world"), undefined);
 	assert.equal(parseAgentEnvelope('<pi-agent from="a" addr="t7" kind="ask">\nx'), undefined);
 	assert.equal(parseAgentEnvelope("<agent>\nx"), undefined);
-	// 旧格式（`<from agent …>` 与 `result` 位）不再被当成本扩展的信封。
+	// 旧格式（`<agent …>` / `<from agent …>` / `result` 位）一律不认。
+	assert.equal(parseAgentEnvelope('<agent a7k2 "boss">\ndone'), undefined);
 	assert.equal(parseAgentEnvelope('<from agent a7k2 "boss">\ndone'), undefined);
-	assert.equal(parseAgentEnvelope('<agent a7k2 "boss" result>\ndone'), undefined);
-	// 没有正文也认：空着正文的发现在收工时不会发生，但解析器不该因此乱喷。
-	assert.deepEqual(parseAgentEnvelope('<agent a7k2 "boss">'), {
-		from: "a7k2",
-		name: "boss",
-		body: "",
-	});
+	// 没有 <content> 的也不认。
+	assert.equal(parseAgentEnvelope('<agent_message from="a7k2" type="task">\nhi\n</agent_message>'), undefined);
+
+	// 空正文：content 里只有换行，解析回空串。
+	assert.equal(parseAgentEnvelope(formatAgentEnvelope({ from: "a7k2", body: "" }))?.body, "");
 });
 
 test("agent names follow the herdr-core terminal rule", () => {
@@ -936,8 +1086,6 @@ test("agent names follow the herdr-core terminal rule", () => {
 	for (const bad of ["", "Reviewer", "fix login", "代码审查", "a".repeat(33)]) {
 		assert.match(String(validateAgentName(bad)), /name must be/);
 	}
-	assert.equal(agentSourceLine("a7k2", "reviewer"), '<agent a7k2 "reviewer">');
-	assert.equal(agentSourceLine("a7k2"), "<agent a7k2>");
 });
 
 test("readSessionFacts reads cwd, name, model and thinking from a session file", () => {
@@ -1004,6 +1152,7 @@ test("hc transport wrapper is unwrapped before the envelope", () => {
 	assert.deepEqual(parseAgentEnvelope(wrapped), {
 		from: "a7k2",
 		name: undefined,
+		type: "task",
 		body: "hi",
 	});
 	assert.equal(stripHcTransport(wrapped), formatAgentEnvelope({ from: "a7k2", body: "hi" }));

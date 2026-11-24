@@ -5,6 +5,8 @@
 - 模型可见文案（如系统提示词、工具描述、工具返回等）一律集中放在 `extensions/prompt/`，按扩展区分文件，必须用英文。
 - 载体选择、文案规范与检查清单见 `extensions/prompt/README.md`。
 - 改动提示词时，动手前必须按 `docs/prompt-review.md` 的格式出一版前后对比表，审过再改。
+- TUI 展示（消息卡片、工具调用行、entry 渲染器、自定义组件）一律放进 `extensions/lib/tui/`，一个界面位置一个文件；扩展文件只做注册与数据拼装，不出现 `Box` / `Text` / 宽度计算。
+- tui 文件头必须写清展示位置与 ASCII 效果示例；颜色只用主题 token，折叠/展开走 pi 的 `expanded`。规范与检查清单见 `docs/tui.md`。
 
 ### 测试规范
 

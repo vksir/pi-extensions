@@ -1,20 +1,29 @@
 /**
- * agent 之间的消息首行（纯函数，无 I/O，便于测试）。
+ * agent 之间的消息格式（纯函数，无 I/O，便于测试）。
  *
  * 消息经 hc 的 `terminal.send` 打进对方终端的输入框，对端 pi 收到的是普通用户输入。
  * hc 自己会给「发给 agent 的消息」套一层 `<hc from="t4m">…</hc>`（`notes = false` 时才不套），
- * 所以解析时先剥这层，再看首行。
+ * 所以解析时先剥这层。
  *
- * 首行告诉接收方这条消息是哪个 agent 发的；正文末尾再挂一个 `<reply to="id">…</reply>`
- * 元素，说明“你的输出不会自动回到发送方，要回就用 agent_job send”。模型的注意力在
- * 结尾，这句话放在这里比塞进首行有效；回不回仍由模型自己决定。
+ *   <agent_message from="a7k2" name="reviewer" type="task">
+ *     <content>
+ *       正文
+ *     </content>
+ *     <note>
+ *       Your output is not returned automatically. Use agent_job send with type="reply" to reply.
+ *     </note>
+ *   </agent_message>
  *
- *   <agent a7k2 "reviewer">
- *   正文
- *   <reply to="a7k2">Your output is not sent back automatically. Use agent_job send to reply.</reply>
+ * type：task（派活）/ reply（回信）/ notice（扩展通知）。`<note>` 只在 task 带。
+ * 正文统一缩进 4 格，解析时剥回；首尾由扩展生成，模型只写 content。
  *
- * 发送方地址不写在首行：按术语表的「寻址一律用 id」，发送时用 id 反查终端。
+ * 发送方地址就是 `from`：寻址一律用 id，发送时用 id 反查终端。
  */
+
+import { piHerdrAgentPrompt } from "../prompt/pi-herdr-agent.ts";
+
+/** 消息类型：派活、回信、扩展通知。 */
+export type AgentMessageType = "task" | "reply" | "notice";
 
 /** 解析出来的信封。 */
 export interface AgentEnvelope {
@@ -22,68 +31,95 @@ export interface AgentEnvelope {
 	from: string;
 	/** 发送方的显示名（可缺省）。 */
 	name?: string;
-	/** 首行之后的正文（末尾的 `<reply>` 提示已经剥掉）。 */
+	/** task / reply / notice。 */
+	type: AgentMessageType;
+	/** `<content>` 里的正文，缩进已剥掉。 */
 	body: string;
 }
 
 export interface AgentEnvelopeInput {
 	from: string;
 	name?: string;
+	/** 缺省按 task 处理。 */
+	type?: AgentMessageType;
 	body: string;
 }
 
-const ENVELOPE_PATTERN = /^<agent\s+([^\s>"]+)(?:\s+"([^"]*)")?>[ \t]*\r?\n?/;
-/** 末尾的回信提示；由本扩展固定生成，解析时剥掉。 */
-const REPLY_TAIL_PATTERN = /\n*<reply to="[^"]*">[^<]*<\/reply>[ \t]*\r?\n?$/;;
+const HEADER_PATTERN =
+	/^<agent_message\s+from="([^"]+)"(?:\s+name="([^"]*)")?\s+type="(task|reply|notice)">[ \t]*\r?\n?/;
+const CONTENT_OPEN = "<content>";
+const CONTENT_CLOSE = "</content>";
+/** 正文缩进：格式化时加、解析时剥。 */
+const INDENT = "    ";
+
 /** hc 给消息套的运输层标签；先剥掉才能看到我们自己的首行。 */
 const HC_OPEN_PATTERN = /^<hc\s+[^>\r\n]*>[ \t]*\r?\n?/;
 const HC_CLOSE_PATTERN = /<\/hc>\s*$/;
 
-/** 引号与尖括号会破坏首行；id/name 都来自受控取值，这里只做防御性清理。 */
+/** 引号与尖括号会破坏属性；id/name 都来自受控取值，这里只做防御性清理。 */
 function clean(value: string): string {
 	return value.replace(/["<>\r\n]/g, "");
 }
 
-/** 消息首行；扩展拼出来、模型也能看到的那一行。 */
-export function agentSourceLine(id: string, name?: string): string {
-	const head = name ? `${clean(id)} "${clean(name)}"` : clean(id);
-	return `<agent ${head}>`;
+/** 每行非空加 4 格缩进；空行保持空行。 */
+function indentBody(body: string): string {
+	return body
+		.split("\n")
+		.map((line) => (line ? `${INDENT}${line}` : line))
+		.join("\n");
 }
 
-/** 末尾的回信提示元素：`to` 是回给谁。 */
-export function agentReplyRequest(to: string): string {
-	return `<reply to="${clean(to)}">Your output is not sent back automatically. Use agent_job send to reply.</reply>`;
+/** 剥掉 `</content>` 两侧的换行与 4 格缩进。 */
+function dedentBody(raw: string): string {
+	const body = raw
+		.replace(/^\r?\n/, "")
+		.replace(/\r?\n[ \t]*$/, "")
+		.split("\n")
+		.map((line) => line.replace(/^ {4}/, ""))
+		.join("\n");
+	return body.trim() ? body : "";
 }
 
+/** 拼一条完整消息：根元素 + content（+ task 的 note）。 */
 export function formatAgentEnvelope(envelope: AgentEnvelopeInput): string {
-	const body = `${envelope.body}\n\n${agentReplyRequest(envelope.from)}`;
-	return `${agentSourceLine(envelope.from, envelope.name)}\n${body}`;
+	const type = envelope.type ?? "task";
+	const name = envelope.name ? ` name="${clean(envelope.name)}"` : "";
+	const lines = [`<agent_message from="${clean(envelope.from)}"${name} type="${type}">`, `  ${CONTENT_OPEN}`];
+	if (envelope.body) lines.push(indentBody(envelope.body));
+	lines.push(`  ${CONTENT_CLOSE}`);
+	if (type === "task") {
+		lines.push("  <note>", `${INDENT}${piHerdrAgentPrompt.protocol.note}`, "  </note>");
+	}
+	lines.push("</agent_message>");
+	return lines.join("\n");
 }
 
-/** 剥掉 hc CLI 的运输层包装，保留我们自己的首行。 */
+/** 剥掉 hc CLI 的运输层包装，保留我们自己的消息。 */
 export function stripHcTransport(text: string): string {
 	return text.replace(HC_OPEN_PATTERN, "").replace(HC_CLOSE_PATTERN, "");
 }
 
 /**
- * 解析首行。不是信封（人打字、别的扩展消息）返回 undefined，调用方原样放行。
- * 宁可让模型看到一行怪文本，也不吞消息。
+ * 解析消息。不是信封（人打字、别的扩展消息）返回 undefined，调用方原样放行。
+ * 宁可让模型看到一段怪文本，也不吞消息。
  */
 export function parseAgentEnvelope(text: string): AgentEnvelope | undefined {
 	// hc 的运输层包装（from 是发送终端地址；若 notes 被关掉则不存在）。
 	const unwrapped = stripHcTransport(text);
 
-	const match = ENVELOPE_PATTERN.exec(unwrapped);
-	if (!match) return undefined;
+	const header = HEADER_PATTERN.exec(unwrapped);
+	if (!header) return undefined;
 
-	let body = unwrapped.slice(match[0].length);
-	const tail = REPLY_TAIL_PATTERN.exec(body);
-	if (tail) body = body.slice(0, tail.index).replace(/[ \t]+\r?\n$/, "");
+	const rest = unwrapped.slice(header[0].length);
+	const open = rest.indexOf(CONTENT_OPEN);
+	const close = rest.indexOf(CONTENT_CLOSE, open + CONTENT_OPEN.length);
+	if (open < 0 || close < 0) return undefined;
 
 	return {
-		from: match[1],
-		name: match[2] || undefined,
-		body,
+		from: header[1],
+		name: header[2] || undefined,
+		type: header[3] as AgentMessageType,
+		body: dedentBody(rest.slice(open + CONTENT_OPEN.length, close)),
 	};
 }
 

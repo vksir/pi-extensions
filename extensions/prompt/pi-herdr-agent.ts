@@ -6,7 +6,7 @@
  *
  * 去重口径：
  * - 动作的语义在工具描述里，`action` 只列可选值。
- * - 回信提示只在消息末尾的 `<reply>` 元素里出现一次；守则与工具描述都不复述。
+ * - 回信提示只在消息的 `<note>` 元素里出现一次，由 lib 拼装时取用；守则与工具描述都不复述。
  * - 「不要睡等」只在守则里，守则挂 `agent_job`（最深一层没有 `agent` 工具）。
  * - 可见范围不进文案：模型看不到的 agent，本来就不会出现在它的参数里。
  */
@@ -36,22 +36,29 @@ export const piHerdrAgentPrompt = {
 			// 常驻·工具声明。三个动作的语义都写在这里。
 			description:
 				"The list action returns the running agents. " +
-				"The send action sends a message to an agent; a busy target queues it. " +
+				"The send action sends a message to an agent. " +
 				"The stop action ends one of your own descendants.",
 			parameters: {
 				action: "One of: list, send, stop.",
 				id: "Agent id. Required for every action except list.",
 				message: "Message for send.",
+				type: "Message kind: task for a new request, reply for an answer. Defaults to task.",
 			},
 		},
+	},
+
+	// ─── 消息协议（首尾由扩展生成，模型只写 content） ───
+
+	protocol: {
+		/** task 消息里的 `<note>`：告诉接收方输出不会自动回传。 */
+		note: 'Your output is not returned automatically. Use agent_job send with type="reply" to reply.',
 	},
 
 	// ─── 每次投递·扩展自己发的通知（模型可见） ───
 
 	notices: {
 		/** 消息发出去后，目标整个子树都退出了，一直没有回信。 */
-		exitedWithoutReply: (id: string, name?: string) =>
-			`Agent ${name ? `${id} ("${name}")` : id} exited without replying.`,
+		exitedWithoutReply: () => "It exited without replying.",
 	},
 
 	// ─── 常驻·系统提示词 ───

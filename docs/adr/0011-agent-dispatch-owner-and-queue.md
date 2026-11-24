@@ -1,6 +1,6 @@
 # agent 之间按「发起人 + 排队」派发，回信由模型自己 send
 
-> **部分被取代**：`ask` 已改名 `send`，收工自动回发与 `result` 位、崩溃 / 排队 / blocked 通知均已删除，见 [ADR-0012](0012-agent-replies-are-sends.md)。本文件里「发起人（原派活人）+ 排队」的派发规则仍然有效，其中「派活人」现在只决定忙时插话还是排队、不承担回信职责。
+> **大部分被取代**：`ask` 已改名 `send`，收工自动回发与 `result` 位、崩溃 / blocked 通知均已删除（[ADR-0012](0012-agent-replies-are-sends.md)）；「发起人 + 排队」也一并删掉，忙时消息直接交给 pi 插入（[ADR-0013](0013-inbound-messages-are-inserted-not-queued.md)）。本文件只作历史记录。
 
 ## 背景
 
