@@ -27,7 +27,7 @@ node --test tests/*.test.ts
 | [pi-cron](extensions/pi-cron.ts) | 进程级 cron job：`cron` 工具（create / list / delete）按 cron 表达式反复把一段 prompt 交给 agent；人工入口是 `/cron [间隔] [once] <prompt>`（省略间隔按 `15m`）、`/cron list`、`/cron delete [id]` |
 | [pi-btw](extensions/pi-btw.ts) | 顺带分派：仅在 herdr / herdr app 环境注册 `/btw <消息>`，新开一个标签，fork 当前会话启动 pi 并把消息作为首条消息递交；本轮还在跑时先把 fork 源截到上一个完整轮次，避免新会话继承半截 turn（见 [ADR-0008](docs/adr/0008-btw-forks-at-turn-boundary.md)） |
 | [pi-bg](extensions/pi-bg.ts) | 后台运行：`bash_bg` / `codemode_bg` 立即返回，结束后把结果作为消息回发；前台 `bash` / `codemode` 超过等待预算（默认 3 分钟）自动转成后台任务；`bg_job` 工具（list / show / kill）与 `/bg` 命令查看/终止，并与内置工具的启用状态联动 |
-| [pi-herdr-agent](extensions/pi-herdr-agent.ts) | 用 herdr-core（hc）的终端树跑子 agent：`agent` 拉起、`agent_job` 管理（list / ask / stop），按「派活人 + 排队」派发、收工自动回发；`/agent list` 显示 agent 树；仅 herdr app + hc 环境生效 |
+| [pi-herdr-agent](extensions/pi-herdr-agent.ts) | 用 herdr-core（hc）的终端树跑子 agent：`agent` 拉起、`agent_job` 管理（list / send / stop），按「发起人 + 排队」派发；回信由 agent 自己 `send`，扩展不代发；`/agent list` 显示 agent 树；仅 herdr app + hc 环境生效 |
 
 `/balance codex` 需要先通过 `/login openai-codex` 登录 ChatGPT Plus/Pro 订阅。`/balance opencode` 查 OpenCode Go 的 5 小时/周/月额度，需要先配置 `opencode-go` 的 API Key。
 
@@ -196,31 +196,29 @@ node --test 'tests/pi-bg.test.ts'
 
 两个工具：
 
-- `agent { prompt, name?, model?, thinking?, resume?, destroy_time? }`：拉起子 agent，等 pi 就绪且 prompt 送达后返回 id / name，不等结果。`name` 是 hc 终端名（侧边栏显示），1–32 位 `[a-z0-9._-]`、活终端间唯一，非法或重名直接报错；省略用 agent id。`model` / `thinking` 省略时继承父 agent 当前值。结果由扩展在该轮收工时自动回发（拉起时的那条 prompt 也算一次派活）。`destroy_time` 控制空闲销毁（见下文），默认 180 秒，`0` 表示永不销毁。
-- `agent_job { action, id?, message? }`：`list`（只看得到自己、一级父、一级子、兄弟）、`ask`（发给任意 agent，不检查对方状态）、`stop`（只能停自己的后代；先发 ctrl+d 请它自己退出，宽限内没走再硬杀）。派发规则见下。
+- `agent { prompt, name?, model?, thinking?, resume?, destroy_time?, expects_reply? }`：拉起子 agent，等 pi 就绪且 prompt 送达后返回 id / name，不等结果。`name` 是 hc 终端名（侧边栏显示），1–32 位 `[a-z0-9._-]`、活终端间唯一，非法或重名直接报错；省略用 agent id。`model` / `thinking` 省略时继承父 agent 当前值。答案不会自动回来：子 agent 要用 `agent_job send` 发给你。`destroy_time` 控制空闲销毁（见下文），默认 180 秒，`0` 表示永不销毁。
+- `agent_job { action, id?, message?, expects_reply? }`：`list`（只看得到自己、一级父、一级子、兄弟）、`send`（发给任意 agent，派活与回信都用它，不检查对方状态）、`stop`（只能停自己的后代；先发 ctrl+d 请它自己退出，宽限内没走再硬杀）。`expects_reply: true` 会在对方收到的消息末尾挂一个 `<reply to="你的id">…</reply>` 元素，告诉它用 `send` 回你；不带就是普通消息。派发规则见下。
 
 人工入口：`/agent list` 以**卡片式森林**渲染当前 hc session 的 agent 树——每棵独立的树一块（`▌` 引导），名字在前、id 在后，状态右对齐（不显示 cwd）；根显示 pi 会话名（无会话名时 `(root)`）；`●` 自己、`↑` 父 agent，父终端已消失的 agent 标「失联」。
 
 身份与寻址：
 
 - 子 agent id 是拉起时生成的 6 位十六进制短码，pi 会话 id 推导为 `pi-<id>`；resume 按 id 找会话文件重新拉起，不需要登记表。根 agent（人启动的 pi）的 id 取自己会话 id 末尾 6 位，写进终端的 `pi.agent.root` label 供树里其他 agent 认出来；label 写不进去时退回 hc 地址。
-- `name` 只作显示；派活人、会话路径等可变语义不进 hc label。发现靠创建时写入的 label `pi.agent=<id>`。
+- `name` 只作显示；发起人、会话路径等可变语义不进 hc label。发现靠创建时写入的 label `pi.agent=<id>`。
 - 拉起时注入 `PI_AGENT_ID` / `PI_AGENT_NAME` / `PI_AGENT_PARENT` / `PI_AGENT_ROOT` / `PI_AGENT_DEPTH`，子进程的扩展据此知道自己是谁、在树里的哪一层；另外注入 `PI_AGENT_DESTROY_TIME`（空闲销毁秒数）。
 
 约束：
 
-- **派发**：一轮只有一个派活人，就是叫醒这一轮的那条消息的发送方。我空闲就开一轮；我忙时，派活人再发来的消息直接插进当前轮，别人发来的被吞掉、按发送方排队（同一发送方最多一条，位置不变）。收工时扩展把最后一段回答自动发回给派活人，不依赖模型调工具；自动回发本身与人打字都不回发，避免 A 与 C 无限来回。设计取舍见 [ADR-0011](docs/adr/0011-agent-dispatch-owner-and-queue.md)。
+- **派发**：一轮只有一个发起人，就是叫醒这一轮的那条消息的发送方。我空闲就开一轮；我忙时，发起人再发来的消息直接插进当前轮，别人发来的被吞掉、按发送方排队（同一发送方最多一条，位置不变）。收工时扩展一条消息也不发：回不回、回给谁，由 agent 自己用 `send` 决定。设计取舍见 [ADR-0012](docs/adr/0012-agent-replies-are-sends.md)。
 - **空闲销毁**：子 agent 在 settle 之后开始计时，安静满 `destroy_time`（默认 180 秒）就自己 `ctx.shutdown()`，pi 退出后 hc 按 `rm: true` 删掉终端；会话文件仍在磁盘上，按 id `resume` 就能回来。`0` 表示永不销毁。
-- 只有「安静」才计时：还有活的子终端、运行中的后台任务（pi-bg）、进程内子 agent（pi-subagents）、cron job（pi-cron），或排队里还有没处理的消息，都不算；中间两项经 `lib/activity.ts` 的忙探测登记表汇总，没加载的扩展按「不忙」处理。任何新入站（`ask` / 人打字 / cron 投递）立即清零。
+- 只有「安静」才计时：还有活的子终端、运行中的后台任务（pi-bg）、进程内子 agent（pi-subagents）、cron job（pi-cron），或排队里还有没处理的消息，都不算；中间两项经 `lib/activity.ts` 的忙探测登记表汇总，没加载的扩展按「不忙」处理。任何新入站（`send` / 人打字 / cron 投递）立即清零。
 - 每 30 秒一拍检查，销毁最多迟到一拍；`hc.list` 读不到时按「忙」处理。一个 `destroy_time: 0` 的子 agent 会永久钉住父 agent（父永远有子），要收尾就用 `stop` 或删 cron。
 - 树深最多三层（root → 子 → 孙），深度 2 的 agent 不再注册 `agent`。
 - resume 不允许换模型 / 思考级别：传了与会话记录不一致的值直接报错（避免缓存整体未命中）。
-- 结果正文超过 2000 行 / 50 KB 时按 bash 同款尾部截断，全文写 `pi-herdr-agent-*.log`，由派活人自己读。
-- `stop` 只允许自己的后代；它先发 `ctrl+d`（每下宽限 5 秒，最多两下），宽限内没退出才 `hc.kill` 硬杀 —— 只有优雅退出才会跑到 `session_shutdown`，把「没做完」交代出去。root 正常退出时递归清理直接子 agent；硬崩溃留下的孤儿在 `list` 里标 `orphan`。
-- 拉起时 `no_notify: true`：hc 的 note 不进消息通道；消息只有 `ask` 与自动回发。
+- `stop` 只允许自己的后代；它先发 `ctrl+d`（每下宽限 5 秒，最多两下），宽限内没退出才 `hc.kill` 硬杀。root 正常退出时递归清理直接子 agent；硬崩溃留下的孤儿在 `list` 里标 `orphan`。
+- 拉起时 `no_notify: true`：hc 的 note 不进消息通道；消息只有 agent 之间的 `send`。
 - 子 agent settle 时把 pi 内置 reporter 的 OSC `state=done` 在 stdout 层改写成 `state=idle`：hc 侧只看到 `working → idle`，不留下 done（根 agent 不受影响）。
-- 子 agent 卡在扩展 UI 弹窗时会给派活人发一条 blocked 提示。
-- 中止（Esc）时给派活人回一句 `Run aborted.`，队列不动、不自动开工；退出时给派活人一条「没来得及回答」、队列里每人一条「你那条没做」。
+- 中止（Esc）时队列不动、不自动开工；对方挂了只能靠 `agent_job list` 看出来（扩展不再发崩溃通知）。
 
 回归测试：
 
@@ -263,8 +261,7 @@ pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式�
 | `lib/herdr.ts` | 两代 herdr 环境探测、标签更名、新标签启动 |
 | `lib/auto-name.ts` | 自动标签名：标题清洗与最多三次尝试的重试循环 |
 | `lib/hc.ts` | herdr-core 的 JSON-RPC 客户端（命名管道、一行一条） |
-| `lib/agent-protocol.ts` | 子 agent 的消息信封、名称校验、结果截断（纯函数） |
-| `lib/output-file.ts` | 超长结果落临时文件（与 pi 内置输出文件同套约定） |
+| `lib/agent-protocol.ts` | 子 agent 的消息首行与名称校验（纯函数） |
 | `lib/subagents.ts` | pi-subagents 注册表的子 agent 存活探测 |
 | `lib/activity.ts` | 进程级忙探测登记表：pi-bg / pi-cron 各自登记，pi-herdr-agent 汇总 |
 | `lib/cron/schedule.ts` | cron 表达式解析、下次触发、间隔换算（纯函数） |

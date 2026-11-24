@@ -18,17 +18,14 @@
  *   `PI_AGENT_DESTROY_TIME`（空闲销毁秒数，0 = 不销毁）。
  *
  * 消息（派发规则）：
- * - `agent_job ask` 不检查对方状态：忙就排队或插入，闲就起一轮。
- * - 一轮（round）只有一个「派活人」= 叫醒它的那条消息的发送方。收到消息时：
- *   - 我空闲：开一轮，派活人 = 发送方。
- *   - 我忙、发送方就是派活人：直接插进当前轮（pi 原生 steer）。
+ * - `agent_job send` 不检查对方状态：忙就排队或插入，闲就起一轮。派活与回信都用它。
+ * - 回信由模型自己决定：扩展不代替 agent 发任何消息。
+ * - 一轮（round）只有一个「发起人」= 叫醒它的那条消息的发送方。收到消息时：
+ *   - 我空闲：开一轮，发起人 = 发送方。
+ *   - 我忙、发送方就是发起人：直接插进当前轮（pi 原生 steer）。
  *   - 我忙、发送方是别人：吞掉，不进上下文，按发送方排队。
- *   - 收到自动回发（首行带 result）：不排队、不回发，直接投递。
- * - 收工时扩展自动把本轮最后一段回答发回给派活人，不依赖模型调工具。
- *   只有 `ask` 起的轮次回发；回发本身、人打字、被中止的轮次都不回发。
  * - 队列按发送方聚合：同一个发送方最多一条，新消息并进他那条，位置不变。
- * - 首行 `<agent id "name">` / `<agent id "name" result>` 由扩展生成，模型可见。
- * - 结果正文超过 2000 行 / 50 KB 时按 bash 工具同款方式尾部截断，全文落临时文件。
+ * - 首行 `<from agent id "name">` 由扩展生成，模型可见；带 `expects_reply` 的那条多一截 `· expects reply`。
  * - 拉起时 `no_notify: true`：hc 自己的 note 不参与语义。
  *
  * 生命周期：`session_shutdown(reason=quit)` 时杀掉自己的直接子 agent（递归由各自的
@@ -65,7 +62,6 @@ import {
 	formatAgentEnvelope,
 	parseAgentEnvelope,
 	stripHcTransport,
-	truncateTail,
 	validateAgentName,
 	type AgentEnvelope,
 } from "./lib/agent-protocol.ts";
@@ -80,7 +76,6 @@ import {
 	type HcTerminal,
 	type HcWaitResult,
 } from "./lib/hc.ts";
-import { writeOutputFile } from "./lib/output-file.ts";
 import { hasRunningSubagents } from "./lib/subagents.ts";
 import { basename } from "./lib/text.ts";
 
@@ -111,7 +106,7 @@ const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "ma
 
 // ─── 类型 ───
 
-/** 对端 agent：发送方与派活人都用它。 */
+/** 对端 agent：发送方与本轮发起人都用它。 */
 interface Peer {
 	id: string;
 	name?: string;
@@ -121,6 +116,8 @@ interface Peer {
 interface QueuedMessage {
 	peer: Peer;
 	parts: string[];
+	/** 合并进来的任意一条带了 `expects_reply`：起这一轮时首行照样带标记。 */
+	expectsReply: boolean;
 }
 
 export interface AgentRow {
@@ -152,12 +149,14 @@ interface AgentParams {
 	thinking?: (typeof THINKING_LEVELS)[number];
 	resume?: string;
 	destroy_time?: number;
+	expects_reply?: boolean;
 }
 
 interface AgentJobParams {
-	action: "list" | "ask" | "stop";
+	action: "list" | "send" | "stop";
 	id?: string;
 	message?: string;
+	expects_reply?: boolean;
 }
 
 interface SessionFacts {
@@ -170,7 +169,7 @@ interface SessionFacts {
 
 /** 结构化 details 只记动作与结果，方便 UI 与测试断言。 */
 interface AgentToolDetails {
-	action?: "start" | "resume" | "list" | "stop" | "ask";
+	action?: "start" | "resume" | "list" | "stop" | "send";
 	id?: string;
 	name?: string;
 	error?: string;
@@ -183,8 +182,6 @@ export interface HerdrAgentOptions {
 	env?: NodeJS.ProcessEnv;
 	/** 会话目录覆盖（测试用）。 */
 	sessionDir?: string;
-	/** 超长结果全文落地（测试可替换）；默认写系统临时目录。 */
-	spill?: (text: string) => Promise<string>;
 	/** 空闲销毁的时钟（测试可替换）；默认 Date.now。 */
 	now?: () => number;
 	/** `stop` 每次按键的宽限（毫秒，测试可缩短）；默认 STOP_GRACE_S 秒。 */
@@ -236,7 +233,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	};
 
 	/**
-	 * 队列模式非 all 时，派活人的插话与自动回发会被 pi 逐条延后；只在本次进程启动时提醒一次。
+	 * 队列模式非 all 时，发起人的插话会被 pi 逐条延后；只在本次进程启动时提醒一次。
 	 * 设置项在 /settings 里叫 Steering mode 与 Follow-up mode；`all` 是当前扩展期望的值。
 	 * 未设置（undefined）不提醒：那是 pi 的默认值，提醒会变成每次启动都喷。
 	 */
@@ -258,7 +255,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		if (oneAtATime.length === 0) return;
 
 		ctx.ui.notify(
-			`${oneAtATime.join(" / ")} 当前为 one-at-a-time，需改为 all；否则派活人的插话与自动回发会被逐条延后。可以在 /settings 里修改。`,
+			`${oneAtATime.join(" / ")} 当前为 one-at-a-time，需改为 all；否则发起人的插话会被逐条延后。可以在 /settings 里修改。`,
 			"warning",
 		);
 	};
@@ -268,15 +265,13 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		warnIfQueueModesAreNotAll(ctx);
 	});
 
-	// 每轮的状态：派活人与队列只在内存里（label 不承担可变语义）。
-	/** 本轮派活人；收工时清空，新的普通消息重新指定。 */
+	// 每轮的状态：发起人与队列只在内存里（label 不承担可变语义）。
+	/** 本轮的发起人（叫醒这一轮的那条消息的发送方）；收工时清空。 */
 	let owner: Peer | undefined;
 	/** 是否有轮次正在跑。`streamingBehavior` 只作交叉校验，这里才是准的。 */
 	let busy = false;
 	/** 收工处理进行中（里面有 await）；这段时间也算忙。 */
 	let settling = false;
-	let lastAnswer: string | undefined;
-	let blockedNotified = false;
 
 	/**
 	 * 排队：key = 发送方 id，Map 的插入顺序就是队列顺序。
@@ -324,8 +319,13 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		const existing = queue.get(envelope.from);
 		if (existing) {
 			existing.parts.push(envelope.body);
+			existing.expectsReply = existing.expectsReply || envelope.expectsReply;
 		} else {
-			queue.set(envelope.from, { peer: { id: envelope.from, name: envelope.name }, parts: [envelope.body] });
+			queue.set(envelope.from, {
+				peer: { id: envelope.from, name: envelope.name },
+				parts: [envelope.body],
+				expectsReply: envelope.expectsReply,
+			});
 		}
 		try {
 			pi.appendEntry(QUEUE_ENTRY, { from: envelope.from, name: envelope.name, body: envelope.body });
@@ -335,52 +335,43 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	};
 
 	/** 取队首；取出来的同时从队列里移除。 */
-	const takeNext = (): { id: string; peer: Peer; parts: string[] } | undefined => {
+	const takeNext = (): { id: string; peer: Peer; parts: string[]; expectsReply: boolean } | undefined => {
 		const first = queue.entries().next();
 		if (first.done) return undefined;
 		const [id, entry] = first.value;
 		queue.delete(id);
-		return { id, peer: entry.peer, parts: entry.parts };
+		return { id, peer: entry.peer, parts: entry.parts, expectsReply: entry.expectsReply };
 	};
 
 	/** 起队首失败时放回队首，位置不丢。 */
-	const putBackFront = (id: string, peer: Peer, parts: string[]): void => {
+	const putBackFront = (id: string, peer: Peer, parts: string[], expectsReply: boolean): void => {
 		const rest = [...queue.entries()];
 		queue.clear();
-		queue.set(id, { peer, parts });
+		queue.set(id, { peer, parts, expectsReply });
 		for (const [key, value] of rest) queue.set(key, value);
 	};
 
-	/** 派活人 id → 当前终端地址；已经不在的返回 undefined。 */
-	const addressOf = async (id: string): Promise<string | undefined> => {
+	/** 起队首；没排队的返回 false。发起人跟着切到队首的发送方。 */
+	const promoteNext = (): boolean => {
+		const next = takeNext();
+		if (!next) return false;
+		owner = next.peer;
 		try {
-			const terminals = await hc.list();
-			return terminals.find((terminal) => agentIdOf(terminal) === id && terminal.state === "live")?.address;
-		} catch {
-			return undefined;
+			pi.sendUserMessage(
+				formatAgentEnvelope({
+					from: next.peer.id,
+					name: next.peer.name,
+					expectsReply: next.expectsReply,
+					body: next.parts.join("\n\n"),
+				}),
+			);
+		} catch (error) {
+			putBackFront(next.id, next.peer, next.parts, next.expectsReply);
+			owner = undefined;
+			appendNote(`queued message from ${next.id} could not start: ${errorMessage(error)}`);
+			return false;
 		}
-	};
-
-	/**
-	 * 自动回发一条结果。对方已经不在时静默丢弃，并在自己界面上记一行：
-	 * 重试没有意义，那是死信箱。
-	 */
-	const sendReport = async (target: Peer, ctx: ExtensionContext, body: string): Promise<void> => {
-		const address = await addressOf(target.id);
-		if (!address) {
-			appendNote(`replay to ${target.id} failed: it is gone.`);
-			return;
-		}
-
-		try {
-			await hc.send({
-				terminal: address,
-				caller: self,
-				text: formatAgentEnvelope({ result: true, from: myId, name: displayName(ctx), body }),
-			});
-		} catch {
-			appendNote(`replay to ${target.id} failed: it disappeared.`);
-		}
+		return true;
 	};
 
 	// ─── 入站消息 ───
@@ -392,20 +383,15 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		const envelope = parseAgentEnvelope(event.text);
 		if (!envelope) return;
 
-		// 自动回发只是一条答案：空闲就起一轮读它（不回发），忙就直接插进去。
-		// 首行留给模型看，只剥掉 hc CLI 的运输层包装。
-		if (envelope.result) return { action: "transform" as const, text: stripHcTransport(event.text) };
-
 		const running = busy || settling || event.streamingBehavior !== undefined;
 
 		if (!running) {
-			// 空闲：开一轮，派活人 = 发送方。首行留给模型看。
+			// 空闲：开一轮，发起人 = 发送方。首行留给模型看。
 			owner = { id: envelope.from, name: envelope.name };
-			lastAnswer = undefined;
 			return { action: "transform" as const, text: stripHcTransport(event.text) };
 		}
 
-		// 派活人插话：直接插进当前轮（pi 原生 steer）。
+		// 发起人插话：直接插进当前轮（pi 原生 steer）。
 		if (owner?.id === envelope.from) {
 			return { action: "transform" as const, text: stripHcTransport(event.text) };
 		}
@@ -415,96 +401,51 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		return { action: "handled" as const };
 	});
 
-	// ─── 出站结果 ───
-
-	pi.on("agent_end", (event) => {
-		const text = lastAssistantText(event.messages);
-		if (text !== undefined) lastAnswer = text;
-	});
+	// ─── 收工 ───
 
 	pi.on("agent_settled", async (event, ctx) => {
 		busy = false;
-		// 收工处理里有 await（回发要查地址）。这段时间里进来的消息也按「忙」处理，
-		// 否则它会把自己当成新一轮的派活人，和下面要起的队首撞车。
+		// 收工处理期间进来的消息也按「忙」处理，否则它会把自己当成新一轮的发起人，
+		// 和下面要起的队首撞车。
 		settling = true;
-		blockedNotified = false;
-
-		const current = owner;
 		owner = undefined;
-		const answer = lastAnswer;
-		lastAnswer = undefined;
 
 		try {
-			// 被中止：只回一句，不附半截回答；队列不动，也不自动开工。
-			if (current) {
-				const body = event.aborted ? piHerdrAgentPrompt.reports.runAborted() : await resultBody(answer);
-				await sendReport(current, ctx, body);
-			}
-
+			// 被中止：队列不动，也不自动开工。
 			if (event.aborted) {
 				// 队列里还有活就不倒计时：那些任务不能跟着一起消失。
 				if (queue.size === 0) await armDestroyCountdown(ctx);
 				return;
 			}
 
-			const next = takeNext();
-			if (next) {
-				owner = next.peer;
-				lastAnswer = undefined;
-				try {
-					pi.sendUserMessage(
-						formatAgentEnvelope({ from: next.peer.id, name: next.peer.name, body: next.parts.join("\n\n") }),
-					);
-				} catch (error) {
-					putBackFront(next.id, next.peer, next.parts);
-					owner = undefined;
-					appendNote(`queued message from ${next.id} could not start: ${errorMessage(error)}`);
-					return; // 还有活没干成：不进入空闲销毁。
-				}
-				return; // 新一轮已开始，倒计时由那一轮收工时再武装。
-			}
+			if (promoteNext()) return; // 新一轮已开始，倒计时由那一轮收工时再武装。
 
 			await armDestroyCountdown(ctx);
 		} finally {
 			settling = false;
 		}
+
+		// 收工处理里有 await；这期间排进来的消息不能就这么坐着，
+		// 否则要等下一次入站才有人把它们叫醒。
+		if (!busy && queue.size > 0) promoteNext();
 	});
 
-	// 不论因为什么起了一轮（cron 投递、人打字、ask），倒计时都作废。
+	// 不论因为什么起了一轮（cron 投递、人打字、send），倒计时都作废。
 	pi.on("agent_start", () => {
 		busy = true;
 		stopDestroyCountdown();
 	});
 
-	pi.on("ui_prompt_start", async (event, ctx) => {
+	pi.on("ui_prompt_start", () => {
 		// 弹窗等人回答：这一轮还没结束，先把倒计时停掉（settle 后会重新武装）。
 		stopDestroyCountdown();
-		if (!owner || blockedNotified) return;
-		blockedNotified = true;
-		const detail = event.title ? ` (${event.title})` : "";
-		await sendReport(owner, ctx, piHerdrAgentPrompt.reports.blocked(detail));
 	});
 
-	pi.on("ui_prompt_end", () => {
-		blockedNotified = false;
-	});
-
-	pi.on("session_shutdown", async (event, ctx) => {
+	pi.on("session_shutdown", async (event) => {
 		stopDestroyCountdown();
 		// 只有真正退出（quit）才收尸；/reload、/new、/resume、/fork 不动子 agent。
 		if (event.reason !== "quit") return;
 
-		// 退出前把「没做完」交代清楚：派活人一条，排队里每人一条。
-		const current = owner;
-		const queued = [...queue.values()];
-		owner = undefined;
-		queue.clear();
-		if (current) await sendReport(current, ctx, piHerdrAgentPrompt.reports.exitedBeforeAnswering(myId));
-		await Promise.allSettled(
-			queued.map((entry) =>
-				sendReport(entry.peer, ctx, piHerdrAgentPrompt.reports.exitedTaskNotProcessed(myId)),
-			),
-		);
 		try {
 			const terminals = await hc.list();
 			const children = terminals.filter((terminal) => terminal.parent === self);
@@ -580,23 +521,6 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		destroyTimer = schedule(() => void checkDestroy(generation, ctx), DESTROY_TICK_S * 1000);
 	};
 
-	// ─── 结果整形 ───
-
-	const resultBody = async (answer: string | undefined): Promise<string> => {
-		const text = answer?.trim();
-		if (!text) return piHerdrAgentPrompt.reports.noText();
-
-		const truncation = truncateTail(text);
-		if (!truncation.truncated) return text;
-
-		try {
-			const path = options.spill ? await options.spill(text) : await writeOutputFile("pi-herdr-agent", ".log", text);
-			return `${truncation.text}\n\n${piHerdrAgentPrompt.reports.truncatedWithPath(path)}`;
-		} catch (error) {
-			return `${truncation.text}\n\n${piHerdrAgentPrompt.reports.truncated(errorMessage(error))}`;
-		}
-	};
-
 	// ─── 工具：agent ───
 
 	const registerAgentTool = (): void => {
@@ -617,6 +541,9 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 				),
 				destroy_time: Type.Optional(
 					Type.Number({ description: piHerdrAgentPrompt.declarations.agent.parameters.destroy_time }),
+				),
+				expects_reply: Type.Optional(
+					Type.Boolean({ description: piHerdrAgentPrompt.declarations.agent.parameters.expects_reply }),
 				),
 			}),
 
@@ -659,6 +586,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			prompt: params.prompt,
 			ctx,
 			destroyTime: normalizeDestroyTime(params.destroy_time),
+			expectsReply: params.expects_reply === true,
 		});
 		return ok(piHerdrAgentPrompt.results.startedAgent(id, name), {
 			action: "start",
@@ -718,6 +646,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			prompt: params.prompt,
 			ctx,
 			destroyTime: normalizeDestroyTime(params.destroy_time),
+			expectsReply: params.expects_reply === true,
 		});
 		return ok(piHerdrAgentPrompt.results.resumedAgent(id, name), {
 			action: "resume",
@@ -736,10 +665,12 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		ctx: ExtensionContext;
 		/** 空闲销毁秒数；0 = 永不。 */
 		destroyTime: number;
+		/** 把 `expects_reply` 写进拉起消息的首行。 */
+		expectsReply: boolean;
 	}
 
 	const launch = async (launchOptions: LaunchOptions): Promise<void> => {
-		const { id, name, cwd, model, thinking, prompt, ctx, destroyTime } = launchOptions;
+		const { id, name, cwd, model, thinking, prompt, ctx, destroyTime, expectsReply } = launchOptions;
 		const argv = ["pi", "--session-id", `pi-${id}`, "--name", name];
 		if (model) argv.push("--model", model);
 		if (thinking) argv.push("--thinking", thinking);
@@ -782,7 +713,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			await hc.send({
 				terminal: run.address,
 				caller: self,
-				text: formatAgentEnvelope({ from: myId, name: displayName(ctx), body: prompt }),
+				text: formatAgentEnvelope({ from: myId, name: displayName(ctx), expectsReply, body: prompt }),
 			});
 		} catch (error) {
 			await hc.kill(run.address).catch(() => undefined);
@@ -832,12 +763,15 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			// 守则挂在 agent_job 上：它全深度都有，而 agent 在最深一层不注册。
 			promptGuidelines: [piHerdrAgentPrompt.system.guidelines.agentJob],
 			parameters: Type.Object({
-				action: StringEnum(["list", "ask", "stop"] as const, {
+				action: StringEnum(["list", "send", "stop"] as const, {
 					description: piHerdrAgentPrompt.declarations.agentJob.parameters.action,
 				}),
 				id: Type.Optional(Type.String({ description: piHerdrAgentPrompt.declarations.agentJob.parameters.id })),
 				message: Type.Optional(
 					Type.String({ description: piHerdrAgentPrompt.declarations.agentJob.parameters.message }),
+				),
+				expects_reply: Type.Optional(
+					Type.Boolean({ description: piHerdrAgentPrompt.declarations.agentJob.parameters.expects_reply }),
 				),
 			}),
 
@@ -853,8 +787,8 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 						}
 						case "stop":
 							return await stopJob(typed);
-						case "ask":
-							return await askJob(typed, ctx);
+						case "send":
+							return await sendJob(typed, ctx);
 					}
 				} catch (error) {
 					return fail(humanError(error, typed.id), typed.action);
@@ -879,8 +813,8 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 
 	/**
 	 * 先请对方自己退出：只有优雅退出才会跑到 `session_shutdown`，
-	 * 把「没来得及回答」与「队列里的活没做」交代给派活人和排队的人。
-	 * `hc.kill` 是硬杀，进程来不及做任何事；宽限期内没走才用它兜底。
+	 * 来得及做完退出清理。`hc.kill` 是硬杀，进程来不及做任何事；
+	 * 宽限期内没走才用它兜底。
 	 */
 	const requestQuit = async (address: string): Promise<void> => {
 		// 工作状态下第一下 ctrl+d 是「中止」，停下来的第二下才是「退出」；
@@ -925,21 +859,26 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 
 	/**
 	 * 发一条消息。不检查对方状态：忙就由对方插进当前轮或排队，闲就起一轮。
-	 * 对方收工时会把这一轮的最后回答自动发回来。
+	 * 派活与回信走同一条路：回不回、回给谁，由收到消息的一方自己决定。
 	 */
-	const askJob = async (params: AgentJobParams, ctx: ExtensionContext) => {
-		if (!params.id) return fail(piHerdrAgentPrompt.results.errors.idRequired("ask"), "ask");
-		if (!params.message?.trim()) return fail(piHerdrAgentPrompt.results.errors.messageRequired("ask"), "ask", params.id);
+	const sendJob = async (params: AgentJobParams, ctx: ExtensionContext) => {
+		if (!params.id) return fail(piHerdrAgentPrompt.results.errors.idRequired("send"), "send");
+		if (!params.message?.trim()) return fail(piHerdrAgentPrompt.results.errors.messageRequired("send"), "send", params.id);
 		const target = await requireTarget(params.id);
-		if (target.row.id === myId) return fail(piHerdrAgentPrompt.results.errors.cannotActOnSelf("ask"), "ask", params.id);
+		if (target.row.id === myId) return fail(piHerdrAgentPrompt.results.errors.cannotActOnSelf("send to"), "send", params.id);
 
 		await hc.send({
 			terminal: target.terminal.address,
 			caller: self,
-			text: formatAgentEnvelope({ from: myId, name: displayName(ctx), body: params.message }),
+			text: formatAgentEnvelope({
+				from: myId,
+				name: displayName(ctx),
+				expectsReply: params.expects_reply === true,
+				body: params.message,
+			}),
 		});
-		return ok(piHerdrAgentPrompt.results.asked(target.row.id, target.row.name), {
-			action: "ask",
+		return ok(piHerdrAgentPrompt.results.sent(target.row.id, target.row.name), {
+			action: "send",
 			id: target.row.id,
 		});
 	};
@@ -1388,27 +1327,6 @@ export function isDescendant(target: HcTerminal, terminals: HcTerminal[], self: 
 	}
 	return false;
 }
-
-/** 从 pi 的 agent_end 消息里取最后一条有文本的 assistant 消息。 */
-export function lastAssistantText(messages: readonly { role?: string; content?: unknown }[]): string | undefined {
-	for (let index = messages.length - 1; index >= 0; index--) {
-		const message = messages[index];
-		if (message?.role !== "assistant") continue;
-		const text = contentText(message.content).trim();
-		if (text) return text;
-	}
-	return undefined;
-}
-
-function contentText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return (content as Array<{ type?: string; text?: string }>)
-		.filter((block) => block?.type === "text" && typeof block.text === "string")
-		.map((block) => block.text as string)
-		.join("\n");
-}
-
 /** 失败原因里附屏幕尾部：pi 启动失败的原因通常就在最后几行。 */
 function excerpt(output: string | null | undefined, max = 600): string {
 	const text = output?.trim();

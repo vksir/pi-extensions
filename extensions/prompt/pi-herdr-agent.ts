@@ -6,7 +6,7 @@
  *
  * 去重口径：
  * - 动作的语义在工具描述里，`action` 只列可选值。
- * - 「答案会以消息回来」写在工具描述里，返回文本不再复述。
+ * - 回信的指令只在带 `expects_reply` 的消息末尾（`<reply>` 元素）出现一次；守则与工具描述都不复述。
  * - 「不要睡等」只在守则里，守则挂 `agent_job`（最深一层没有 `agent` 工具）。
  * - 可见范围不进文案：模型看不到的 agent，本来就不会出现在它的参数里。
  */
@@ -20,8 +20,7 @@ export const piHerdrAgentPrompt = {
 	declarations: {
 		agent: {
 			// 常驻·工具声明。参数规则只在参数描述里，这里不再复述。
-			description:
-				"Start a sub-agent in its own terminal. It runs a separate pi session; the answer comes back as a message when it finishes.",
+			description: "Start a sub-agent in its own terminal. It runs a separate pi session.",
 			parameters: {
 				prompt: "The task for the sub-agent.",
 				name: "Sidebar name: 1-32 chars of a-z, 0-9, '.', '_' or '-', unique among running agents. Defaults to the agent id.",
@@ -31,18 +30,20 @@ export const piHerdrAgentPrompt = {
 					"Agent id whose exited session to continue instead of starting a new one. Model and thinking must match the session. A destroyed agent can be resumed by its id.",
 				destroy_time:
 					"Seconds of idleness before the agent process is destroyed. Default 180. 0 never destroys it.",
+				expects_reply: "Set true when you want an answer back.",
 			},
 		},
 		agentJob: {
 			// 常驻·工具声明。三个动作的语义都写在这里。
 			description:
 				"The list action returns the running agents. " +
-				"The ask action sends a message and the answer comes back as a message when the target finishes; a busy target queues it. " +
+				"The send action sends a message to an agent; a busy target queues it. " +
 				"The stop action ends one of your own descendants.",
 			parameters: {
-				action: "One of: list, ask, stop.",
+				action: "One of: list, send, stop.",
 				id: "Agent id. Required for every action except list.",
-				message: "Message for ask.",
+				message: "Message for send.",
+				expects_reply: "Set true when you want an answer back.",
 			},
 		},
 	},
@@ -76,8 +77,8 @@ export const piHerdrAgentPrompt = {
 		/** 每次调用。`agent_job list` 没有 agent。 */
 		listEmpty: () => "No agents are running.",
 
-		/** 每次调用。`agent_job ask` 投递成功。 */
-		asked: (id: string, name: string) => `Asked ${id} (${name}).`,
+		/** 每次调用。`agent_job send` 投递成功。 */
+		sent: (id: string, name: string) => `Sent to ${id} (${name}).`,
 
 		/** 每次调用。`agent_job stop` 成功。 */
 		stopped: (id: string) => `Stopped agent ${id}.`,
@@ -98,7 +99,7 @@ export const piHerdrAgentPrompt = {
 			/** 每次调用。 */
 			invalidName: (name: string, reason: string) => `invalid name '${name}': ${reason}`,
 			/** 每次调用。 */
-			stillRunning: (id: string) => `agent '${id}' is still running; use agent_job ask.`,
+			stillRunning: (id: string) => `agent '${id}' is still running; use agent_job send.`,
 			/** 每次调用。 */
 			noSession: (id: string) => `no session for agent '${id}'.`,
 			/** 每次调用。 */
@@ -126,23 +127,5 @@ export const piHerdrAgentPrompt = {
 			spawnFailed: (message: string) => `could not start pi in a new terminal: ${message}`,
 			coreError: (kind: string, message: string) => `herdr-core ${kind}: ${message}`,
 		},
-	},
-
-	// ─── 每次投递·自定义消息正文 ───
-
-	reports: {
-		/** 每次投递。本轮没有文本输出。 */
-		noText: () => "No text output this turn.",
-		/** 每次投递。run 被中止。 */
-		runAborted: () => "Run aborted.",
-		/** 每次投递。子 agent 在等人工输入；`detail` 是弹窗标题，可空。 */
-		blocked: (detail: string) => `Blocked waiting for human input${detail}.`,
-		/** 每次投递。子 agent 在收工前退出，本轮不会再回发。 */
-		exitedBeforeAnswering: (id: string) => `agent ${id} exited before answering.`,
-		/** 每次投递。子 agent 退出时排队里还有待处理的消息。 */
-		exitedTaskNotProcessed: (id: string) => `agent ${id} exited. Your task was not processed.`,
-		/** 每次投递。文本被截断。 */
-		truncatedWithPath: (path: string) => `[Output truncated. Full output: ${path}]`,
-		truncated: (reason: string) => `[Output truncated: ${reason}]`,
 	},
 } as const;

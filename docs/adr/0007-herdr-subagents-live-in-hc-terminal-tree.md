@@ -1,6 +1,6 @@
 # 子 agent 跑在 hc 终端树里，结果按 asker 回发
 
-> **部分被取代**：消息与回发部分（「结果按 asker 回发」、消息信封的 `kind=ask|steer|result`）已由 [ADR-0011](0011-agent-dispatch-owner-and-queue.md) 取代 —— 现在是「派活人 + 排队 + 收工自动回发」，`ask` / `steer` 合并为一个 `ask`。本文件其余部分（终端树、身份注入、id 推导、空闲销毁）仍然有效。
+> **部分被取代**：消息与回发部分（「结果按 asker 回发」、消息信封的 `kind=ask|steer|result`）已由 [ADR-0011](0011-agent-dispatch-owner-and-queue.md) 取代，又由 [ADR-0012](0012-agent-replies-are-sends.md) 统一成单一的 `send`（扩展不再代发）。本文件其余部分（终端树、身份注入、id 推导、空闲销毁）仍然有效。
 
 要替代 [@tintinweb/pi-subagents](https://www.npmjs.com/package/@tintinweb/pi-subagents) 的进程内子 agent：后者的 agent 与主 pi 同进程、不可在 herdr-app 里当独立终端观察，崩溃会连坐，也没有真正独立的生命周期。herdr-core（hc）已经提供了一套终端树：子终端的 `parent` 指向拉起它的终端，herdr-app 把没有 pane 的终端显示为父 tab 下的 sub-agent，`agent.focus` 可临时给它一个 pane。子 agent 因此落在 hc 终端里，每个都是独立的交互式 pi。
 
