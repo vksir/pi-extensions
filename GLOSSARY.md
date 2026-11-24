@@ -222,6 +222,10 @@ _Avoid_: 派活人、调用方、提问者、asker、requester、父 agent（归
 agent 收到消息后自己调用 `agent_job send` 发回去的回应。扩展不代发、不代收、不判断一条消息该不该回。发起一条新任务与回一条消息是同一个动作，只差在模型怎么想。
 _Avoid_: 自动回发、回调、completion、汇报、result
 
+**等回信 (pending reply)**：
+本进程发过消息、还没收到回信的目标。收到该目标的任何消息就销账；目标整棵子树都退出了还没回信，扩展补一条 `Agent <id> ("<name>") exited without replying.`，免得发消息的一方永远等下去。只在有账时每 10 秒查一次。
+_Avoid_: 超时、TTL、watchdog、崩溃通知
+
 **排队 (queue)**：
 agent 忙着时，非发起人发来的消息不进它的上下文，按发送方攒在扩展内存里，各自起一个轮次。**按发送方聚合**：同一个发送方在排队里最多只有一条，新消息并进他那一条，位置不变。
 _Avoid_: 等待队列、backlog、待办
@@ -231,7 +235,7 @@ _Avoid_: 等待队列、backlog、待办
 _Avoid_: TTL、超时、idle timeout、GC、回收
 
 **消息首行 (agent source line)**：
-每条 agent 消息正文的第一行，`<agent 7f3a "reviewer">`；带 `expects_reply` 的那条在正文末尾多一个 `<reply to="7f3a">…</reply>` 元素，表示发送方在等这条消息的回答。接收方的模型据此知道是谁发的（回信就用这个 id）以及要不要回。不再剥离，也不写发送方地址：寻址一律用 id。
+每条 agent 消息正文的第一行，`<agent 7f3a "reviewer">`；正文末尾固定挂一个 `<reply to="7f3a">…</reply>` 元素，说明输出不会自动回到发送方、要回就用 `agent_job send`。接收方的模型据此知道是谁发的（回信就用这个 id）以及要不要回。不再剥离，也不写发送方地址：寻址一律用 id。
 _Avoid_: 信封、header、前缀、metadata、标记、result
 
 **会话推导 (derived session id)**：

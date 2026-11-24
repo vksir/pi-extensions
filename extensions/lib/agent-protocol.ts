@@ -5,13 +5,13 @@
  * hc 自己会给「发给 agent 的消息」套一层 `<hc from="t4m">…</hc>`（`notes = false` 时才不套），
  * 所以解析时先剥这层，再看首行。
  *
- * 首行只告诉接收方这条消息是哪个 agent 发的。想让人回信时，正文后面再挂一个
- * `<reply to="id">…</reply>` 元素（`expects_reply` 参数）：模型的注意力在结尾，
- * 指令放在这里比塞进首行有效。回不回仍由模型自己用 `agent_job send` 决定。
+ * 首行告诉接收方这条消息是哪个 agent 发的；正文末尾再挂一个 `<reply to="id">…</reply>`
+ * 元素，说明“你的输出不会自动回到发送方，要回就用 agent_job send”。模型的注意力在
+ * 结尾，这句话放在这里比塞进首行有效；回不回仍由模型自己决定。
  *
  *   <agent a7k2 "reviewer">
  *   正文
- *   <reply to="a7k2">Reply with agent_job send when you have an answer.</reply>
+ *   <reply to="a7k2">Your output is not sent back automatically. Use agent_job send to reply.</reply>
  *
  * 发送方地址不写在首行：按术语表的「寻址一律用 id」，发送时用 id 反查终端。
  */
@@ -22,22 +22,19 @@ export interface AgentEnvelope {
 	from: string;
 	/** 发送方的显示名（可缺省）。 */
 	name?: string;
-	/** true 表示发送方在等这条消息的回答（末尾带 `<reply>` 元素）。 */
-	expectsReply: boolean;
-	/** 首行之后的正文。 */
+	/** 首行之后的正文（末尾的 `<reply>` 提示已经剥掉）。 */
 	body: string;
 }
 
 export interface AgentEnvelopeInput {
 	from: string;
 	name?: string;
-	expectsReply?: boolean;
 	body: string;
 }
 
 const ENVELOPE_PATTERN = /^<agent\s+([^\s>"]+)(?:\s+"([^"]*)")?>[ \t]*\r?\n?/;
-/** 末尾的回信请求；由本扩展生成，格式固定。 */
-const REPLY_TAIL_PATTERN = /\n*<reply to="[^"]*">[^<]*<\/reply>[ \t]*\r?\n?$/;
+/** 末尾的回信提示；由本扩展固定生成，解析时剥掉。 */
+const REPLY_TAIL_PATTERN = /\n*<reply to="[^"]*">[^<]*<\/reply>[ \t]*\r?\n?$/;;
 /** hc 给消息套的运输层标签；先剥掉才能看到我们自己的首行。 */
 const HC_OPEN_PATTERN = /^<hc\s+[^>\r\n]*>[ \t]*\r?\n?/;
 const HC_CLOSE_PATTERN = /<\/hc>\s*$/;
@@ -53,15 +50,13 @@ export function agentSourceLine(id: string, name?: string): string {
 	return `<agent ${head}>`;
 }
 
-/** 末尾的回信请求元素：`to` 是回答发给谁。 */
+/** 末尾的回信提示元素：`to` 是回给谁。 */
 export function agentReplyRequest(to: string): string {
-	return `<reply to="${clean(to)}">Reply with agent_job send when you have an answer.</reply>`;
+	return `<reply to="${clean(to)}">Your output is not sent back automatically. Use agent_job send to reply.</reply>`;
 }
 
 export function formatAgentEnvelope(envelope: AgentEnvelopeInput): string {
-	const body = envelope.expectsReply
-		? `${envelope.body}\n\n${agentReplyRequest(envelope.from)}`
-		: envelope.body;
+	const body = `${envelope.body}\n\n${agentReplyRequest(envelope.from)}`;
 	return `${agentSourceLine(envelope.from, envelope.name)}\n${body}`;
 }
 
@@ -88,7 +83,6 @@ export function parseAgentEnvelope(text: string): AgentEnvelope | undefined {
 	return {
 		from: match[1],
 		name: match[2] || undefined,
-		expectsReply: Boolean(tail),
 		body,
 	};
 }

@@ -196,8 +196,8 @@ node --test 'tests/pi-bg.test.ts'
 
 两个工具：
 
-- `agent { prompt, name?, model?, thinking?, resume?, destroy_time?, expects_reply? }`：拉起子 agent，等 pi 就绪且 prompt 送达后返回 id / name，不等结果。`name` 是 hc 终端名（侧边栏显示），1–32 位 `[a-z0-9._-]`、活终端间唯一，非法或重名直接报错；省略用 agent id。`model` / `thinking` 省略时继承父 agent 当前值。答案不会自动回来：子 agent 要用 `agent_job send` 发给你。`destroy_time` 控制空闲销毁（见下文），默认 180 秒，`0` 表示永不销毁。
-- `agent_job { action, id?, message?, expects_reply? }`：`list`（只看得到自己、一级父、一级子、兄弟）、`send`（发给任意 agent，派活与回信都用它，不检查对方状态）、`stop`（只能停自己的后代；先发 ctrl+d 请它自己退出，宽限内没走再硬杀）。`expects_reply: true` 会在对方收到的消息末尾挂一个 `<reply to="你的id">…</reply>` 元素，告诉它用 `send` 回你；不带就是普通消息。派发规则见下。
+- `agent { prompt, name?, model?, thinking?, resume?, destroy_time? }`：拉起子 agent，等 pi 就绪且 prompt 送达后返回 id / name，不等结果。`name` 是 hc 终端名（侧边栏显示），1–32 位 `[a-z0-9._-]`、活终端间唯一，非法或重名直接报错；省略用 agent id。`model` / `thinking` 省略时继承父 agent 当前值。答案不会自动回来：子 agent 要用 `agent_job send` 发给你。`destroy_time` 控制空闲销毁（见下文），默认 180 秒，`0` 表示永不销毁。
+- `agent_job { action, id?, message? }`：`list`（只看得到自己、一级父、一级子、兄弟）、`send`（发给任意 agent，派活与回信都用它，不检查对方状态）、`stop`（只能停自己的后代；先发 ctrl+d 请它自己退出，宽限内没走再硬杀）。每条 agent 消息末尾固定挂一个 `<reply to="你的id">Your output is not sent back automatically. Use agent_job send to reply.</reply>`：输出不会自动回到发送方，要回就用 `send`。派发规则见下。
 
 人工入口：`/agent list` 以**卡片式森林**渲染当前 hc session 的 agent 树——每棵独立的树一块（`▌` 引导），名字在前、id 在后，状态右对齐（不显示 cwd）；根显示 pi 会话名（无会话名时 `(root)`）；`●` 自己、`↑` 父 agent，父终端已消失的 agent 标「失联」。
 
@@ -210,6 +210,7 @@ node --test 'tests/pi-bg.test.ts'
 约束：
 
 - **派发**：一轮只有一个发起人，就是叫醒这一轮的那条消息的发送方。我空闲就开一轮；我忙时，发起人再发来的消息直接插进当前轮，别人发来的被吞掉、按发送方排队（同一发送方最多一条，位置不变）。收工时扩展一条消息也不发：回不回、回给谁，由 agent 自己用 `send` 决定。设计取舍见 [ADR-0012](docs/adr/0012-agent-replies-are-sends.md)。
+- **等回信**：发消息给某个 agent 后，扩展记一笔账并每 10 秒查一次它整棵子树的存活；子树全退了还没收到回信，就给本地 agent 补一条 `Agent <id> ("<name>") exited without replying.`。收到该 agent 的任何消息就销账。这是扩展唯一自己发的消息。
 - **空闲销毁**：子 agent 在 settle 之后开始计时，安静满 `destroy_time`（默认 180 秒）就自己 `ctx.shutdown()`，pi 退出后 hc 按 `rm: true` 删掉终端；会话文件仍在磁盘上，按 id `resume` 就能回来。`0` 表示永不销毁。
 - 只有「安静」才计时：还有活的子终端、运行中的后台任务（pi-bg）、进程内子 agent（pi-subagents）、cron job（pi-cron），或排队里还有没处理的消息，都不算；中间两项经 `lib/activity.ts` 的忙探测登记表汇总，没加载的扩展按「不忙」处理。任何新入站（`send` / 人打字 / cron 投递）立即清零。
 - 每 30 秒一拍检查，销毁最多迟到一拍；`hc.list` 读不到时按「忙」处理。一个 `destroy_time: 0` 的子 agent 会永久钉住父 agent（父永远有子），要收尾就用 `stop` 或删 cron。

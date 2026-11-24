@@ -270,7 +270,7 @@ test("root registers agent and agent_job; depth 2 registers only agent_job", asy
 test("agent tool exposes destroy_time and no longer the old parameter name", async () => {
 	const { pi } = await setup();
 	const schema = pi.tools.get("agent")?.parameters as { properties: Record<string, { description?: string }> };
-	assert.deepEqual(Object.keys(schema.properties).sort(), ["destroy_time", "expects_reply", "model", "name", "prompt", "resume", "thinking"]);
+	assert.deepEqual(Object.keys(schema.properties).sort(), ["destroy_time", "model", "name", "prompt", "resume", "thinking"]);
 	assert.match(schema.properties.destroy_time.description ?? "", /^Seconds of idleness before the agent process is destroyed/);
 });
 
@@ -327,27 +327,23 @@ test("agent launches pi with identity env, labels and the source line", async ()
 	assert.equal(send.caller, "t4m");
 	const envelope = parseAgentEnvelope(String(send.text));
 	assert.equal(envelope?.from, "t4m");
-	assert.equal(envelope?.expectsReply, false); // 没给 expects_reply：普通消息，不带标记
 	assert.equal(envelope?.name, undefined); // 根没有注入的名字，会话也未命名
 	assert.equal(envelope?.body, "do the thing");
 	assert.ok(text.includes(id));
 });
 
-test("expects_reply appends a reply element to the delivered message", async () => {
+test("every delivered message carries the reply hint", async () => {
 	const hc = new FakeHc();
 	const { pi } = await setup({ hc });
 
-	await pi.tools.get("agent")!.execute("call", { prompt: "x", expects_reply: true }, undefined, undefined, context());
-	await pi.tools.get("agent")!.execute("call", { prompt: "y" }, undefined, undefined, context());
+	await pi.tools.get("agent")!.execute("call", { prompt: "x" }, undefined, undefined, context());
 
-	const marked = String(hc.callsOf("send")[0].params.text);
+	const sent = String(hc.callsOf("send")[0].params.text);
 	assert.equal(
-		marked,
-		'<agent t4m>\nx\n\n<reply to="t4m">Reply with agent_job send when you have an answer.</reply>',
+		sent,
+		'<agent t4m>\nx\n\n<reply to="t4m">Your output is not sent back automatically. Use agent_job send to reply.</reply>',
 	);
-	assert.equal(parseAgentEnvelope(marked)?.expectsReply, true);
-	assert.equal(parseAgentEnvelope(marked)?.body, "x");
-	assert.equal(parseAgentEnvelope(String(hc.callsOf("send")[1].params.text))?.expectsReply, false);
+	assert.equal(parseAgentEnvelope(sent)?.body, "x");
 });
 
 test("agent defaults model and thinking to the caller's", async () => {
@@ -429,18 +425,8 @@ test("send never checks the target's status", async () => {
 	assert.equal(send.terminal, "t10");
 	assert.equal(send.if, undefined); // 不再带状态前置条件
 	const envelope = parseAgentEnvelope(String(send.text));
-	assert.equal(envelope?.expectsReply, false); // 没给 expects_reply：不带标记
 	assert.equal(envelope?.body, "hi");
-
-	// 要回答时带一份标记：接收方的首行会写 `· expects reply`。
-	await pi.tools.get("agent_job")!.execute(
-		"call",
-		{ action: "send", id: "aaaa", message: "please answer", expects_reply: true },
-		undefined,
-		undefined,
-		context(),
-	);
-	assert.equal(parseAgentEnvelope(String(hc.callsOf("send")[1].params.text))?.expectsReply, true);
+	assert.match(String(send.text), /<reply to="t4m">Your output is not sent back automatically/);
 });
 
 test("stop only reaches descendants, and asks first before killing", async () => {
@@ -545,7 +531,7 @@ test("dispatch: idle starts a round, the owner steers, others queue and merge", 
 	assert.deepEqual(
 		await pi.emit("input", {
 			type: "input",
-			text: formatAgentEnvelope({ from: "bbbb", body: "task B1", expectsReply: true }),
+			text: formatAgentEnvelope({ from: "bbbb", body: "task B1" }),
 			streamingBehavior: "steer",
 		}),
 		{ action: "handled" },
@@ -575,8 +561,8 @@ test("dispatch: idle starts a round, the owner steers, others queue and merge", 
 	assert.equal(pi.userMessages.length, 1);
 	const next = parseAgentEnvelope(pi.userMessages[0]);
 	assert.equal(next?.from, "bbbb");
-	assert.equal(next?.expectsReply, true); // 合并进来的那条带标记，起轮时首行照样带
 	assert.equal(next?.body, "task B1\n\ntask B2");
+	assert.match(String(pi.userMessages[0]), /<reply to="bbbb">Your output is not sent back automatically/);
 
 	// 下一轮收工：起 Z。
 	await pi.emit("agent_start");
@@ -633,6 +619,54 @@ test("settling never messages anyone on its own: replies only happen through sen
 	const envelope = parseAgentEnvelope(String(send.text));
 	assert.equal(envelope?.from, "abcd");
 	assert.equal(envelope?.body, "the answer");
+});
+
+test("an ask without a reply is reported once the target's whole subtree is gone", async () => {
+	const hc = new FakeHc();
+	hc.terminals = [
+		terminal({ address: "t4m", labels: {} }),
+		terminal({ address: "t10", name: "kid", labels: { "pi.agent": "aaaa" }, parent: "t4m" }),
+	];
+	const scheduler = manualSchedule();
+	const { pi } = await setup({ hc, schedule: scheduler.schedule });
+
+	await pi.tools
+		.get("agent_job")!
+		.execute("call", { action: "send", id: "aaaa", message: "hi" }, undefined, undefined, context());
+	assert.equal(scheduler.ticks.length, 1);
+
+	// 孙子还活着：这一棵还没收场，继续等。
+	hc.terminals = [
+		terminal({ address: "t4m", labels: {} }),
+		terminal({ address: "t11", name: "grandkid", labels: { "pi.agent": "bbbb" }, parent: "t10" }),
+	];
+	await tickOnce(scheduler.ticks.shift());
+	assert.deepEqual(pi.userMessages, []);
+
+	// 整个子树都没了：给本地 agent 补一条。
+	hc.terminals = [terminal({ address: "t4m", labels: {} })];
+	await tickOnce(scheduler.ticks.shift());
+	assert.deepEqual(pi.userMessages, ['Agent aaaa ("kid") exited without replying.']);
+	assert.equal(scheduler.ticks.length, 0); // 账销了，不再盯
+});
+
+test("a reply cancels the pending death notice", async () => {
+	const hc = new FakeHc();
+	hc.terminals = [
+		terminal({ address: "t4m", labels: {} }),
+		terminal({ address: "t10", name: "kid", labels: { "pi.agent": "aaaa" }, parent: "t4m" }),
+	];
+	const scheduler = manualSchedule();
+	const { pi } = await setup({ hc, schedule: scheduler.schedule });
+
+	await pi.tools
+		.get("agent_job")!
+		.execute("call", { action: "send", id: "aaaa", message: "hi" }, undefined, undefined, context());
+	await pi.emit("input", { type: "input", text: formatAgentEnvelope({ from: "aaaa", name: "kid", body: "done" }) });
+
+	hc.terminals = [terminal({ address: "t4m", labels: {} })];
+	await tickOnce(scheduler.ticks.shift());
+	assert.deepEqual(pi.userMessages, []);
 });
 
 test("only quit tears down direct children", async () => {
@@ -872,24 +906,14 @@ test("resume applies destroy_time from the call, not from the session", async ()
 
 test("envelope round-trips and rejects foreign text", () => {
 	const text = formatAgentEnvelope({ from: "a7k2", name: "reviewer", body: "hi\nthere" });
-	assert.equal(text, '<agent a7k2 "reviewer">\nhi\nthere');
+	assert.equal(
+		text,
+		'<agent a7k2 "reviewer">\nhi\nthere\n\n<reply to="a7k2">Your output is not sent back automatically. Use agent_job send to reply.</reply>',
+	);
 	assert.deepEqual(parseAgentEnvelope(text), {
 		from: "a7k2",
 		name: "reviewer",
-		expectsReply: false,
 		body: "hi\nthere",
-	});
-
-	const withReply = formatAgentEnvelope({ from: "a7k2", expectsReply: true, body: "do it" });
-	assert.equal(
-		withReply,
-		'<agent a7k2>\ndo it\n\n<reply to="a7k2">Reply with agent_job send when you have an answer.</reply>',
-	);
-	assert.deepEqual(parseAgentEnvelope(withReply), {
-		from: "a7k2",
-		name: undefined,
-		expectsReply: true,
-		body: "do it",
 	});
 
 	assert.equal(parseAgentEnvelope("hello world"), undefined);
@@ -902,7 +926,6 @@ test("envelope round-trips and rejects foreign text", () => {
 	assert.deepEqual(parseAgentEnvelope('<agent a7k2 "boss">'), {
 		from: "a7k2",
 		name: "boss",
-		expectsReply: false,
 		body: "",
 	});
 });
@@ -981,7 +1004,6 @@ test("hc transport wrapper is unwrapped before the envelope", () => {
 	assert.deepEqual(parseAgentEnvelope(wrapped), {
 		from: "a7k2",
 		name: undefined,
-		expectsReply: false,
 		body: "hi",
 	});
 	assert.equal(stripHcTransport(wrapped), formatAgentEnvelope({ from: "a7k2", body: "hi" }));
