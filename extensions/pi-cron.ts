@@ -380,7 +380,7 @@ export default function (pi: ExtensionAPI) {
 		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
 		box.addChild(
 			new Text(
-				theme.bold(theme.fg("customMessageLabel", "cron")) + theme.fg("muted", ` ${id}${schedule}`) + theme.fg("dim", meta),
+				theme.fg("toolTitle", theme.bold("cron")) + theme.fg("muted", ` ${id}${schedule}`) + theme.fg("dim", meta),
 				0,
 				0,
 			),

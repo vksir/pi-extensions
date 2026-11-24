@@ -26,12 +26,12 @@
 | 类别 | token | 默认深色主题 |
 |---|---|---|
 | 出站：工具调用头行的**工具名**（`agent` / `agent_job` / `cron` / `bash_bg` / `codemode_bg` / `bg_job`） | `toolTitle` + 加粗 | 默认前景色（白） |
-| 回传：消息卡片的类型标签（`agent_message` / `bg_job` / `cron`，紫底 `customMessageBg`） | `customMessageLabel` + 加粗 | 紫 |
+| 回传：消息卡片的类型标签（`agent_message` / `bg_job` / `cron`，紫底 `customMessageBg`） | `toolTitle` + 加粗 | 白 |
 | 名字、id、参数、正文 | `muted` | 灰 |
 | 次级信息（类型、时间、折叠提示） | `dim` | 淡灰 |
 | 失败、异常 | `error` | 红 |
 
-- **加粗的字体跟着底色走**：紫底（`customMessageBg`）里的加粗文本用紫（`customMessageLabel`）；绿底（`toolSuccessBg`）里的加粗文本用白（`toolTitle`）。
+- 加粗文本一律用白（`toolTitle`），紫底（`customMessageBg`）与绿底（`toolSuccessBg`）都一样。
 - 工具行里只有工具名加粗（白色）；子动作（`send` / `stop` / `resume` / `list` / `create` …）、名字、id、参数一律灰色（`muted`）、不加粗。
 - 卡片正文按行染 `muted`：pi 每行结束会重置样式，多行字符串要逐行包色。
 

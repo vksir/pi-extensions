@@ -11,9 +11,8 @@
  *   line04
  *   … 6 more lines · ctrl+o
  *
- * 展开（ctrl+o）后显示全文。统一风格：紫色底（`customMessageBg`）里加粗的字用紫色——
- * `agent_message` 加粗 + `customMessageLabel`；`← name (id)` 与正文都是灰色（`muted`，不加粗），
- * `· type` 用 `dim`。
+ * 展开（ctrl+o）后显示全文。统一风格：紫底白字——`agent_message` 加粗 + `toolTitle`（默认白）；
+ * `← name (id)` 与正文都是灰色（`muted`，不加粗），`· type` 用 `dim`。
  * 正文顶格，不缩进。模型看到的仍是完整 XML，卡片只是 TUI 视图。
  */
 
@@ -43,7 +42,7 @@ export const agentMessageRenderer: MessageRenderer<AgentMessageDetails> = (messa
 	const kind = details?.type ?? "task";
 
 	const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
-	const label = theme.bold(theme.fg("customMessageLabel", "agent_message"));
+	const label = theme.fg("toolTitle", theme.bold("agent_message"));
 	box.addChild(
 		new Text(
 			`${label}  ${theme.fg("muted", `← ${who}`)}${theme.fg("dim", ` · ${kind}`)}`,

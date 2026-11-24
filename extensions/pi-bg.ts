@@ -838,7 +838,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 		// 头行由 details 重排：正文里的头行只给模型看，TUI 不重复渲染状态。
 		// 风格与 agent 消息卡片一致：紫色标签，id / 种类 / 标签用灰色，只有状态带颜色。
 		const headline = details
-			? `${theme.bold(theme.fg("customMessageLabel", "bg_job"))} ${theme.fg("muted", details.id)}` +
+			? `${theme.fg("toolTitle", theme.bold("bg_job"))} ${theme.fg("muted", details.id)}` +
 				theme.fg("dim", ` · ${details.kind}_bg · ${details.label}`) +
 				theme.fg(tone, ` — ${details.text}`)
 			: theme.fg(tone, head);
