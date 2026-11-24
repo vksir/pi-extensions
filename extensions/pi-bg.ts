@@ -490,7 +490,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 				renderCall(args, theme, context) {
 					const input = args as { command?: string };
 					return new Text(
-						theme.fg("success", theme.bold("bash_bg ")) +
+						theme.fg("toolTitle", theme.bold("bash_bg ")) +
 							theme.fg("muted", previewArg(input.command ?? "", context.expanded, theme)),
 						0,
 						0,
@@ -527,7 +527,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 				renderCall(args, theme, context) {
 					const input = args as { code?: string };
 					return new Text(
-						theme.fg("success", theme.bold("codemode_bg ")) +
+						theme.fg("toolTitle", theme.bold("codemode_bg ")) +
 							theme.fg("muted", previewArg(input.code ?? "", context.expanded, theme)),
 						0,
 						0,
@@ -598,8 +598,8 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 			},
 
 			renderCall(args, theme) {
-				const head = `bg_job ${args.action}${args.id ? ` ${args.id}` : ""}`;
-				return new Text(theme.fg("success", theme.bold(head)), 0, 0);
+				const head = `${theme.fg("toolTitle", theme.bold("bg_job"))} ${theme.fg("muted", args.action)}`;
+				return new Text(args.id ? `${head} ${theme.fg("muted", args.id)}` : head, 0, 0);
 			},
 
 			renderResult(result, { expanded }, theme) {
@@ -838,7 +838,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 		// 头行由 details 重排：正文里的头行只给模型看，TUI 不重复渲染状态。
 		// 风格与 agent 消息卡片一致：紫色标签，id / 种类 / 标签用灰色，只有状态带颜色。
 		const headline = details
-			? `${theme.bold(theme.fg("customMessageLabel", "bg_job"))} ${theme.fg("muted", details.id)}` +
+			? `${theme.fg("customMessageLabel", "bg_job")} ${theme.fg("muted", details.id)}` +
 				theme.fg("dim", ` · ${details.kind}_bg · ${details.label}`) +
 				theme.fg(tone, ` — ${details.text}`)
 			: theme.fg(tone, head);

@@ -14,8 +14,9 @@
  *   继续，把缺失的测试补上
  *   reviewer (a7k2) · resumed
  *
- * 头行绿色加粗（`success` token）；正文 `muted`，折叠 3 行 / 每行 100 字符；结果行 `muted`，
- * 出错时用 `error`。拉起的 id 到结果行才能拿到，头行只有名字。
+ * 头行：工具名 `agent` 白色加粗（`toolTitle`），`resume`、名字、id 都是灰色；
+ * 正文 `muted`，折叠 3 行 / 每行 100 字符；结果行 `muted`，出错时用 `error`。
+ * 拉起的 id 到结果行才能拿到，头行只有名字。
  */
 
 import type { AgentToolResult, ToolRenderers } from "@earendil-works/pi-coding-agent";
@@ -47,13 +48,10 @@ export function createAgentLaunchRenderers(
 ): Pick<ToolRenderers, "renderCall" | "renderResult"> {
 	const renderCall: NonNullable<ToolRenderers["renderCall"]> = (raw, theme, context) => {
 		const args = raw as AgentLaunchArgs;
-		const verb = args.resume ? "agent resume" : "agent";
-		const target = args.resume
-			? ` ${agentLabel(args.resume, resolveName(args.resume))}`
-			: args.name
-				? ` ${args.name}`
-				: "";
-		const head = theme.fg("success", theme.bold(`${verb}${target}`));
+		const tool = theme.fg("toolTitle", theme.bold("agent"));
+		const verb = args.resume ? `${tool} ${theme.fg("muted", "resume")}` : tool;
+		const target = args.resume ? agentLabel(args.resume, resolveName(args.resume)) : args.name;
+		const head = target ? `${verb} ${theme.fg("muted", target)}` : verb;
 		if (!args.prompt) return new Text(head, 0, 0);
 
 		const hint = context.keyHint("app.tools.expand", "to expand");

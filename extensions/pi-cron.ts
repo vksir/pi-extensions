@@ -380,7 +380,7 @@ export default function (pi: ExtensionAPI) {
 		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
 		box.addChild(
 			new Text(
-				theme.bold(theme.fg("customMessageLabel", "cron")) + theme.fg("muted", ` ${id}${schedule}`) + theme.fg("dim", meta),
+				theme.fg("customMessageLabel", "cron") + theme.fg("muted", ` ${id}${schedule}`) + theme.fg("dim", meta),
 				0,
 				0,
 			),
@@ -630,8 +630,8 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args, theme) {
-			let text = theme.fg("success", theme.bold(`cron ${args.action}`));
-			if (args.cron) text += ` ${theme.fg("dim", args.cron)}`;
+			let text = `${theme.fg("toolTitle", theme.bold("cron"))} ${theme.fg("muted", args.action)}`;
+			if (args.cron) text += ` ${theme.fg("muted", args.cron)}`;
 			if (args.id) text += ` ${theme.fg("muted", args.id)}`;
 			return new Text(text, 0, 0);
 		},

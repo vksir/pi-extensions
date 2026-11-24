@@ -25,13 +25,13 @@
 
 | 类别 | token | 默认深色主题 |
 |---|---|---|
-| 出站：主动发起的工具调用头行（`agent` / `agent_job` / `cron` / `bash_bg` / `codemode_bg` / `bg_job`） | `success` + 加粗 | 绿 |
-| 回传：消息卡片的类型标签（`agent_message` / `bg_job` / `cron`） | `customMessageLabel` + 加粗 | 紫 |
+| 出站：工具调用头行的**工具名**（`agent` / `agent_job` / `cron` / `bash_bg` / `codemode_bg` / `bg_job`） | `toolTitle` + 加粗 | 默认前景色（白） |
+| 回传：消息卡片的类型标签（`agent_message` / `bg_job` / `cron`） | `customMessageLabel`（不加粗） | 紫 |
 | 名字、id、参数、正文 | `muted` | 灰 |
 | 次级信息（类型、时间、折叠提示） | `dim` | 淡灰 |
 | 失败、异常 | `error` | 红 |
 
-- 名字和 id 只做标识，不加粗、不着色（灰色 `muted`）。
+- 只有工具名加粗，且加粗一律白色（`toolTitle`）；子动作（`send` / `stop` / `resume` / `list` / `create` …）、名字、id、参数一律灰色（`muted`）、不加粗。
 - 卡片正文按行染 `muted`：pi 每行结束会重置样式，多行字符串要逐行包色。
 
 ## 折叠与展开

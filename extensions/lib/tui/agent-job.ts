@@ -11,7 +11,7 @@
  *   … (3 more lines, ctrl+o to expand)
  *   Sent to 21f943 (reviewer).
  *
- * 展开（ctrl+o）后显示全部正文。头行（`agent_job <action> name (id)`）用绿色（`success`）加粗，
+ * 展开（ctrl+o）后显示全部正文。头行：工具名 `agent_job` 白色加粗，子动作（send/stop）与 `name (id)` 灰色；
  * 正文用 `muted`；list / stop 只出头行，不带正文。
  */
 
@@ -55,8 +55,8 @@ export function createAgentJobRenderCall(
 	return (raw, theme, context) => {
 		const args = raw as unknown as AgentJobCallArgs;
 		const action = args.action ?? "";
-		const target = args.id ? ` ${agentLabel(args.id, resolveName(args.id))}` : "";
-		const head = theme.fg("success", theme.bold(`agent_job ${action}${target}`));
+		const verb = `${theme.fg("toolTitle", theme.bold("agent_job"))} ${theme.fg("muted", action)}`;
+		const head = args.id ? `${verb} ${theme.fg("muted", agentLabel(args.id, resolveName(args.id)))}` : verb;
 		if (args.action !== "send" || !args.message) return new Text(head, 0, 0);
 
 		const hint = context.keyHint("app.tools.expand", "to expand");
