@@ -42,6 +42,7 @@ interface FakePi {
 			parameters?: unknown;
 			execute: (...args: unknown[]) => Promise<ToolCallResult>;
 			renderCall?: (args: any, theme: any, context: any) => { render(width: number): string[] };
+			renderResult?: (result: any, options: any, theme: any, context: any) => { render(width: number): string[] };
 		}
 	>;
 	handlers: Map<string, ((...args: unknown[]) => unknown)[]>;
@@ -58,6 +59,7 @@ interface FakePi {
 		parameters?: unknown;
 		execute: (...args: unknown[]) => Promise<ToolCallResult>;
 		renderCall?: (args: any, theme: any, context: any) => { render(width: number): string[] };
+		renderResult?: (result: any, options: any, theme: any, context: any) => { render(width: number): string[] };
 	}) => void;
 	on: (event: string, handler: (...args: unknown[]) => unknown) => void;
 	registerCommand: (name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> | void }) => void;
@@ -406,7 +408,7 @@ test("agent messages render as a card, collapsed when long", async () => {
 				display: true,
 				details: { from: "aaaa", name: "kid", type: "reply", body },
 			},
-			{ expanded, outputPad: 0 },
+			{ expanded, outputPad: 0, keyHint: (_id: string, description: string) => `ctrl+o ${description}` },
 			theme,
 		);
 		assert.ok(box);
@@ -445,6 +447,52 @@ test("agent_job send renders the message under a bold header, collapsed when lon
 	const expanded = render({ action: "send", id: "aaaa", message: body }, true);
 	assert.equal(expanded.filter((line) => /^line \d+$/.test(line)).length, 6);
 	assert.deepEqual(render({ action: "list" }, false), ["agent_job list"]);
+});
+
+test("launch row shows the name and the result line adds the id", async () => {
+	const { pi } = await setup();
+	const tool = pi.tools.get("agent")!;
+	const theme = { fg: (_token: string, text: string) => text, bold: (text: string) => text };
+	const context = { expanded: false, keyHint: (_id: string, description: string) => `ctrl+o ${description}` };
+
+	const call = tool
+		.renderCall!({ prompt: "Fix it", name: "reviewer" }, theme, context)
+		.render(80)
+		.map((line) => line.trim());
+	assert.equal(call[0], "agent reviewer");
+	assert.ok(call.includes("Fix it"));
+
+	const result = tool
+		.renderResult!(
+			{
+				content: [{ type: "text", text: "Started agent 7f3a as 'reviewer'." }],
+				details: { action: "start", id: "7f3a", name: "reviewer" },
+			},
+			{ expanded: false, isPartial: false },
+			theme,
+			context,
+		)
+		.render(80)
+		.map((line) => line.trim());
+	assert.deepEqual(result, ["reviewer (7f3a) · started"]);
+});
+
+test("agent_job header uses the cached display name", async () => {
+	const hc = new FakeHc();
+	hc.terminals = [terminal({ address: "t10", name: "kid", labels: { "pi.agent": "aaaa" }, parent: "t4m" })];
+	const { pi } = await setup({ hc });
+
+	// list 会刷新 id → name 缓存，之后 send 的头部就能带上名字。
+	await pi.tools.get("agent_job")!.execute("call", { action: "list" }, undefined, undefined, context());
+
+	const theme = { fg: (_token: string, text: string) => text, bold: (text: string) => text };
+	const context2 = { expanded: false, keyHint: (_id: string, description: string) => `ctrl+o ${description}` };
+	const lines = pi
+		.tools.get("agent_job")!
+		.renderCall!({ action: "send", id: "aaaa", message: "hi" }, theme, context2)
+		.render(80)
+		.map((line) => line.trim());
+	assert.equal(lines[0], "agent_job send kid (aaaa)");
 });
 
 test("agent defaults model and thinking to the caller's", async () => {
@@ -1174,10 +1222,10 @@ test("formatAgentTree renders cards with self, parent and orphan marks", () => {
 	const text = formatAgentTree(rows).map(treeText);
 
 	assert.equal(text[0], "agent 树 · 5 个 agent");
-	assert.ok(text.some((line) => line.includes("▌ ↑ root  ·  t4m")));
-	assert.ok(text.some((line) => line.includes("● reviewer  ·  aaaa")));
-	assert.ok(text.some((line) => line.includes("└─ deep  ·  bbbb")));
-	assert.ok(text.some((line) => line.includes("lost  ·  dddd") && line.includes("失联")));
+	assert.ok(text.some((line) => line.includes("▌ ↑ root (t4m)")));
+	assert.ok(text.some((line) => line.includes("● reviewer (aaaa)")));
+	assert.ok(text.some((line) => line.includes("└─ deep (bbbb)")));
+	assert.ok(text.some((line) => line.includes("lost (dddd)") && line.includes("失联")));
 	assert.equal(text.at(-1), "● 自己   ↑ 父 agent   失联 = 父终端已消失");
 
 	assert.deepEqual(formatAgentTree([]).map(treeText), ["没有正在运行的 agent。"]);
@@ -1366,13 +1414,13 @@ test("/agent list shows the current tree, /agent list-all shows every tree", asy
 	assert.equal(entry?.type, "pi-herdr-agent:tree");
 	const text = (entry?.data.lines as TreeLine[]).map(treeText);
 	assert.ok(text.some((line) => line.startsWith("agent 树")));
-	assert.ok(text.some((line) => line.includes("● reviewer  ·  aaaa")));
+	assert.ok(text.some((line) => line.includes("● reviewer (aaaa)")));
 	assert.ok(!text.some((line) => line.includes("stranger")));
 
 	await handler("list-all", context());
 	const all = (pi.entries.at(-1)?.data.lines as TreeLine[]).map(treeText);
 	assert.ok(all.some((line) => line.startsWith("全部 agent 树")));
-	assert.ok(all.some((line) => line.includes("stranger  ·  cccc")));
+	assert.ok(all.some((line) => line.includes("stranger (cccc)")));
 });
 
 test("subagent done OSC is rewritten to idle", () => {

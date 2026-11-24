@@ -490,7 +490,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 				renderCall(args, theme, context) {
 					const input = args as { command?: string };
 					return new Text(
-						theme.fg("toolTitle", theme.bold("bash_bg ")) +
+						theme.fg("success", theme.bold("bash_bg ")) +
 							theme.fg("muted", previewArg(input.command ?? "", context.expanded, theme)),
 						0,
 						0,
@@ -527,7 +527,7 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 				renderCall(args, theme, context) {
 					const input = args as { code?: string };
 					return new Text(
-						theme.fg("toolTitle", theme.bold("codemode_bg ")) +
+						theme.fg("success", theme.bold("codemode_bg ")) +
 							theme.fg("muted", previewArg(input.code ?? "", context.expanded, theme)),
 						0,
 						0,
@@ -598,9 +598,8 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 			},
 
 			renderCall(args, theme) {
-				let text = theme.fg("toolTitle", theme.bold("bg_job ")) + theme.fg("muted", args.action);
-				if (args.id) text += ` ${theme.fg("accent", args.id)}`;
-				return new Text(text, 0, 0);
+				const head = `bg_job ${args.action}${args.id ? ` ${args.id}` : ""}`;
+				return new Text(theme.fg("success", theme.bold(head)), 0, 0);
 			},
 
 			renderResult(result, { expanded }, theme) {
@@ -836,15 +835,17 @@ export function registerPiBg(pi: ExtensionAPI, codemode: ToolDefinition | null, 
 		const { head, body } = splitDelivery(raw);
 
 		const tone = details?.status === "failed" ? "error" : details?.status === "done" ? "success" : "warning";
-		// 头行由 details 重排：正文里的头行只给模型看，TUI 不重复渲染状态
+		// 头行由 details 重排：正文里的头行只给模型看，TUI 不重复渲染状态。
+		// 风格与 agent 消息卡片一致：紫色标签，id / 种类 / 标签用灰色，只有状态带颜色。
 		const headline = details
-			? theme.fg("customMessageText", `[bg_job ${details.id}] ${details.kind}_bg · ${details.label}`) +
+			? `${theme.bold(theme.fg("customMessageLabel", "bg_job"))} ${theme.fg("muted", details.id)}` +
+				theme.fg("dim", ` · ${details.kind}_bg · ${details.label}`) +
 				theme.fg(tone, ` — ${details.text}`)
 			: theme.fg(tone, head);
 
 		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
-		box.addChild(new Text(theme.fg("customMessageLabel", "\x1b[1m[bg]\x1b[22m ") + headline, 0, 0));
-		if (body) box.addChild(new Text(body, 0, 0));
+		box.addChild(new Text(headline, 0, 0));
+		if (body) box.addChild(new Text(body.split("\n").map((line) => theme.fg("muted", line)).join("\n"), 0, 0));
 		return box;
 	});
 }

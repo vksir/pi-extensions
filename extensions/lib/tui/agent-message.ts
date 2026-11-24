@@ -11,8 +11,8 @@
  *   line04
  *   … 6 more lines · ctrl+o
  *
- * 展开（ctrl+o）后显示全文。头行 `agent_message` 加粗、用 `customMessageLabel`（默认主题是紫），
- * 整块铺 `customMessageBg`；类型色：task = accent、reply = success、notice = warning。
+ * 展开（ctrl+o）后显示全文。统一风格：`agent_message` 加粗紫色（`customMessageLabel`）作为类型标签，
+ * `← name (id)` 与正文都是灰色（`muted`，不加粗），`· type` 用 `dim`；整块铺 `customMessageBg`。
  * 正文顶格，不缩进。模型看到的仍是完整 XML，卡片只是 TUI 视图。
  */
 
@@ -40,18 +40,27 @@ export const agentMessageRenderer: MessageRenderer<AgentMessageDetails> = (messa
 	const from = details?.from ?? "?";
 	const who = details?.name ? `${details.name} (${from})` : from;
 	const kind = details?.type ?? "task";
-	const tone = kind === "reply" ? "success" : kind === "notice" ? "warning" : "accent";
 
 	const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
 	const label = theme.bold(theme.fg("customMessageLabel", "agent_message"));
-	box.addChild(new Text(`${label}${theme.fg(tone, `  ← ${who} · ${kind}`)}`, 0, 0));
+	box.addChild(
+		new Text(
+			`${label}  ${theme.fg("muted", `← ${who}`)}${theme.fg("dim", ` · ${kind}`)}`,
+			0,
+			0,
+		),
+	);
 	if (!body) return box;
 
 	const lines = body.split("\n");
 	const collapsed = !options.expanded && lines.length > COLLAPSED_LINES;
-	box.addChild(new Text((collapsed ? lines.slice(0, COLLAPSED_LINES) : lines).join("\n"), 0, 0));
+	const shown = collapsed ? lines.slice(0, COLLAPSED_LINES) : lines;
+	box.addChild(new Text(shown.map((line) => theme.fg("muted", line)).join("\n"), 0, 0));
 	if (collapsed) {
-		box.addChild(new Text(theme.fg("dim", `… ${lines.length - COLLAPSED_LINES} more lines · ctrl+o`), 0, 0));
+		const hint = options.keyHint("app.tools.expand", "to expand");
+		box.addChild(
+			new Text(theme.fg("dim", `… ${lines.length - COLLAPSED_LINES} more lines · ${hint}`), 0, 0),
+		);
 	}
 	return box;
 };

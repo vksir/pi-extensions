@@ -11,12 +11,13 @@
  *   … (3 more lines, ctrl+o to expand)
  *   Sent to 21f943 (reviewer).
  *
- * 展开（ctrl+o）后显示全部正文。头行（`agent_job <action> <id>`）加粗，颜色沿用工具默认
- * （`toolTitle`），正文用 `muted`；list / stop 只出头行，不带正文。
+ * 展开（ctrl+o）后显示全部正文。头行（`agent_job <action> name (id)`）用绿色（`success`）加粗，
+ * 正文用 `muted`；list / stop 只出头行，不带正文。
  */
 
 import type { Theme, ToolRenderers } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { agentLabel } from "./names.ts";
 
 /** 工具调用行只关心这三个字段；具体参数类型由扩展保证。 */
 export interface AgentJobCallArgs {
@@ -47,13 +48,18 @@ export function previewArg(text: string, expanded: boolean, theme: Theme, hint: 
 	return `${shown.join("\n")}\n${theme.fg("dim", `… (${detail}, `)}${hint}${theme.fg("dim", ")")}`;
 }
 
-/** 渲染工具调用行；挂到 `agent_job` 的 `renderCall` 上。 */
-export const renderAgentJobCall: NonNullable<ToolRenderers["renderCall"]> = (raw, theme, context) => {
-	const args = raw as unknown as AgentJobCallArgs;
-	const action = args.action ?? "";
-	const head = theme.fg("toolTitle", theme.bold(`agent_job ${action}${args.id ? ` ${args.id}` : ""}`));
-	if (args.action !== "send" || !args.message) return new Text(head, 0, 0);
+/** 渲染工具调用行；扩展用 `createAgentJobRenderCall(resolveName)` 产出后挂到 `agent_job.renderCall`。 */
+export function createAgentJobRenderCall(
+	resolveName: (id: string) => string | undefined,
+): NonNullable<ToolRenderers["renderCall"]> {
+	return (raw, theme, context) => {
+		const args = raw as unknown as AgentJobCallArgs;
+		const action = args.action ?? "";
+		const target = args.id ? ` ${agentLabel(args.id, resolveName(args.id))}` : "";
+		const head = theme.fg("success", theme.bold(`agent_job ${action}${target}`));
+		if (args.action !== "send" || !args.message) return new Text(head, 0, 0);
 
-	const hint = context.keyHint("app.tools.expand", "to expand");
-	return new Text(`${head}\n${theme.fg("muted", previewArg(args.message, context.expanded, theme, hint))}`, 0, 0);
+		const hint = context.keyHint("app.tools.expand", "to expand");
+		return new Text(`${head}\n${theme.fg("muted", previewArg(args.message, context.expanded, theme, hint))}`, 0, 0);
+	};
 }

@@ -21,7 +21,18 @@
 
 - 只用主题 token：`theme.fg("muted", …)`、`theme.bg("customMessageBg", …)`。可用的 token 见 pi 的 `THEME_TOKENS`（`accent` / `success` / `warning` / `error` / `muted` / `dim` / `toolTitle` / `customMessageLabel` / `customMessageBg` …）。
 - 不写死 ANSI、RGB 或 256 色；换主题要能跟着变。
-- 类型色约定：`task` → `accent`，`reply` → `success`，`notice` → `warning`。
+- 统一配色（全仓库一致）：
+
+| 类别 | token | 默认深色主题 |
+|---|---|---|
+| 出站：主动发起的工具调用头行（`agent` / `agent_job` / `cron` / `bash_bg` / `codemode_bg` / `bg_job`） | `success` + 加粗 | 绿 |
+| 回传：消息卡片的类型标签（`agent_message` / `bg_job` / `cron`） | `customMessageLabel` + 加粗 | 紫 |
+| 名字、id、参数、正文 | `muted` | 灰 |
+| 次级信息（类型、时间、折叠提示） | `dim` | 淡灰 |
+| 失败、异常 | `error` | 红 |
+
+- 名字和 id 只做标识，不加粗、不着色（灰色 `muted`）。
+- 卡片正文按行染 `muted`：pi 每行结束会重置样式，多行字符串要逐行包色。
 
 ## 折叠与展开
 

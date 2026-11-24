@@ -65,7 +65,8 @@ import { hasBusyActivity } from "./lib/activity.ts";
 import { errorMessage } from "./lib/errors.ts";
 import { ERROR_PREFIX, piHerdrAgentPrompt } from "./prompt/pi-herdr-agent.ts";
 import { AGENT_MESSAGE, agentMessageRenderer, type AgentMessageDetails } from "./lib/tui/agent-message.ts";
-import { renderAgentJobCall } from "./lib/tui/agent-job.ts";
+import { createAgentJobRenderCall } from "./lib/tui/agent-job.ts";
+import { createAgentLaunchRenderers } from "./lib/tui/agent-launch.ts";
 import {
 	agentTreeEntryRenderer,
 	TREE_ENTRY,
@@ -190,6 +191,27 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	let myId = injectedId || self;
 	let myRoot = env.PI_AGENT_ROOT?.trim() || myId;
 	const myDepth = Number.parseInt(env.PI_AGENT_DEPTH ?? "0", 10) || 0;
+
+	/**
+	 * id → 显示名缓存：每次读终端列表顺手刷新，供 TUI 渲染器显示 `name (id)`。
+	 * 查不到就只显示 id（渲染是同步的，不能为了一行头部再去打一次 I/O）。
+	 */
+	const knownNames = new Map<string, string>();
+	const rememberNames = (terminals: readonly HcTerminal[]): void => {
+		for (const terminal of terminals) {
+			const id = agentIdOf(terminal);
+			const name = terminal.name?.trim();
+			if (id && name) knownNames.set(id, name);
+		}
+	};
+	const resolveName = (id: string): string | undefined => knownNames.get(id);
+
+	/** `hc.list()` 的统一入口：顺手刷新名字缓存。 */
+	const listTerminals = async (): Promise<HcTerminal[]> => {
+		const terminals = await hc.list();
+		rememberNames(terminals);
+		return terminals;
+	};
 	// 空闲销毁：根 agent 没有这个 env（0 = 不销毁），子 agent 的秒数由拉起者按参数注入。
 	const destroyTime = parseDestroyTime(env[DESTROY_ENV]);
 	const now = options.now ?? (() => Date.now());
@@ -318,7 +340,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 
 		let terminals: HcTerminal[];
 		try {
-			terminals = await hc.list();
+			terminals = await listTerminals();
 		} catch {
 			// 读不到就下一拍再试，不能凭空宣布对方死了。
 			armReplyWatch();
@@ -419,7 +441,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		if (event.reason !== "quit") return;
 
 		try {
-			const terminals = await hc.list();
+			const terminals = await listTerminals();
 			const children = terminals.filter((terminal) => terminal.parent === self);
 			await Promise.allSettled(children.map((terminal) => hc.kill(terminal.address)));
 		} catch {
@@ -444,7 +466,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		if (!ctx.isIdle()) return false;
 		if (hasBusyActivity() || hasRunningSubagents()) return false;
 		try {
-			const terminals = await hc.list();
+			const terminals = await listTerminals();
 			return !terminals.some((terminal) => terminal.parent === self && terminal.state === "live");
 		} catch {
 			return false;
@@ -494,6 +516,9 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 
 	// ─── 工具：agent ───
 
+	const agentLaunchRenderers = createAgentLaunchRenderers(resolveName);
+	const agentJobRenderCall = createAgentJobRenderCall(resolveName);
+
 	const registerAgentTool = (): void => {
 		pi.registerTool({
 			name: "agent",
@@ -515,6 +540,9 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 				),
 			}),
 
+			renderCall: agentLaunchRenderers.renderCall,
+			renderResult: agentLaunchRenderers.renderResult,
+
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 				const typed = params as AgentParams;
 				try {
@@ -528,7 +556,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	};
 
 	const startAgent = async (params: AgentParams, ctx: ExtensionContext) => {
-		const terminals = await hc.list();
+		const terminals = await listTerminals();
 		const taken = new Set(
 			terminals
 				.filter((terminal) => terminal.state === "live")
@@ -564,7 +592,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 
 	const resumeAgent = async (params: AgentParams, ctx: ExtensionContext) => {
 		const id = params.resume!;
-		const terminals = await hc.list();
+		const terminals = await listTerminals();
 		if (terminals.some((terminal) => agentIdOf(terminal) === id && terminal.state === "live")) {
 			return fail(piHerdrAgentPrompt.results.errors.stillRunning(id), "resume", id);
 		}
@@ -667,6 +695,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			throw error;
 		}
 
+		knownNames.set(id, name);
 		const ready = await waitForReady(run.address, run.wait, run.output, run.state);
 		if (!ready.ok) {
 			await hc.kill(run.address).catch(() => undefined);
@@ -742,14 +771,14 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 				),
 			}),
 
-			renderCall: renderAgentJobCall,
+			renderCall: agentJobRenderCall,
 
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 				const typed = params as AgentJobParams;
 				try {
 					switch (typed.action) {
 						case "list": {
-							const terminals = await hc.list();
+							const terminals = await listTerminals();
 							// 只看自己、一级父、一级子、兄弟；爷爷、侄子、别的树都看不到。
 							const rows = buildRows(terminals, myId, self).filter((row) => row.relation !== "other");
 							return ok(formatRows(rows), { action: "list", agents: rows });
@@ -768,7 +797,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 
 	const stopJob = async (params: AgentJobParams) => {
 		if (!params.id) return fail(piHerdrAgentPrompt.results.errors.idRequired("stop"), "stop");
-		const terminals = await hc.list();
+		const terminals = await listTerminals();
 		const target = terminals.find((terminal) => agentIdOf(terminal) === params.id && terminal.state === "live");
 		if (!target) return fail(piHerdrAgentPrompt.results.errors.notRunning(params.id), "stop", params.id);
 		if (target.address === self)
@@ -854,7 +883,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	};
 
 	const requireTarget = async (id: string): Promise<{ terminal: HcTerminal; row: AgentRow }> => {
-		const terminals = await hc.list();
+		const terminals = await listTerminals();
 		const terminal = terminals.find((candidate) => agentIdOf(candidate) === id && candidate.state === "live");
 		if (!terminal) throw new Error(piHerdrAgentPrompt.results.errors.notRunning(id));
 		const row = buildRows(terminals, myId, self).find((candidate) => candidate.id === id);
@@ -889,7 +918,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			// 默认只看自己所在的树；list-all 才跨树。
 			const all = args === "list-all";
 			try {
-				const rows = buildRows(await hc.list(), myId, self);
+				const rows = buildRows(await listTerminals(), myId, self);
 				pi.appendEntry<TreeEntry>(TREE_ENTRY, {
 					lines: all ? formatAgentTree(rows, "全部 agent 树") : formatAgentTree(currentTree(rows, myId)),
 				});
@@ -1157,9 +1186,7 @@ export function formatAgentTree(rows: AgentRow[], title = "agent 树"): TreeLine
 		const marker = markerOf(row);
 		if (marker) left.push(marker);
 		left.push({ text: row.name, tone: row.relation === "self" ? "accent" : "text" });
-		if (row.name !== row.id) {
-			left.push({ text: "  ·  ", tone: "dim" }, { text: row.id, tone: "dim" });
-		}
+		if (row.name !== row.id) left.push({ text: ` (${row.id})`, tone: "dim" });
 		lines.push({ left, right: statusOf(row) });
 	};
 
