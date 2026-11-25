@@ -150,7 +150,6 @@ export interface RateFooterOptions {
 interface RateCache {
 	sessionId: string;
 	leafId: string | null;
-	entries: number;
 	rate?: number;
 	firstTokenMs?: number;
 }
@@ -164,21 +163,22 @@ export function createRateFooter(
 	const inner = new FooterComponent(footerSession(ctx), footerData);
 	let cached: RateCache | undefined;
 
-	// footer 每帧都渲染，而条目只在会话追加时变化；按条目数缓存，避免逐帧全量扫描。
+	// footer 每帧都渲染，而条目只在会话追加时变化。
+	// `getEntries()` 会整份拷贝会话（pi 自己都因此避免逐帧调用），所以先比 leaf：
+	// 只有 leaf 变了才重新取条目；同一个 leaf 下每帧只做两次 getter。
 	const measure = (): RateCache => {
-		const entries = ctx.sessionManager.getEntries();
 		const sessionId = ctx.sessionManager.getSessionId();
 		const leafId = ctx.sessionManager.getLeafId();
-		if (cached?.sessionId !== sessionId || cached.leafId !== leafId || cached.entries !== entries.length) {
-			const message = lastTimedResponse(entries);
-			cached = {
-				sessionId,
-				leafId,
-				entries: entries.length,
-				rate: message ? message.usage.output / ((message.durationMs ?? 0) / 1000) : undefined,
-				firstTokenMs: message ? options.firstTokenMs?.(message.timestamp) : undefined,
-			};
-		}
+		if (cached?.sessionId === sessionId && cached.leafId === leafId) return cached;
+
+		const entries = ctx.sessionManager.getEntries();
+		const message = lastTimedResponse(entries);
+		cached = {
+			sessionId,
+			leafId,
+			rate: message ? message.usage.output / ((message.durationMs ?? 0) / 1000) : undefined,
+			firstTokenMs: message ? options.firstTokenMs?.(message.timestamp) : undefined,
+		};
 		return cached;
 	};
 

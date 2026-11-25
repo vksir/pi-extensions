@@ -60,14 +60,22 @@ function notifyOSC99(title: string, body: string): void {
 	process.stdout.write(`\x1b]99;i=1:p=body;${body}\x1b\\`);
 }
 
+/** 拉起 PowerShell 失败过（缺 BurntToast、被策略拦住…）就不再每轮试：每次都是一次进程创建。 */
+let windowsNotifyBroken = false;
+
 function notifyWindows(title: string, body: string): void {
+	if (windowsNotifyBroken) return;
 	// Install-Module -Name BurntToast
 	// 单引号成对转义，防止目录名等文本破坏 PowerShell 命令
 	const esc = (text: string) => text.replace(/'/g, "''");
 	execFile(
 		"powershell.exe",
 		["-NoProfile", "-Command", `New-BurntToastNotification -Text '${esc(title)}', '${esc(body)}'`],
-		{ windowsHide: true },
+		{ windowsHide: true, timeout: 5000 },
+		(error) => {
+			// 没装 BurntToast 是常态：记下来，别每轮都再拉一次 PowerShell。
+			if (error) windowsNotifyBroken = true;
+		},
 	);
 }
 

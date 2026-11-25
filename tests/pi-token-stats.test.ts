@@ -153,10 +153,11 @@ test("createRateFooter：内置状态行里多一段首字时间与速率", () =
 	assert.match(lines[1], /deepseek-flash/);
 	assert.match(lines[1], /\(auto\)/);
 
-	// 条目数不变时不重复扫描会话内容：每帧只取一次条目列表用于比对
+	// leaf 没变时不碰 getEntries：它整份拷贝会话，逐帧调用会把长会话拖慢
 	const before = calls.entries;
 	footer.render(120);
-	assert.equal(calls.entries, before + 1);
+	footer.render(120);
+	assert.equal(calls.entries, before);
 });
 
 test("createRateFooter：没测到首字时间时只显示速率", () => {

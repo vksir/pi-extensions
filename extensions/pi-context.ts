@@ -262,9 +262,10 @@ export default function (pi: ExtensionAPI) {
 	 */
 	pi.on("context", (event) => {
 		if (pending) return;
-		const messages = event.messages.filter((message) => !isTrigger(message));
-		if (messages.length === event.messages.length) return;
-		return { messages };
+		// 每个请求都会走到这里：先无分配地扫一遍，只有真的夹着触发消息时才复制数组。
+		// 触发消息捕获后会在下一次请求里被剔掉，绝大多数请求走不到 filter。
+		if (!event.messages.some(isTrigger)) return;
+		return { messages: event.messages.filter((message) => !isTrigger(message)) };
 	});
 
 	/** 只做快照，不修改消息，也不替换 handler 的输出。 */
