@@ -24,7 +24,7 @@ import {
 	type AgentRow,
 } from "../extensions/pi-herdr-agent.ts";
 import { type TreeLine } from "../extensions/lib/tui/agent-tree.ts";
-import { HcError, type HcClient, type HcLabelParams, type HcRunParams, type HcRunResult, type HcSendParams, type HcSendResult, type HcTerminal, type HcWaitParams, type HcWaitResult } from "../extensions/lib/hc.ts";
+import { HcError, type HcClient, type HcLabelParams, type HcRunParams, type HcRunResult, type HcSendParams, type HcSendResult, type HcSubscribeParams, type HcSubscription, type HcTerminal, type HcWaitParams, type HcWaitResult, type HcWatchMessage } from "../extensions/lib/hc.ts";
 
 // ─── 测试替身 ───
 
@@ -154,11 +154,65 @@ function waitResult(overrides: Partial<HcWaitResult> = {}): HcWaitResult {
 	};
 }
 
+/** 按 hc 的 events filter 语义匹配一条终端记录。 */
+function matchesWatcher(
+	params: HcSubscribeParams,
+	record: HcTerminal | undefined,
+	address?: string,
+): boolean {
+	if (params.terminal && params.terminal !== (address ?? record?.address)) return false;
+	if (params.children_of && record?.parent !== params.children_of) return false;
+	for (const [key, value] of Object.entries(params.labels ?? {})) {
+		if (record?.labels[key] !== value) return false;
+	}
+	return true;
+}
+
 class FakeHc implements HcClient {
 	readonly calls: { method: string; params: any }[] = [];
 	terminals: HcTerminal[] = [];
 	runResult: HcRunResult = { ...terminal({ address: "t10" }), output: "", wait: waitResult() };
 	sendResult: HcSendResult = { started: true, status: "idle", turn: 1, wait: null };
+	readonly watchers: {
+		params: HcSubscribeParams;
+		onMessage: (message: HcWatchMessage) => void;
+		closed: boolean;
+	}[] = [];
+	private seq = 0;
+
+	/** `events: true` 时才有 subscribe：默认让老轮询路径继续跑原有断言。 */
+	constructor(options: { events?: boolean } = {}) {
+		if (!options.events) return;
+		this.subscribe = async (params, onMessage) => {
+			this.record("subscribe", params);
+			const watcher = { params, onMessage, closed: false };
+			this.watchers.push(watcher);
+			onMessage({
+				kind: "snapshot",
+				seq: this.seq,
+				terminals: this.terminals.filter((candidate) => matchesWatcher(params, candidate)),
+			});
+			const subscription: HcSubscription = {
+				channel: this.watchers.length,
+				close: () => {
+					watcher.closed = true;
+					this.record("unsubscribe", params);
+				},
+			};
+			return subscription;
+		};
+	}
+
+	subscribe?: HcClient["subscribe"];
+
+	/** 把一条终端事件推给匹配的订阅（快照不重发，测试自己改 terminals）。 */
+	emit(type: string, address: string, data: Record<string, unknown> = {}): void {
+		const record = this.terminals.find((candidate) => candidate.address === address);
+		for (const watcher of this.watchers) {
+			if (watcher.closed || !matchesWatcher(watcher.params, record, address)) continue;
+			watcher.onMessage({ kind: "event", seq: ++this.seq, type, terminal: address, data });
+		}
+	}
 
 	record(method: string, params: unknown): void {
 		this.calls.push({ method, params });
@@ -251,6 +305,7 @@ async function setup(
 		now?: () => number;
 		schedule?: (tick: () => void, ms: number) => () => void;
 		stopGraceMs?: number;
+		replyExitGraceMs?: number;
 	} = {},
 ) {
 	const { default: extension } = await import(`../extensions/pi-herdr-agent.ts?run=${moduleSeq++}`);
@@ -267,6 +322,7 @@ async function setup(
 		now: options.now,
 		schedule: options.schedule,
 		stopGraceMs: options.stopGraceMs,
+		replyExitGraceMs: options.replyExitGraceMs,
 	});
 	return { pi, hc };
 }
@@ -857,6 +913,201 @@ test("only quit tears down direct children", async () => {
 
 	await pi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
 	assert.deepEqual(hc.callsOf("kill").map((call) => call.params.terminal), ["t10"]);
+});
+
+// ─── 事件订阅（framed） ───
+
+test("with events, a quiet child counts down without polling the terminal list", async () => {
+	const hc = new FakeHc({ events: true });
+	const clock = { value: 0 };
+	const scheduler = manualSchedule();
+	const { pi } = await setup({
+		hc,
+		env: childEnv("180"),
+		now: () => clock.value,
+		schedule: scheduler.schedule,
+	});
+	const shutdowns: number[] = [];
+	const ctx = context({ shutdown: () => shutdowns.push(clock.value) });
+
+	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, ctx);
+	assert.equal(hc.callsOf("list").length, 0);
+	assert.deepEqual(
+		hc.callsOf("subscribe").map((call) => call.params),
+		[{ children_of: "t4m" }],
+	);
+
+	clock.value = 180_000;
+	await tickOnce(scheduler.ticks[0]);
+	assert.deepEqual(shutdowns, [180_000]);
+	assert.equal(hc.callsOf("list").length, 0);
+});
+
+test("with events, a child's finished event starts the idle countdown", async () => {
+	const hc = new FakeHc({ events: true });
+	hc.terminals = [terminal({ address: "t20", parent: "t4m", labels: { "pi.agent": "eeee" } })];
+	const clock = { value: 0 };
+	const scheduler = manualSchedule();
+	const { pi } = await setup({
+		hc,
+		env: childEnv("180"),
+		now: () => clock.value,
+		schedule: scheduler.schedule,
+	});
+	const shutdowns: number[] = [];
+	const ctx = context({ shutdown: () => shutdowns.push(clock.value) });
+
+	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, ctx);
+	clock.value = 100_000;
+	await tickOnce(scheduler.ticks[0]);
+	assert.deepEqual(shutdowns, []);
+
+	// 子终端退出：事件把它从 liveChildren 里去掉，倒计时从这一刻起算。
+	hc.terminals = [
+		terminal({ address: "t20", parent: "t4m", state: "finished", labels: { "pi.agent": "eeee" } }),
+	];
+	hc.emit("finished", "t20");
+	clock.value = 130_000;
+	await tickOnce(scheduler.ticks[0]);
+	clock.value = 310_000;
+	await tickOnce(scheduler.ticks[0]);
+	assert.deepEqual(shutdowns, [310_000]);
+	assert.equal(hc.callsOf("list").length, 0);
+});
+
+test("with events, an exited ask is reported without polling", async () => {
+	const hc = new FakeHc({ events: true });
+	hc.terminals = [
+		terminal({ address: "t4m", labels: {} }),
+		terminal({ address: "t10", name: "kid", labels: { "pi.agent": "aaaa" }, parent: "t4m" }),
+	];
+	const scheduler = manualSchedule();
+	const { pi } = await setup({ hc, schedule: scheduler.schedule, replyExitGraceMs: 0 });
+
+	await pi.tools
+		.get("agent_job")!
+		.execute("call", { action: "send", id: "aaaa", message: "hi" }, undefined, undefined, context());
+	await new Promise((resolve) => setImmediate(resolve));
+
+	const lists = hc.callsOf("list").length;
+	assert.equal(scheduler.ticks.length - scheduler.cancels, 0, "no fallback poll is armed");
+
+	// 子终端退出：children watch 推一条 finished，核完账补通知。
+	hc.terminals = [
+		terminal({ address: "t4m", labels: {} }),
+		terminal({
+			address: "t10",
+			name: "kid",
+			labels: { "pi.agent": "aaaa" },
+			parent: "t4m",
+			state: "finished",
+		}),
+	];
+	hc.emit("finished", "t10");
+	await new Promise((resolve) => setImmediate(resolve));
+	await new Promise((resolve) => setImmediate(resolve));
+
+	const notices = pi.messages.filter(
+		(entry) => parseAgentEnvelope(String(entry.message.content))?.type === "notice",
+	);
+	assert.equal(notices.length, 1);
+	assert.equal(hc.callsOf("list").length, lists + 1, "one verification, not a poll loop");
+});
+
+test("with events, a reply closes the pending watch and cancels the death notice", async () => {
+	const hc = new FakeHc({ events: true });
+	hc.terminals = [
+		terminal({ address: "t4m", labels: {} }),
+		terminal({ address: "t10", name: "kid", labels: { "pi.agent": "aaaa" }, parent: "t4m" }),
+	];
+	const { pi } = await setup({ hc, replyExitGraceMs: 0 });
+
+	await pi.tools
+		.get("agent_job")!
+		.execute("call", { action: "send", id: "aaaa", message: "hi" }, undefined, undefined, context());
+	await new Promise((resolve) => setImmediate(resolve));
+
+	await pi.emit("input", {
+		type: "input",
+		text: formatAgentEnvelope({ from: "aaaa", name: "kid", type: "reply", body: "done" }),
+	});
+
+	hc.terminals = [
+		terminal({ address: "t4m", labels: {} }),
+		terminal({
+			address: "t10",
+			name: "kid",
+			labels: { "pi.agent": "aaaa" },
+			parent: "t4m",
+			state: "finished",
+		}),
+	];
+	hc.emit("finished", "t10");
+	await new Promise((resolve) => setImmediate(resolve));
+	await new Promise((resolve) => setImmediate(resolve));
+
+	const notices = pi.messages.filter(
+		(entry) => parseAgentEnvelope(String(entry.message.content))?.type === "notice",
+	);
+	assert.equal(notices.length, 0);
+});
+
+test("with events, stop waits for the exit event instead of polling terminal.get", async () => {
+	const hc = new FakeHc({ events: true });
+	hc.terminals = [
+		terminal({ address: "t4m", labels: {} }),
+		terminal({ address: "t10", labels: { "pi.agent": "aaaa" }, parent: "t4m" }),
+	];
+	const { pi } = await setup({ hc });
+
+	const result = await pi.tools
+		.get("agent_job")!
+		.execute("call", { action: "stop", id: "aaaa" }, undefined, undefined, context());
+	assert.ok(toolResultText(result).length > 0);
+	assert.equal(hc.callsOf("keys").length, 1);
+	assert.equal(hc.callsOf("kill").length, 0);
+	assert.equal(hc.callsOf("get").length, 0);
+});
+
+test("a target already missing at subscribe time still resolves the stop wait", async () => {
+	const hc = new FakeHc({ events: true });
+	hc.terminals = [
+		terminal({ address: "t4m", labels: {} }),
+		terminal({ address: "t10", labels: { "pi.agent": "aaaa" }, parent: "t4m" }),
+	];
+	// 目标在 keys 之后、订阅之前就被 core 移除了：events.subscribe 回 not_found。
+	hc.subscribe = async () => {
+		throw new HcError("not_found", "gone");
+	};
+	const { pi } = await setup({ hc });
+
+	const result = await pi.tools
+		.get("agent_job")!
+		.execute("call", { action: "stop", id: "aaaa" }, undefined, undefined, context());
+	assert.ok(toolResultText(result).length > 0);
+	assert.equal(hc.callsOf("keys").length, 1);
+	assert.equal(hc.callsOf("kill").length, 0);
+	assert.equal(hc.callsOf("get").length, 0);
+});
+
+test("without event support, stop falls back to polling", async () => {
+	const hc = new FakeHc();
+	hc.terminals = [
+		terminal({ address: "t4m", labels: {} }),
+		terminal({ address: "t10", labels: { "pi.agent": "aaaa" }, parent: "t4m" }),
+	];
+	hc.subscribe = async () => {
+		throw new HcError("unsupported", "no events here");
+	};
+	const { pi } = await setup({ hc });
+
+	const result = await pi.tools
+		.get("agent_job")!
+		.execute("call", { action: "stop", id: "aaaa" }, undefined, undefined, context());
+	assert.ok(toolResultText(result).length > 0);
+	assert.equal(hc.callsOf("keys").length, 1);
+	assert.equal(hc.callsOf("kill").length, 0);
+	assert.equal(hc.callsOf("get").length, 1, "the old get-poll path is still there");
 });
 
 // ─── 空闲销毁 ───

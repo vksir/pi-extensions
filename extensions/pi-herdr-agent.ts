@@ -34,7 +34,12 @@
  * 0 = 永不），满钟后自己 `ctx.shutdown()`，pi 退出即由 hc 删掉终端；会话文件仍在磁盘上，
  * 可以按 id resume 回来。倒计时只在「安静」时走：还有活的子终端、后台任务、进程内
  * 子 agent 或 cron job 就不计时（后两者经 lib/activity.ts 的忙探测登记表汇总），任何新
- * 入站都立即清零。30 秒一拍检查，销毁最多迟到一拍。
+ * 入站都立即清零。30 秒一拍只走本地检查；有没有活的子终端由事件快照维护，不产生 hc 调用。
+ *
+ * hc 连接：每个 pi 进程一条懒建的长连接，第一次调用 hc API 时建连，之后所有调用复用；
+ * `/reload` 与退出时关闭，下次再从懒建开始。新 core（framed）上再挂 `events.subscribe`：
+ * 子终端进出、目标终端退出都是推送，空闲销毁 / 等回信 / stop 不再定时 `terminal.list`
+ * 或 `terminal.get`；旧 core（或订阅断了）才退回轮询。
  *
  * 状态：pi 内置 reporter 在 settle 时硬写 OSC 7501 `state=done`；子 agent 在 stdout 层
  * 把这条报告改写成 `state=idle`，所以 hc 只看到 working → idle，不会留下 done。
@@ -80,8 +85,11 @@ import {
 	HcError,
 	inHcEnv,
 	type HcClient,
+	type HcSubscribeParams,
+	type HcSubscription,
 	type HcTerminal,
 	type HcWaitResult,
+	type HcWatchMessage,
 } from "./lib/hc.ts";
 import { hasRunningSubagents } from "./lib/subagents.ts";
 import { basename } from "./lib/text.ts";
@@ -106,8 +114,11 @@ const STOP_GRACE_S = 5;
 /** `stop` 等对方退出的轮询间隔。 */
 const STOP_POLL_MS = 250;
 
-/** 等回信检查的节拍（毫秒）：目标子树全退了就补一条通知。 */
+/** 等回信检查的节拍（毫秒）：事件订阅不可用 / 断线时才退回轮询。 */
 const REPLY_WATCH_MS = 10_000;
+
+/** 目标终端退出后，给回信留的宽限：回信可能还在 hc 的 quiet 等待里。 */
+const DEFAULT_REPLY_EXIT_GRACE_MS = 5_000;
 
 /** 子进程从 env 读自己的空闲销毁秒数；0 或缺省表示不销毁。 */
 const DESTROY_ENV = "PI_AGENT_DESTROY_TIME";
@@ -170,6 +181,8 @@ export interface HerdrAgentOptions {
 	now?: () => number;
 	/** `stop` 每次按键的宽限（毫秒，测试可缩短）；默认 STOP_GRACE_S 秒。 */
 	stopGraceMs?: number;
+	/** 目标退出后等回信的宽限（毫秒，测试可设为 0）；默认 5 秒。 */
+	replyExitGraceMs?: number;
 	/** 空闲销毁的调度：每 ms 毫秒回调一次、返回取消函数；默认 setInterval。 */
 	schedule?: (tick: () => void, ms: number) => () => void;
 }
@@ -206,11 +219,20 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	};
 	const resolveName = (id: string): string | undefined => knownNames.get(id);
 
-	/** `hc.list()` 的统一入口：顺手刷新名字缓存。 */
+	/** `hc.list()` 的统一入口：顺手刷新名字缓存；同一刻的多次读取共用一次调用。 */
+	let listInFlight: Promise<HcTerminal[]> | undefined;
 	const listTerminals = async (): Promise<HcTerminal[]> => {
-		const terminals = await hc.list();
-		rememberNames(terminals);
-		return terminals;
+		if (listInFlight) return listInFlight;
+		listInFlight = (async () => {
+			const terminals = await hc.list();
+			rememberNames(terminals);
+			return terminals;
+		})();
+		try {
+			return await listInFlight;
+		} finally {
+			listInFlight = undefined;
+		}
 	};
 	// 空闲销毁：根 agent 没有这个 env（0 = 不销毁），子 agent 的秒数由拉起者按参数注入。
 	const destroyTime = parseDestroyTime(env[DESTROY_ENV]);
@@ -218,6 +240,8 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	const schedule = options.schedule ?? defaultSchedule;
 	/** `stop` 每次按键后的宽限；测试可缩短。 */
 	const stopGraceMs = options.stopGraceMs ?? STOP_GRACE_S * 1000;
+	/** 目标退出后等回信的宽限；测试可设为 0。 */
+	const replyExitGraceMs = options.replyExitGraceMs ?? DEFAULT_REPLY_EXIT_GRACE_MS;
 
 	/**
 	 * 根 agent 的短 id：会话 id 末尾 6 位字母数字（uuidv7 的尾段就是随机 hex；
@@ -293,46 +317,346 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		}
 	};
 
-	// ─── 等回信 ───
+	// ─── hc 事件订阅 ───
 
 	/**
-	 * 发出去、还没等到回信的目标。收到该目标的任何消息就销账；
+	 * framed 连接上的事件订阅：终端事实变化由 core 推过来，不用定时 `terminal.list`。
+	 * `eventsUnsupported` 只封死「方法不存在 / 连接不支持」这一类；socket / 超时不算，
+	 * 下一拍还会再试。
+	 */
+	let eventsUnsupported = false;
+	/** 事件订阅失败后的冷却：core 暂时不在时，别让每拍都去连一次。 */
+	let eventsRetryAt = 0;
+	const EVENTS_RETRY_MS = 30_000;
+	/** 订阅的过滤目标已经没了（`not_found`）：对 `terminal` 过滤等同于「它已消失」。 */
+	const WATCH_GONE = Symbol("hc-watch-gone");
+
+	const watchSubscription = async (
+		params: HcSubscribeParams,
+		onMessage: (message: HcWatchMessage) => void,
+	): Promise<HcSubscription | typeof WATCH_GONE | undefined> => {
+		if (eventsUnsupported || !hc.subscribe || Date.now() < eventsRetryAt) return undefined;
+		try {
+			return await hc.subscribe(params, onMessage);
+		} catch (error) {
+			if (error instanceof HcError && (error.kind === "not_found" || error.kind === "finished")) {
+				return WATCH_GONE;
+			}
+			if (error instanceof HcError && error.kind !== "socket" && error.kind !== "timeout") {
+				eventsUnsupported = true;
+			} else {
+				eventsRetryAt = Date.now() + EVENTS_RETRY_MS;
+			}
+			return undefined;
+		}
+	};
+
+	// ─── 等回信 ───
+
+	interface ReplyEntry {
+		name?: string;
+		address: string;
+		pending: number;
+		/** 目标终端的事件订阅；目标还活着时一直挂着。 */
+		watch?: HcSubscription;
+		checking?: boolean;
+		/** 核账期间又收到退出通知：这一轮结束后再核一次，别把事件漏掉。 */
+		recheck?: boolean;
+	}
+
+	/**
+	 * 发出去、还没等到回信的目标。收到该目标的回复就销账；
 	 * 目标整个子树都退出了才补一条「退出了没回信」，免得发消息的一方永远等下去。
 	 */
-	const awaitingReply = new Map<string, { name?: string; address: string; pending: number }>();
+	const awaitingReply = new Map<string, ReplyEntry>();
 	let replyWatchTimer: (() => void) | undefined;
+	/** 目标退出后延迟核账的计时器，按 id 去重。 */
+	const replyGrace = new Map<string, () => void>();
 
 	const stopReplyWatch = (): void => {
 		replyWatchTimer?.();
 		replyWatchTimer = undefined;
 	};
 
-	const armReplyWatch = (): void => {
+	const closeReplyEntry = (entry: ReplyEntry): void => {
+		entry.watch?.close();
+		entry.watch = undefined;
+	};
+
+	const dropReplyEntry = (id: string): void => {
+		const entry = awaitingReply.get(id);
+		if (!entry) return;
+		awaitingReply.delete(id);
+		closeReplyEntry(entry);
+		const cancel = replyGrace.get(id);
+		cancel?.();
+		replyGrace.delete(id);
+		if (awaitingReply.size === 0) stopReplyWatch();
+	};
+
+	/**
+	 * 本终端的直接子终端（活着的地址）。由 `children_of: self` 的快照 + 增量事件维护；
+	 * `undefined` 表示订阅还没建立 / 断了。空闲销毁与子 agent 回信都靠它，不再轮询。
+	 */
+	let liveChildren: Set<string> | undefined;
+	let childrenWatch: HcSubscription | undefined;
+	let childrenWatching: Promise<boolean> | undefined;
+
+	const applyChildrenMessage = (message: HcWatchMessage): void => {
+		switch (message.kind) {
+			case "snapshot":
+			case "missed":
+				liveChildren = new Set(
+					message.terminals
+						.filter((terminal) => terminal.state === "live")
+						.map((terminal) => terminal.address),
+				);
+				return;
+			case "event": {
+				const address = message.terminal;
+				if (!address || !liveChildren) return;
+				if (message.type === "created" || message.type === "restarted" || message.type === "lost") {
+					liveChildren.add(address);
+				} else if (message.type === "finished" || message.type === "removed") {
+					liveChildren.delete(address);
+					onTerminalGone(address);
+				}
+				return;
+			}
+			case "lost":
+				liveChildren = undefined;
+				childrenWatch = undefined;
+				// 连接没了：有账就退回轮询，别干等。
+				armReplyWatch();
+				return;
+		}
+	};
+
+	/** 建 `children_of: self` 订阅；返回 true 表示快照已到、`liveChildren` 可用。 */
+	const ensureChildrenWatch = async (): Promise<boolean> => {
+		if (eventsUnsupported || !hc.subscribe) return false;
+		if (liveChildren) return true;
+		if (childrenWatching) return childrenWatching;
+
+		childrenWatching = (async () => {
+			const subscription = await watchSubscription({ children_of: self }, applyChildrenMessage);
+			if (!subscription || subscription === WATCH_GONE) return false;
+			childrenWatch = subscription;
+			// 订阅回复里带快照，resolve 时已经处理过；收不到快照就当没建立。
+			return liveChildren !== undefined;
+		})();
+		try {
+			return await childrenWatching;
+		} finally {
+			childrenWatching = undefined;
+		}
+	};
+
+	const closeChildrenWatch = (): void => {
+		childrenWatch?.close();
+		childrenWatch = undefined;
+		liveChildren = undefined;
+		childrenWatching = undefined;
+	};
+
+	const onTerminalGone = (address: string): void => {
+		for (const [id, entry] of [...awaitingReply]) {
+			if (entry.address === address) scheduleReplyExitCheck(id, entry);
+		}
+	};
+
+	/** 目标退出后延迟核账：回信可能还在 hc 的 quiet 等待里，别抢先宣布没回。 */
+	const scheduleReplyExitCheck = (id: string, entry: ReplyEntry): void => {
+		if (awaitingReply.get(id) !== entry || replyGrace.has(id)) return;
+		if (replyExitGraceMs <= 0) {
+			void verifyReplyGone(id, entry);
+			return;
+		}
+		const timer = setTimeout(() => {
+			replyGrace.delete(id);
+			void verifyReplyGone(id, entry);
+		}, replyExitGraceMs);
+		timer.unref?.();
+		replyGrace.set(id, () => clearTimeout(timer));
+	};
+
+	const notifyExited = (id: string, entry: ReplyEntry): void => {
+		const body = piHerdrAgentPrompt.notices.exitedWithoutReply();
+		try {
+			pi.sendMessage<AgentMessageDetails>(
+				{
+					customType: AGENT_MESSAGE,
+					content: formatAgentEnvelope({ from: id, name: entry.name, type: "notice", body }),
+					display: true,
+					details: { from: id, name: entry.name, type: "notice", body },
+				},
+				{ deliverAs: "steer", triggerTurn: true },
+			);
+		} catch (error) {
+			appendNote(`could not report ${id}: ${errorMessage(error)}`);
+		}
+	};
+
+	/**
+	 * 目标终端没了：认 id（可能换地址 resume 了）与整棵子树；真没了就销账 + 通知。
+	 * 只由「目标退出」或轮询触发，不是定时开销。
+	 */
+	const verifyReplyGone = async (id: string, entry: ReplyEntry): Promise<void> => {
+		if (awaitingReply.get(id) !== entry) return;
+		if (entry.checking) {
+			entry.recheck = true;
+			return;
+		}
+		entry.checking = true;
+		try {
+			let terminals: HcTerminal[];
+			try {
+				terminals = await listTerminals();
+			} catch {
+				// 事件已经触发过，读不到列表也要再来一次，不能把这一笔账挂死。
+				armReplyWatch(true);
+				return;
+			}
+			// 等列表期间回信可能已经到了；账已销就别再宣布对方没回。
+			if (awaitingReply.get(id) !== entry) return;
+
+			const live = terminals.filter((terminal) => terminal.state === "live");
+			const alive = live.find((terminal) => agentIdOf(terminal) === id);
+			if (alive) {
+				// 目标可能换地址 resume 了：旧订阅作废，重新盯新地址。
+				if (alive.address !== entry.address) {
+					entry.address = alive.address;
+					entry.watch?.close();
+					entry.watch = undefined;
+					await watchReplyTarget(id, entry);
+				}
+				return;
+			}
+
+			const byAddress = new Map(terminals.map((terminal) => [terminal.address, terminal]));
+			const subtreeAlive = live.some((terminal) => {
+				let cursor = terminal.parent;
+				const seen = new Set<string>();
+				while (cursor && !seen.has(cursor)) {
+					if (cursor === entry.address) return true;
+					seen.add(cursor);
+					cursor = byAddress.get(cursor)?.parent ?? null;
+				}
+				return false;
+			});
+			if (subtreeAlive) {
+				// 目标没了、子树还在（默认 die_with_parent 下很少见）：目标地址可能已被移除，
+				// 不能再拿它做 `children_of` 过滤；退回低频轮询，等子树清空再核。
+				armReplyWatch(true);
+				return;
+			}
+
+			dropReplyEntry(id);
+			notifyExited(id, entry);
+		} finally {
+			entry.checking = false;
+			if (entry.recheck) {
+				entry.recheck = false;
+				void verifyReplyGone(id, entry);
+			}
+		}
+	};
+
+	/** 给一个非直接子终端挂事件订阅；快照就已经没了时同样走核账。 */
+	const watchReplyTarget = async (id: string, entry: ReplyEntry): Promise<void> => {
+		if (eventsUnsupported || !hc.subscribe || entry.watch) return;
+		// 直接子终端由 children watch 统一盯，不再单独订。
+		if (liveChildren?.has(entry.address)) return;
+
+		const subscription = await watchSubscription({ terminal: entry.address }, (message) => {
+			if (awaitingReply.get(id) !== entry) return;
+			if (message.kind === "lost") {
+				entry.watch = undefined;
+				armReplyWatch();
+				return;
+			}
+			if (message.kind === "snapshot" || message.kind === "missed") {
+				if (!message.terminals.some((terminal) => terminal.state === "live")) {
+					scheduleReplyExitCheck(id, entry);
+				}
+				return;
+			}
+			if (message.kind === "event" && (message.type === "finished" || message.type === "removed")) {
+				scheduleReplyExitCheck(id, entry);
+			}
+		});
+		if (subscription === WATCH_GONE) {
+			scheduleReplyExitCheck(id, entry);
+			return;
+		}
+		if (!subscription) return;
+		if (awaitingReply.get(id) !== entry) {
+			subscription.close();
+			return;
+		}
+		entry.watch = subscription;
+		if (replyWatchHealthy()) stopReplyWatch();
+	};
+
+	/** 每条账都有事件订阅（或落在 children watch 里）时，不需要轮询兜底。 */
+	const replyWatchHealthy = (): boolean => {
+		if (eventsUnsupported || !hc.subscribe || awaitingReply.size === 0) return false;
+		for (const entry of awaitingReply.values()) {
+			if (entry.watch || liveChildren?.has(entry.address)) continue;
+			return false;
+		}
+		return true;
+	};
+
+	const armReplyWatch = (force = false): void => {
 		if (awaitingReply.size === 0 || replyWatchTimer) return;
+		if (!force && replyWatchHealthy()) return;
 		replyWatchTimer = schedule(() => void checkReplies(), REPLY_WATCH_MS);
 	};
 
 	/**
 	 * 记一笔「等它回信」，并开始盯。同一目标发几条就记几次：
 	 * 收到一条 `reply` 只销一笔，剩下的仍然算没回。
+	 * 直接子终端交给 children watch；其余目标单独订一条。
 	 */
-	const expectReply = (peer: { id: string; name?: string }, address: string): void => {
+	const expectReply = async (
+		peer: { id: string; name?: string },
+		address: string,
+		directChild: boolean,
+	): Promise<void> => {
 		if (peer.id === myId) return;
-		const entry = awaitingReply.get(peer.id);
-		if (entry) {
+		const existing = awaitingReply.get(peer.id);
+		let entry: ReplyEntry;
+		if (existing) {
+			entry = existing;
 			entry.pending += 1;
 			entry.name = peer.name ?? entry.name;
-			entry.address = address;
+			if (entry.address !== address) {
+				entry.address = address;
+				entry.watch?.close();
+				entry.watch = undefined;
+			}
 		} else {
-			awaitingReply.set(peer.id, { name: peer.name, address, pending: 1 });
+			entry = { name: peer.name, address, pending: 1 };
+			awaitingReply.set(peer.id, entry);
 		}
-		armReplyWatch();
+
+		if (directChild) {
+			const ready = await ensureChildrenWatch();
+			if (ready && liveChildren?.has(address)) {
+				if (replyWatchHealthy()) stopReplyWatch();
+				return;
+			}
+		}
+
+		await watchReplyTarget(peer.id, entry);
+		if (replyWatchHealthy()) stopReplyWatch();
+		else armReplyWatch();
 	};
 
 	/**
-	 * 一拍：目标还活着就继续等；子树里还有活着的终端也不动（它的子代理可能还会回）；
+	 * 轮询兜底（旧 core / 连接断了）：目标还活着就继续等；子树里还有活着的终端也不动；
 	 * 整个子树都没了且没收到回信，就给本地 agent 发一条通知。
-	 * 通知是普通用户消息：agent 空闲就起一轮，忙就由 pi 按 steering 模式插进当前轮。
 	 */
 	const checkReplies = async (): Promise<void> => {
 		replyWatchTimer = undefined;
@@ -362,25 +686,29 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			});
 
 		for (const [id, entry] of [...awaitingReply]) {
-			if (live.some((terminal) => agentIdOf(terminal) === id)) continue;
-			if (subtreeAlive(entry.address)) continue;
-			awaitingReply.delete(id);
-			const body = piHerdrAgentPrompt.notices.exitedWithoutReply();
-			try {
-				pi.sendMessage<AgentMessageDetails>(
-					{
-						customType: AGENT_MESSAGE,
-						content: formatAgentEnvelope({ from: id, name: entry.name, type: "notice", body }),
-						display: true,
-						details: { from: id, name: entry.name, type: "notice", body },
-					},
-					{ deliverAs: "steer", triggerTurn: true },
-				);
-			} catch (error) {
-				appendNote(`could not report ${id}: ${errorMessage(error)}`);
+			// 已经有事件订阅的账交给事件路径（它在退出后还有回信宽限），轮询只兜底没盯上的。
+			if (entry.watch || liveChildren?.has(entry.address)) continue;
+
+			const alive = live.find((terminal) => agentIdOf(terminal) === id);
+			if (alive) {
+				if (alive.address !== entry.address) {
+					entry.address = alive.address;
+					void watchReplyTarget(id, entry);
+				}
+				continue;
 			}
+			if (subtreeAlive(entry.address)) continue;
+
+			dropReplyEntry(id);
+			notifyExited(id, entry);
 		}
 
+		// 事件恢复后把轮询停掉；订阅建立是异步的，建立后自己会再检查一次。
+		for (const [id, entry] of [...awaitingReply]) {
+			if (!entry.watch && !liveChildren?.has(entry.address)) {
+				void watchReplyTarget(id, entry);
+			}
+		}
 		armReplyWatch();
 	};
 
@@ -398,7 +726,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			const entry = awaitingReply.get(envelope.from);
 			if (entry) {
 				entry.pending -= 1;
-				if (entry.pending <= 0) awaitingReply.delete(envelope.from);
+				if (entry.pending <= 0) dropReplyEntry(envelope.from);
 			}
 		}
 
@@ -436,17 +764,25 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	pi.on("session_shutdown", async (event) => {
 		stopDestroyCountdown();
 		stopReplyWatch();
+		for (const cancel of replyGrace.values()) cancel();
+		replyGrace.clear();
+		for (const entry of awaitingReply.values()) closeReplyEntry(entry);
 		awaitingReply.clear();
-		// 只有真正退出（quit）才收尸；/reload、/new、/resume、/fork 不动子 agent。
-		if (event.reason !== "quit") return;
+		closeChildrenWatch();
 
-		try {
-			const terminals = await listTerminals();
-			const children = terminals.filter((terminal) => terminal.parent === self);
-			await Promise.allSettled(children.map((terminal) => hc.kill(terminal.address)));
-		} catch {
-			// 退出路径尽力而为：清理失败不能盖住正常退出。
+		// 只有真正退出（quit）才收尸；/reload、/new、/resume、/fork 不动子 agent。
+		if (event.reason === "quit") {
+			try {
+				const terminals = await listTerminals();
+				const children = terminals.filter((terminal) => terminal.parent === self);
+				await Promise.allSettled(children.map((terminal) => hc.kill(terminal.address)));
+			} catch {
+				// 退出路径尽力而为：清理失败不能盖住正常退出。
+			}
 		}
+
+		// 这个扩展实例要退场了：长连接与订阅一起关掉；/reload 后新实例再懒建。
+		hc.close?.();
 	});
 
 	// ─── 空闲销毁 ───
@@ -459,12 +795,17 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 
 	/**
 	 * 安静 = 本 agent 空闲 + 进程内没有后台任务 / cron job / 进程内子 agent + 没有活的子
-	 * 终端。子终端也算：销毁会级联杀掉子 agent，它有活就先让着它（它自己也有同一套规则）。
+	 * 终端。子终端由 `children_of: self` 的事件快照维护，这里不再定时 `terminal.list`；
+	 * 事件不可用（旧 core / 断线）时才退回列表。
 	 * `hc.list` 失败时不知道有没有子 agent，按「忙」处理。
 	 */
 	const isQuiet = async (ctx: ExtensionContext): Promise<boolean> => {
 		if (!ctx.isIdle()) return false;
 		if (hasBusyActivity() || hasRunningSubagents()) return false;
+		if (await ensureChildrenWatch()) {
+			const children = liveChildren;
+			if (children) return children.size === 0;
+		}
 		try {
 			const terminals = await listTerminals();
 			return !terminals.some((terminal) => terminal.parent === self && terminal.state === "live");
@@ -708,7 +1049,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 				caller: self,
 				text: formatAgentEnvelope({ from: myId, name: displayName(ctx), type: "task", body: prompt }),
 			});
-			expectReply({ id, name }, run.address);
+			void expectReply({ id, name }, run.address, true);
 		} catch (error) {
 			await hc.kill(run.address).catch(() => undefined);
 			throw error;
@@ -838,10 +1179,44 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	};
 
 	/**
-	 * 轮询到终端消失或超时。不用 `terminal.wait`：它等的是「下一次停」，
-	 * 对一个已经停下来的终端会一直等到超时，分不清「退出了」和「只是闲置」。
+	 * 等终端消失：有事件订阅就等 `finished` / `removed` 推送（不再 250 ms 抡 `terminal.get`）；
+	 * 旧 core / 订阅失败才退回轮询。不用 `terminal.wait`：它等的是「下一次停」，
+	 * 对一个已经停下来的 pi 会立即返回，分不清「退出了」和「只是闲置」。
 	 */
 	const waitUntilGone = async (address: string, seconds: number): Promise<boolean> => {
+		if (hc.subscribe && !eventsUnsupported) {
+			let settle: ((gone: boolean) => void) | undefined;
+			const watched = new Promise<boolean>((resolve) => {
+				settle = resolve;
+			});
+			const subscription = await watchSubscription({ terminal: address }, (message) => {
+				if (message.kind === "lost") {
+					settle?.(false);
+					return;
+				}
+				if (message.kind === "snapshot" || message.kind === "missed") {
+					if (!message.terminals.some((terminal) => terminal.state === "live")) settle?.(true);
+					return;
+				}
+				if (message.kind === "event" && (message.type === "finished" || message.type === "removed")) {
+					settle?.(true);
+				}
+			});
+
+			if (subscription === WATCH_GONE) return true;
+			if (subscription) {
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				const timeout = new Promise<boolean>((resolve) => {
+					timer = setTimeout(() => resolve(false), seconds * 1000);
+					timer.unref?.();
+				});
+				const gone = await Promise.race([watched, timeout]);
+				if (timer) clearTimeout(timer);
+				subscription.close();
+				return gone;
+			}
+		}
+
 		const deadline = now() + seconds * 1000;
 		while (now() < deadline) {
 			try {
@@ -875,7 +1250,11 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 				body: params.message,
 			}),
 		});
-		expectReply({ id: target.row.id, name: target.row.name }, target.terminal.address);
+		void expectReply(
+			{ id: target.row.id, name: target.row.name },
+			target.terminal.address,
+			target.terminal.parent === self,
+		);
 		return ok(piHerdrAgentPrompt.results.sent(target.row.id, target.row.name), {
 			action: "send",
 			id: target.row.id,
