@@ -365,7 +365,8 @@ test("守则挂在 agent_job 上（深度 2 也有），agent 不再带守则", 
 	const job = pi.tools.get("agent_job") as unknown as { promptGuidelines?: string[] };
 	assert.equal(agent.promptGuidelines, undefined);
 	assert.deepEqual(job.promptGuidelines, [
-		"Do not sleep or poll to wait for an agent you started or messaged.",
+		"Never sleep, poll, or wait for an agent you started or messaged. " +
+			"Its reply arrives automatically as a message when it finishes.",
 	]);
 });
 

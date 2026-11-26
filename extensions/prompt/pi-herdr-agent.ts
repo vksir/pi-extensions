@@ -6,8 +6,8 @@
  *
  * 去重口径：
  * - 动作的语义在工具描述里，`action` 只列可选值。
- * - 回信提示只在消息的 `<note>` 元素里出现一次，由 lib 拼装时取用；守则与工具描述都不复述。
- * - 「不要睡等」只在守则里，守则挂 `agent_job`（最深一层没有 `agent` 工具）。
+ * - 回信到达方式只在守则里说一次：完成时自动作为消息回来。`<note>` 只负责提醒接收方显式 reply。
+ * - 「不等待、不睡、不轮询」只在守则里，守则挂 `agent_job`（最深一层没有 `agent` 工具）。
  * - 可见范围不进文案：模型看不到的 agent，本来就不会出现在它的参数里。
  */
 
@@ -74,7 +74,9 @@ export const piHerdrAgentPrompt = {
 		 * 而 `agent` 在树深上限那一层不会注册。
 		 */
 		guidelines: {
-			agentJob: "Do not sleep or poll to wait for an agent you started or messaged.",
+			agentJob:
+				"Never sleep, poll, or wait for an agent you started or messaged. " +
+				"Its reply arrives automatically as a message when it finishes.",
 		},
 	},
 
