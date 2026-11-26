@@ -64,6 +64,7 @@ import {
 	parseAgentEnvelope,
 	stripHcTransport,
 	validateAgentName,
+	type AgentEnvelope,
 	type AgentMessageType,
 } from "./lib/agent-protocol.ts";
 import { hasBusyActivity } from "./lib/activity.ts";
@@ -715,32 +716,53 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 	// ─── 入站消息 ───
 
 	// 有新活就不销毁：不管是 agent 消息还是人直接打字，都发生在 agent_start 之前。
-	pi.on("input", (event) => {
+	pi.on("input", (event, ctx) => {
 		stopDestroyCountdown();
 
-		const envelope = parseAgentEnvelope(event.text);
-		if (!envelope) return;
-
-		// 只有 reply 销账：task 是新活，不是对我那条消息的回答。
-		if (envelope.type === "reply") {
-			const entry = awaitingReply.get(envelope.from);
-			if (entry) {
-				entry.pending -= 1;
-				if (entry.pending <= 0) dropReplyEntry(envelope.from);
+		const handleEnvelope = (raw: string, envelope: AgentEnvelope): void => {
+			// 只有 reply 销账：task 是新活，不是对我那条消息的回答。
+			if (envelope.type === "reply") {
+				const entry = awaitingReply.get(envelope.from);
+				if (entry) {
+					entry.pending -= 1;
+					if (entry.pending <= 0) dropReplyEntry(envelope.from);
+				}
 			}
+
+			// 原文不进 TUI：转成自定义消息，模型看到的还是同一份 XML，界面画成卡片。
+			// 忙时 steer 插进当前轮，闲时起一轮 —— 与 pi 的原生插入语义一致。
+			pi.sendMessage<AgentMessageDetails>(
+				{
+					customType: AGENT_MESSAGE,
+					content: stripHcTransport(raw),
+					display: true,
+					details: { from: envelope.from, name: envelope.name, type: envelope.type, body: envelope.body },
+				},
+				{ deliverAs: event.streamingBehavior === "followUp" ? "followUp" : "steer", triggerTurn: true },
+			);
+		};
+
+		const envelope = parseAgentEnvelope(event.text);
+		if (envelope) {
+			handleEnvelope(event.text, envelope);
+			return { action: "handled" as const };
 		}
 
-		// 原文不进 TUI：转成自定义消息，模型看到的还是同一份 XML，界面画成卡片。
-		// 忙时 steer 插进当前轮，闲时起一轮 —— 与 pi 的原生插入语义一致。
-		pi.sendMessage<AgentMessageDetails>(
-			{
-				customType: AGENT_MESSAGE,
-				content: stripHcTransport(event.text),
-				display: true,
-				details: { from: envelope.from, name: envelope.name, type: envelope.type, body: envelope.body },
-			},
-			{ deliverAs: event.streamingBehavior === "followUp" ? "followUp" : "steer", triggerTurn: true },
-		);
+		// hc 的 terminal.send 会等输入框草稿；等满 HC_DRAFT_MS（默认 60s）就把消息接在
+		// 草稿后面回车，实际输入是 `草稿< hc from=…><agent_message …>`。消息不在开头，
+		// 上面的解析会失败。切出消息、把草稿放回输入框，别让半截草稿跟着进上下文。
+		if (typeof ctx?.ui?.setEditorText !== "function") return;
+		const split = splitDraftFromEnvelope(event.text);
+		if (!split) return;
+		const splitEnvelope = parseAgentEnvelope(split.envelope);
+		if (!splitEnvelope) return;
+
+		handleEnvelope(split.envelope, splitEnvelope);
+		try {
+			ctx.ui.setEditorText(split.draft);
+		} catch {
+			// 不是交互式 TUI 或旧 pi：草稿已经提交，至少别把消息混进用户输入。
+		}
 		return { action: "handled" as const };
 	});
 
@@ -1347,6 +1369,27 @@ const STDOUT_PATCHED = Symbol.for("pi-herdr-agent:done-to-idle");
 /** pi 在 settle 时写 `state=done`；子 agent 要把这一条改成 `state=idle`。 */
 export function rewriteDoneStatus(text: string): string {
 	return text.startsWith(DONE_STATUS_PREFIX) ? text.replace("state=done", "state=idle") : text;
+}
+
+/**
+ * 草稿与 agent 消息被 hc 一起提交时（`draft + <hc from=…><agent_message …>`），
+ * 找出消息的起点。只认能完整解析成信封的后缀，避免把用户正文里的
+ * `<agent_message` 字样当成消息。
+ */
+export function splitDraftFromEnvelope(text: string): { draft: string; envelope: string } | undefined {
+	// 开头就是运输层 / 信封：没有草稿前缀，交给原来的 parseAgentEnvelope；
+	// 它都没解析成功时不要把 wrapper 当草稿塞回输入框。
+	if (text.startsWith("<hc ") || text.startsWith("<agent_message ")) return undefined;
+
+	const starts = new Set<number>();
+	for (const marker of ["<hc ", "<agent_message "]) {
+		for (let at = text.indexOf(marker, 1); at >= 0; at = text.indexOf(marker, at + 1)) starts.add(at);
+	}
+	for (const at of [...starts].sort((left, right) => left - right)) {
+		const envelope = text.slice(at);
+		if (parseAgentEnvelope(envelope)) return { draft: text.slice(0, at), envelope };
+	}
+	return undefined;
 }
 
 /**

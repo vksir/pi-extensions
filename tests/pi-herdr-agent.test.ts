@@ -21,6 +21,7 @@ import {
 	readSessionFacts,
 	rewriteDoneStatus,
 	rootIdOf,
+	splitDraftFromEnvelope,
 	type AgentRow,
 } from "../extensions/pi-herdr-agent.ts";
 import { type TreeLine } from "../extensions/lib/tui/agent-tree.ts";
@@ -273,7 +274,10 @@ interface FakeCtx {
 	thinkingLevel: string | undefined;
 	sessionManager: { getSessionName: () => string | undefined; getSessionId: () => string };
 	modelRegistry: { getAll: () => { provider: string; id: string; name?: string }[] };
-	ui: { notify: (message: string, type?: string) => void };
+	ui: {
+		notify: (message: string, type?: string) => void;
+		setEditorText?: (text: string) => void;
+	};
 	isIdle: () => boolean;
 	shutdown: () => void;
 }
@@ -738,6 +742,30 @@ test("every inbound agent message is passed through, busy or idle", async () => 
 	await pi.emit("agent_settled", { type: "agent_settled", aborted: false }, context());
 	assert.equal(hc.callsOf("send").length, 0);
 	assert.deepEqual(pi.userMessages, []);
+});
+
+test("a draft submitted together with an agent reply is restored, not sent", async () => {
+	const hc = new FakeHc();
+	const { pi } = await setup({ hc });
+	const editor: string[] = [];
+	const ctx = context({
+		ui: { notify: () => undefined, setEditorText: (text) => editor.push(text) },
+	});
+
+	const draft = "my unfinished draft";
+	const reply = formatAgentEnvelope({ from: "aaaa", name: "kid", type: "reply", body: "done" });
+	// hc 的 terminal.send 等满草稿时间后，把消息套在 <hc from> 里接到草稿后面。
+	const wire = `<hc from="t10">${reply}</hc>`;
+	const result = await pi.emit("input", { type: "input", text: `${draft}${wire}` }, ctx);
+
+	assert.deepEqual(result, { action: "handled" });
+	assert.deepEqual(editor, [draft], "the draft goes back into the editor");
+	assert.equal(pi.messages.length, 1);
+	const shown = String(pi.messages[0].message.content);
+	assert.equal(parseAgentEnvelope(shown)?.type, "reply");
+	assert.equal(parseAgentEnvelope(shown)?.body, "done");
+	assert.ok(!shown.includes(draft), "the draft is not sent as part of the agent message");
+	assert.ok(!shown.includes("<hc from"), "the transport wrapper is stripped");
 });
 
 test("a message arriving while the previous round is settling is still passed through", async () => {
@@ -1672,6 +1700,20 @@ test("/agent list shows the current tree, /agent list-all shows every tree", asy
 	const all = (pi.entries.at(-1)?.data.lines as TreeLine[]).map(treeText);
 	assert.ok(all.some((line) => line.startsWith("全部 agent 树")));
 	assert.ok(all.some((line) => line.includes("stranger (cccc)")));
+});
+
+test("splitDraftFromEnvelope finds the real envelope after a draft", () => {
+	const reply = formatAgentEnvelope({ from: "aaaa", type: "reply", body: "done" });
+	const wire = `<hc from="t10">${reply}</hc>`;
+
+	// 草稿里也带 <agent_message 字样时，跳过它，找能完整解析的那一段。
+	assert.deepEqual(splitDraftFromEnvelope(`draft <agent_message broken ${wire}`), {
+		draft: "draft <agent_message broken ",
+		envelope: wire,
+	});
+	// 正常消息从 0 开始：交给原来的 parseAgentEnvelope，不走拆分。
+	assert.equal(splitDraftFromEnvelope(wire), undefined);
+	assert.equal(splitDraftFromEnvelope("just a human message"), undefined);
 });
 
 test("subagent done OSC is rewritten to idle", () => {

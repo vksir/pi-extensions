@@ -1,6 +1,8 @@
 # agent 之间按「发起人 + 排队」派发，回信由模型自己 send
 
 > **大部分被取代**：`ask` 已改名 `send`，收工自动回发与 `result` 位、崩溃 / blocked 通知均已删除（[ADR-0012](0012-agent-replies-are-sends.md)）；「发起人 + 排队」也一并删掉，忙时消息直接交给 pi 插入（[ADR-0013](0013-inbound-messages-are-inserted-not-queued.md)）。本文件只作历史记录。
+>
+> **更正**：API 的 `terminal.send` 在调用方与目标都是 agent 时也会套 `<hc from="…">`（core 的 `tagged`），并非只有 CLI；扩展在 `agent-protocol.ts` 里用 `stripHcTransport` 剥掉。下面「API 不套包装」的说法已过时。
 
 ## 背景
 
