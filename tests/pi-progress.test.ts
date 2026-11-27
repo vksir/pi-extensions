@@ -51,10 +51,10 @@ interface Setup {
 
 const theme = { fg: (_token: string, text: string) => text, bold: (text: string) => text };
 
-/** 把一次 setWidget 的工厂渲染成去掉首尾空白的行。 */
+/** 把一次 setWidget 的工厂渲染成去掉行尾填充空白的行（保留行首缩进）。 */
 function renderWidget(call: WidgetCall, width = 80): string[] {
 	assert.ok(call.content);
-	return call.content({}, theme).render(width).map((line) => line.trim());
+	return call.content({}, theme).render(width).map((line) => line.trimEnd());
 }
 
 /** 只取 `pi-progress:entry` 记录。 */
@@ -165,11 +165,11 @@ test("一轮内多次报告按顺序堆叠，最新一条在底部", async () =>
 	await report(tool, ctx, "Patching the uploader");
 	await report(tool, ctx, "Running the auth tests");
 
-	assert.deepEqual(renderWidget(widgets.at(-1)!), [
-		"▸ Reading the failing test",
-		"▸ Patching the uploader",
-		"▸ Running the auth tests",
-	]);
+	const lines = renderWidget(widgets.at(-1)!);
+	assert.equal(lines.length, 3);
+	assert.match(lines[0], /^ {3}\d{2}:\d{2}  Reading the failing test$/);
+	assert.match(lines[1], /^ {3}\d{2}:\d{2}  Patching the uploader$/);
+	assert.match(lines[2], /^ ▌ \d{2}:\d{2}  Running the auth tests$/);
 });
 
 test("超过 8 条时 widget 只留最近 8 条", async () => {
@@ -178,8 +178,8 @@ test("超过 8 条时 widget 只留最近 8 条", async () => {
 
 	const lines = renderWidget(widgets.at(-1)!);
 	assert.equal(lines.length, 8);
-	assert.deepEqual(lines[0], "▸ stage 2");
-	assert.deepEqual(lines.at(-1), "▸ stage 9");
+	assert.match(lines[0], /^ {3}\d{2}:\d{2}  stage 2$/);
+	assert.match(lines.at(-1)!, /^ ▌ \d{2}:\d{2}  stage 9$/);
 	// 全部 9 条都写进了会话，`/progress` 不会丢。
 	assert.equal(progressEntries(entries).length, 9);
 });
@@ -188,7 +188,7 @@ test("换行和多余空白压成一行", async () => {
 	const { tool, ctx, widgets } = await setup();
 	await report(tool, ctx, "  Running\n  the   auth tests  ");
 
-	assert.deepEqual(renderWidget(widgets[0]), ["▸ Running the auth tests"]);
+	assert.match(renderWidget(widgets[0])[0], /^ ▌ \d{2}:\d{2}  Running the auth tests$/);
 });
 
 test("窄终端下进展行不溢出", async () => {

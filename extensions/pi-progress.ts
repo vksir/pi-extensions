@@ -167,7 +167,7 @@ export default function progressExtension(pi: ExtensionAPI): void {
 			const record: ProgressRecord = { text, round: Math.max(round, 1), at: Date.now() };
 			current = [...current, record];
 			pi.appendEntry<ProgressRecord>(ENTRY_TYPE, record);
-			if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => renderProgressWidget(current.map((item) => item.text), theme));
+			if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => renderProgressWidget(current, theme));
 
 			return {
 				content: [{ type: "text" as const, text: piProgressPrompt.results.shown() }],
