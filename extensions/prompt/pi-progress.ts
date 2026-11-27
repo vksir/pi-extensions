@@ -13,9 +13,8 @@ export const piProgressPrompt = {
 
 	declarations: {
 		progress: {
-			// 常驻·工具声明。只讲「向使用者报告进展」与调用时机，不提 UI 细节。
-			description:
-				"Report what you are doing now to the user as one short line. Call it when you start a stage, switch approach, or begin a long tool call.",
+			// 常驻·工具声明。只讲用途与调用时机，格式约束留给字段 text。
+			description: "Report your progress to the user. Call it when you start a stage or switch approach.",
 			parameters: {
 				// 常驻·工具声明。
 				text: "One short sentence. Say what you are doing now, not what you already did.",
@@ -28,7 +27,7 @@ export const piProgressPrompt = {
 	system: {
 		snippets: {
 			// 常驻·系统提示词。索引行只回答「有这个工具」。
-			progress: "Report one-line progress to the user",
+			progress: "Report progress to the user",
 		},
 	},
 
