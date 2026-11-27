@@ -28,8 +28,24 @@ node --test tests/*.test.ts
 | [pi-btw](extensions/pi-btw.ts) | 顺带分派：仅在 herdr / herdr app 环境注册 `/btw <消息>`，新开一个标签，fork 当前会话启动 pi 并把消息作为首条消息递交；本轮还在跑时先把 fork 源截到上一个完整轮次，避免新会话继承半截 turn（见 [ADR-0008](docs/adr/0008-btw-forks-at-turn-boundary.md)） |
 | [pi-bg](extensions/pi-bg.ts) | 后台运行：`bash_bg` / `codemode_bg` 立即返回，结束后把结果作为消息回发；前台 `bash` / `codemode` 超过等待预算（默认 3 分钟）自动转成后台任务；`bg_job` 工具（list / show / kill）与 `/bg` 命令查看/终止，并与内置工具的启用状态联动 |
 | [pi-herdr-agent](extensions/pi-herdr-agent.ts) | 用 herdr-core（hc）的终端树跑子 agent：`agent` 拉起、`agent_job` 管理（list / send / stop），消息进来一律交给 pi 插入当前轮（不吞、不排队）；回信由 agent 自己 `send`，扩展不代发；`/agent list` 显示 agent 树；仅 herdr app + hc 环境生效 |
+| [pi-progress](extensions/pi-progress.ts) | 长任务进展：`progress` 工具让模型用一句话报告当前阶段，显示在 footer 状态行（`▸ Fixing the retry loop`），下次轮次开始时清空；会话切换/退出时也清空，不跨会话残留 |
 
 `/balance codex` 需要先通过 `/login openai-codex` 登录 ChatGPT Plus/Pro 订阅。`/balance opencode` 查 OpenCode Go 的 5 小时/周/月额度，需要先配置 `opencode-go` 的 API Key。
+
+### 进展状态行
+
+`progress` 工具让模型用一句话报告当前阶段，例如「正在跑 auth 测试」。文本显示在 footer 的扩展状态行（`▸ Fixing the retry loop`），不占 transcript，也不进会话记录。
+
+- 每次新的轮次开始（`agent_start`）时清空；轮次结束后保留最后一条，方便回看它停在哪里。
+- 同一轮次内多次调用只显示最新一条；换行与多余空白压成单行。
+- 参数上限 120 字符；空文本返回错误。没有 UI 的模式（print）只返回确认，不写状态。
+- 会话启动与退出时也清空，状态行不会跨会话残留。
+
+回归测试：
+
+```bash
+node --test 'tests/pi-progress.test.ts'
+```
 
 ### 首字时间与输出速率
 
@@ -280,7 +296,7 @@ pi-notify 仅在交互 TUI 模式发通知，RPC/JSON/print 等非交互模式�
 | `lib/auto-name.ts` | 自动标签名：标题清洗与最多三次尝试的重试循环 |
 | `lib/hc.ts` | herdr-core 的 JSON-RPC 客户端（命名管道、一行一条） |
 | `lib/agent-protocol.ts` | agent 消息信封（XML 拼装/解析）与名称校验（纯函数） |
-| `lib/tui/` | 全部 TUI 渲染：消息卡片、`agent_job` 工具行、`/agent list` 树卡片、备注行；规范见 `docs/tui.md` |
+| `lib/tui/` | 全部 TUI 渲染：消息卡片、`agent_job` / `progress` 工具行、`/agent list` 树卡片、备注行；规范见 `docs/tui.md` |
 | `lib/subagents.ts` | pi-subagents 注册表的子 agent 存活探测 |
 | `lib/activity.ts` | 进程级忙探测登记表：pi-bg / pi-cron 各自登记，pi-herdr-agent 汇总 |
 | `lib/cron/schedule.ts` | cron 表达式解析、下次触发、间隔换算（纯函数） |
