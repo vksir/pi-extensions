@@ -72,7 +72,7 @@ export default function progressExtension(pi: ExtensionAPI): void {
 
 			if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, `${STATUS_PREFIX}${text}`);
 			return {
-				content: [{ type: "text" as const, text: piProgressPrompt.results.shown(text) }],
+				content: [{ type: "text" as const, text: piProgressPrompt.results.shown() }],
 				details: { text } as ProgressDetails,
 			};
 		},

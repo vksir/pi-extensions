@@ -13,9 +13,9 @@ export const piProgressPrompt = {
 
 	declarations: {
 		progress: {
-			// 常驻·工具声明。显示位置与清空时机是行为约束，一次说清。
+			// 常驻·工具声明。只讲「向使用者报告进展」与调用时机，不提 UI 细节。
 			description:
-				"Show a one-line status of what you are doing in the footer, so the user can follow a long run without reading the transcript. Call it when you start a stage, switch approach, or begin a long tool call. The line clears when the next run starts.",
+				"Report what you are doing now to the user as one short line. Call it when you start a stage, switch approach, or begin a long tool call.",
 			parameters: {
 				// 常驻·工具声明。
 				text: "One short sentence. Say what you are doing now, not what you already did.",
@@ -28,15 +28,15 @@ export const piProgressPrompt = {
 	system: {
 		snippets: {
 			// 常驻·系统提示词。索引行只回答「有这个工具」。
-			progress: "Show a one-line status of the current stage in the footer",
+			progress: "Report one-line progress to the user",
 		},
 	},
 
 	// ─── 每次调用·工具返回 ───
 
 	results: {
-		/** 每次调用。设置成功，回显已规范化的文本。 */
-		shown: (text: string) => `progress shown: ${text}`,
+		/** 每次调用。设置成功。 */
+		shown: () => "progress set.",
 
 		errors: {
 			/** 每次调用。 */

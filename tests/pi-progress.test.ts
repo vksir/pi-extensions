@@ -89,7 +89,7 @@ test("设置进展后写进 footer 状态行", async () => {
 	assert.deepEqual(statuses, [{ key: "pi-progress", text: "▸ Fixing the retry loop" }]);
 	assert.equal(result.isError, undefined);
 	assert.equal(result.details.text, "Fixing the retry loop");
-	assert.equal(result.content[0].text, "progress shown: Fixing the retry loop");
+	assert.equal(result.content[0].text, "progress set.");
 });
 
 test("连续调用覆盖上一条进展", async () => {
@@ -116,7 +116,7 @@ test("没有 UI 时只返回确认，不碰状态行", async () => {
 
 	assert.deepEqual(statuses, []);
 	assert.equal(result.isError, undefined);
-	assert.equal(result.content[0].text, "progress shown: Running the auth tests");
+	assert.equal(result.content[0].text, "progress set.");
 });
 
 // ─── 输入校验 ───
