@@ -28,7 +28,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { fitTitle, runAutoName, sanitizeTitle } from "./lib/auto-name.ts";
-import { createTabRenamer, inHerdrApp, inHerdrEnv } from "./lib/herdr.ts";
+import { createTabRenamer, inHerdrApp, inHerdrEnv, inSubAgentProcess } from "./lib/herdr.ts";
 import { readExtensionSettings } from "./lib/settings.ts";
 import { basename } from "./lib/text.ts";
 import { piTitlePrompt } from "./prompt/pi-title.ts";
@@ -108,15 +108,6 @@ interface PiTitleSettings {
 	autoName?: boolean;
 	/** 生成标题用的模型 `provider/id`；缺失或解析失败时用当前会话模型。 */
 	autoNameModel?: string;
-}
-
-/**
- * 是否为 herdr-agent 拉起的子 agent（拉起时注入 `PI_AGENT_ID`）。子 agent 的 tab 名
- * 由拉起方的 `--name` 决定，自动命名只会跟它抢名字；根 agent 没有这个变量。
- * 进程内子 agent（pi-subagents）走另一条判据：它们的 `ctx.mode` 不是 "tui"。
- */
-function inSubAgentSession(): boolean {
-	return Boolean(process.env.PI_AGENT_ID?.trim());
 }
 
 /**
@@ -209,7 +200,7 @@ export default function (pi: ExtensionAPI) {
 		pi.on("session_start", (event, ctx) => {
 			if (ctx.mode !== "tui") return;
 			activeSession = ctx.sessionManager;
-			autoNamePending = event.reason !== "fork" && !inSubAgentSession() && !hasUserMessages(ctx);
+			autoNamePending = event.reason !== "fork" && !inSubAgentProcess() && !hasUserMessages(ctx);
 
 			// resume / /reload / 切换会话后，pi 的内置标题会变回 `π - <会话名> - <cwd>`；
 			// 标签未命名时 herdr 显示的就是这个标题。会话名存在就把标签对齐回去，

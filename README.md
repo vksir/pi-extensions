@@ -28,7 +28,7 @@ node --test tests/*.test.ts
 | [pi-btw](extensions/pi-btw.ts) | 顺带分派：仅在 herdr / herdr app 环境注册 `/btw <消息>`，新开一个标签，fork 当前会话启动 pi 并把消息作为首条消息递交；本轮还在跑时先把 fork 源截到上一个完整轮次，避免新会话继承半截 turn（见 [ADR-0008](docs/adr/0008-btw-forks-at-turn-boundary.md)） |
 | [pi-bg](extensions/pi-bg.ts) | 后台运行：`bash_bg` / `codemode_bg` 立即返回，结束后把结果作为消息回发；前台 `bash` / `codemode` 超过等待预算（默认 3 分钟）自动转成后台任务；`bg_job` 工具（list / show / kill）与 `/bg` 命令查看/终止，并与内置工具的启用状态联动 |
 | [pi-herdr-agent](extensions/pi-herdr-agent.ts) | 用 herdr-core（hc）的终端树跑子 agent：`agent` 拉起、`agent_job` 管理（list / send / stop），消息进来一律交给 pi 插入当前轮（不吞、不排队）；回信由 agent 自己 `send`，扩展不代发；`/agent list` 显示 agent 树；仅 herdr app + hc 环境生效 |
-| [pi-progress](extensions/pi-progress.ts) | 长任务进展：`progress` 工具让模型用一句话报告当前阶段，显示在 footer 状态行（`▸ Fixing the retry loop`），下次轮次开始时清空；会话切换/退出时也清空，不跨会话残留 |
+| [pi-progress](extensions/pi-progress.ts) | 长任务进展：`progress` 工具让模型用一句话报告当前阶段，显示在 footer 状态行（`▸ Fixing the retry loop`），下次轮次开始时清空；会话切换/退出时也清空，不跨会话残留；pi-herdr-agent 拉起的子代理不注册此工具 |
 
 `/balance codex` 需要先通过 `/login openai-codex` 登录 ChatGPT Plus/Pro 订阅。`/balance opencode` 查 OpenCode Go 的 5 小时/周/月额度，需要先配置 `opencode-go` 的 API Key。
 
@@ -40,6 +40,7 @@ node --test tests/*.test.ts
 - 同一轮次内多次调用只显示最新一条；换行与多余空白压成单行。
 - 参数上限 120 字符；空文本返回错误。没有 UI 的模式（print）只返回确认，不写状态。
 - 会话启动与退出时也清空，状态行不会跨会话残留。
+- pi-herdr-agent 拉起的子代理（注入 `PI_AGENT_ID`）不注册 `progress`：子代理有自己的终端，但用户看的是父代理的 transcript。
 
 回归测试：
 

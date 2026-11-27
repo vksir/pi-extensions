@@ -70,6 +70,15 @@ export function inHerdrEnv(): boolean {
 	return inLegacyHerdr() || inHerdrApp();
 }
 
+/**
+ * 是否为 pi-herdr-agent 拉起的子 agent（拉起时注入 PI_AGENT_ID，根 agent 没有）。
+ * 子 agent 在自己的终端里跑，界面只有它自己看；需要按角色收窄功能的扩展用它判断。
+ * 进程内子 agent（pi-subagents）不走这条判据，它们的 `ctx.mode` 不是 "tui"。
+ */
+export function inSubAgentProcess(): boolean {
+	return envValue("PI_AGENT_ID") !== undefined;
+}
+
 /** 旧 herdr CLI 命令：优先注入的 HERDR_BIN_PATH（Windows 下绝对路径才可靠）。 */
 function herdrCommand(): string {
 	return envValue("HERDR_BIN_PATH") ?? HERDR_CLI;

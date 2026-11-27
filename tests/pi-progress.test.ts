@@ -19,6 +19,7 @@ interface StatusCall {
 }
 
 interface Setup {
+	tools: Map<string, Setup["tool"]>;
 	tool: {
 		name: string;
 		label: string;
@@ -35,43 +36,67 @@ interface Setup {
 
 /** 每个用例拿到全新的扩展实例，避免注册表互相污染。 */
 let moduleSeq = 0;
-async function setup(hasUI = true): Promise<Setup> {
-	const { default: progressExtension } = await import(`../extensions/pi-progress.ts?run=${moduleSeq++}`);
+async function setup(hasUI = true, subAgent = false): Promise<Setup> {
+	// 导入时判角色：根代理没有 PI_AGENT_ID，子代理由 herdr-agent 注入。
+	const previousAgentId = process.env.PI_AGENT_ID;
+	if (subAgent) process.env.PI_AGENT_ID = "a1b2c3";
+	else delete process.env.PI_AGENT_ID;
 
-	const tools = new Map<string, Setup["tool"]>();
-	const handlers = new Map<string, Handler[]>();
+	try {
+		const { default: progressExtension } = await import(`../extensions/pi-progress.ts?run=${moduleSeq++}`);
 
-	const pi = {
-		on(event: string, handler: Handler) {
-			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
-		},
-		registerTool(definition: Setup["tool"]) {
-			tools.set(definition.name, definition);
-		},
-	};
-	progressExtension(pi as never);
+		const tools = new Map<string, Setup["tool"]>();
+		const handlers = new Map<string, Handler[]>();
 
-	const statuses: StatusCall[] = [];
-	const ctx: FakeCtx = {
-		hasUI,
-		ui: {
-			setStatus(key, text) {
-				statuses.push({ key, text });
+		const pi = {
+			on(event: string, handler: Handler) {
+				handlers.set(event, [...(handlers.get(event) ?? []), handler]);
 			},
-		},
-	};
+			registerTool(definition: Setup["tool"]) {
+				tools.set(definition.name, definition);
+			},
+		};
+		progressExtension(pi as never);
 
-	return {
-		tool: tools.get("progress")!,
-		ctx,
-		statuses,
-		fire(event, eventCtx = ctx) {
-			for (const handler of handlers.get(event) ?? []) handler({ type: event }, eventCtx);
-		},
-	};
+		const statuses: StatusCall[] = [];
+		const ctx: FakeCtx = {
+			hasUI,
+			ui: {
+				setStatus(key, text) {
+					statuses.push({ key, text });
+				},
+			},
+		};
+
+		return {
+			tools,
+			tool: tools.get("progress")!,
+			ctx,
+			statuses,
+			fire(event, eventCtx = ctx) {
+				for (const handler of handlers.get(event) ?? []) handler({ type: event }, eventCtx);
+			},
+		};
+	} finally {
+		if (previousAgentId === undefined) delete process.env.PI_AGENT_ID;
+		else process.env.PI_AGENT_ID = previousAgentId;
+	}
 }
 
 // ─── 设置与展示 ───
+
+test("herdr-agent 拉起的子代理不注册 progress", async () => {
+	const { tools, fire, statuses } = await setup(true, true);
+
+	assert.equal(tools.size, 0);
+	fire("agent_start");
+	assert.deepEqual(statuses, []);
+});
+
+test("根代理没有 PI_AGENT_ID 时照常注册", async () => {
+	const { tools } = await setup();
+	assert.deepEqual([...tools.keys()], ["progress"]);
+});
 
 test("progress 注册为模型可见工具，带索引行", async () => {
 	const { tool } = await setup();

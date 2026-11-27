@@ -11,6 +11,7 @@
 
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { inSubAgentProcess } from "./lib/herdr.ts";
 import { renderProgressCall } from "./lib/tui/progress.ts";
 import { ERROR_PREFIX, piProgressPrompt } from "./prompt/pi-progress.ts";
 
@@ -46,6 +47,10 @@ function failure(message: string) {
 }
 
 export default function progressExtension(pi: ExtensionAPI): void {
+	// pi-herdr-agent 拉起的子 agent 注入 PI_AGENT_ID：它有自己的终端，但用户看的是
+	// 父 agent 的 transcript；子 agent 报告进展只会写进没人盯着的状态行。
+	if (inSubAgentProcess()) return;
+
 	// 新一轮开始：上一轮的进展已经过时。
 	pi.on("agent_start", (_event, ctx) => clearStatus(ctx));
 	// 状态行跨会话共享，换会话/退出时也要清。
