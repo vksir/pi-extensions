@@ -5,7 +5,7 @@ import { initTheme, type ExtensionContext, type ReadonlyFooterDataProvider, type
 import { createFirstTokenTimer, createRateFooter, formatFirstToken, formatRate, insertRate, outputRate, shrinkPadding } from "../extensions/lib/footer-rate.ts";
 import { averageFirstTokenMs, averageOutputRate, recordSessionTurn, type SessionTurn } from "../extensions/lib/session-usage.ts";
 import { parseRateWindow, renderRate, renderStats, tokenArgumentCompletions } from "../extensions/pi-token-stats.ts";
-import type { RateRow } from "../extensions/lib/token-stats-db.ts";
+import type { RateModelRow } from "../extensions/lib/token-stats-db.ts";
 
 // 内置 FooterComponent 渲染时会取当前主题的颜色。
 initTheme("dark");
@@ -270,8 +270,10 @@ test("parseRateWindow：默认 1 小时，支持 m/h/d/all", () => {
 	assert.throws(() => parseRateWindow("0h"), /greater than 0/);
 });
 
-function rateRow(overrides: Partial<RateRow> = {}): RateRow {
+function rateModelRow(model: string, overrides: Partial<RateModelRow> = {}): RateModelRow {
 	return {
+		model,
+		lastAt: 1_000,
 		turns: 2,
 		timedOutput: 1_000,
 		timedMs: 10_000,
@@ -281,26 +283,53 @@ function rateRow(overrides: Partial<RateRow> = {}): RateRow {
 	};
 }
 
-test("renderRate：当前模型的平均首字与平均速率", () => {
-	const text = renderRate(rateRow(), "new-api/opencode-go/deepseek-v4.1-flash", { since: 0, label: "1h" }).join("\n");
+test("renderRate：时间窗内所有模型各一行，带平均首字与平均速率", () => {
+	const text = renderRate(
+		[
+			rateModelRow("new-api/opencode-go/deepseek-v4.1-flash", { lastAt: 2_000 }),
+			rateModelRow("openai/gpt-5.1", {
+				lastAt: 1_000,
+				turns: 7,
+				timedOutput: 2_000,
+				timedMs: 20_000,
+				firstTokenMs: 2_400,
+				firstTokenSamples: 2,
+			}),
+		],
+		{ since: 0, label: "1h" },
+		100,
+	).join("\n");
 	assert.match(text, /Token Rate · Last 1h/);
-	assert.match(text, /new-api\/opencode-go\/deepseek-v4\.1-flash/);
-	assert.match(text, /Avg TTFT\s+800ms/);
-	assert.match(text, /Avg Rate\s+100t\/s/);
+	// 表头 + 每个模型一行；模型名不再当标题单独一行
+	assert.equal(text.match(/new-api\/opencode-go\/deepseek-v4\.1-flash/g)?.length, 1);
+	assert.match(text, /Model\s+Avg TTFT\s+Avg Rate\s+Turns/);
+	assert.match(text, /new-api\/opencode-go\/deepseek-v4\.1-flash\s+800ms\s+100t\/s\s+2/);
+	assert.match(text, /openai\/gpt-5\.1\s+1\.2s\s+100t\/s\s+7/);
+	// 最近用过的模型排前面
+	assert.ok(text.indexOf("deepseek-v4.1-flash") < text.indexOf("gpt-5.1"));
 });
 
 test("renderRate：没有数据与没有计时样本的占位", () => {
-	const empty = renderRate(undefined, "openai/gpt-5", { since: 0, label: "3h" }).join("\n");
+	const empty = renderRate([], { since: 0, label: "3h" }, 100).join("\n");
 	assert.match(empty, /Token Rate · Last 3h/);
-	assert.match(empty, /No data for openai\/gpt-5\./);
+	assert.match(empty, /No data\./);
 
 	const noTiming = renderRate(
-		rateRow({ timedOutput: 0, timedMs: 0, firstTokenMs: 0, firstTokenSamples: 0 }),
-		"deepseek/deepseek-chat",
+		[rateModelRow("deepseek/deepseek-chat", { timedOutput: 0, timedMs: 0, firstTokenMs: 0, firstTokenSamples: 0 })],
 		{ since: 0, label: "1h" },
+		100,
 	).join("\n");
-	assert.match(noTiming, /Avg TTFT\s+-/);
-	assert.match(noTiming, /Avg Rate\s+-/);
+	assert.match(noTiming, /deepseek\/deepseek-chat\s+-\s+-\s+2/);
+});
+
+test("renderRate：模型名过长时截尾，不撑破终端宽度", () => {
+	const model = "new-api/opencode-go/deepseek-v4.1-flash";
+	const lines = renderRate([rateModelRow(model)], { since: 0, label: "1h" }, 48);
+	const row = lines.find((line) => line.includes("…"));
+	assert.ok(row, "应当截断并带省略号");
+	assert.equal(row.length, 48);
+	// 保留后缀：provider 前缀重复度高，区分度在后半段
+	assert.match(row, /….*v4\.1-flash/);
 });
 
 test("tokenArgumentCompletions：补全保留已写好的参数", () => {

@@ -39,16 +39,16 @@ _Avoid_: 日聚合、daily stats
 _Avoid_: 会话记录表、session row
 
 **速率视图 (Rate View)**：
-`/token rate [窗口]` 的输出，只列当前模型的 `Avg TTFT` 与 `Avg Rate`，不显示用量；默认过去 1 小时。与 `/token` 用量报告是同一个命令的两个分支，报告文案统一英文。
+`/token rate [窗口]` 的输出：时间窗内每个用过的模型一行，列出 `Avg TTFT`、`Avg Rate` 与 `Turns`，不显示用量；默认过去 1 小时。与 `/token` 用量报告是同一个命令的两个分支，报告文案统一英文。
 _Avoid_: 性能报告、speed command
 
 **时间窗 (Time Window)**：
 速率视图的聚合范围，默认过去 1 小时，可用 `30m` / `3h` / `7d` / `all` 指定。窗口从查询时刻向前滚，不按自然小时切。
 _Avoid_: 区间、时间段、period
 
-**当前模型 (Current Model)**：
-速率视图唯一统计的模型，由 `ctx.model` 的 `provider/id` 确定，与 `turn` 表里落盘的 `provider/model` 同形。没有记录时显示 `No data for ...`，不混入其他模型。
-_Avoid_: 活动模型、默认模型
+**模型行 (Model Row)**：
+速率视图里按 `turn.model`（`provider/model`）分组的一行：轮次、有耗时响应的输出与耗时、测到的首字时间都用 `GROUP BY model` 聚合，最近用过的排前面。窗口内没有记录的模型不出现；某个模型没有计时/首字样本时对应列显示 `-`。
+_Avoid_: 当前模型、活动模型、默认模型
 
 **迁移备份 (Migration Backup)**：
 任何改变表结构或删数据的迁移，动手前必须先 `VACUUM INTO 'token-stats.db.before-migrate-<timestamp>'` 备份旧数据库；迁移失败从备份恢复。`/token rate` 只用 `turn` 明细，没有 schema 迁移。

@@ -66,17 +66,19 @@ test("recordTurn：一轮同时写明细、按天汇总与会话汇总", () => {
 		assert.equal(averageOutputRate(session), 100);
 		assert.equal(averageFirstTokenMs(session), 700);
 
-		// 速率视图只看 turn 明细的时间窗，不受 day_model 影响
-		assert.deepEqual(store.rateRow(0, "deepseek/deepseek-chat"), {
-			turns: 2,
-			timedOutput: 400,
-			timedMs: 4_000,
-			firstTokenMs: 1_400,
-			firstTokenSamples: 2,
-		});
-		assert.equal(store.rateRow(0, "missing"), undefined);
-		assert.equal(store.latestModel(0), "deepseek/deepseek-chat");
-		assert.equal(store.latestModel(2_001), undefined);
+		// 速率视图只看 turn 明细的时间窗，不受 day_model 影响；最近用过的模型在前
+		assert.deepEqual(store.rateRows(0), [
+			{
+				model: "deepseek/deepseek-chat",
+				lastAt: 2_000,
+				turns: 2,
+				timedOutput: 400,
+				timedMs: 4_000,
+				firstTokenMs: 1_400,
+				firstTokenSamples: 2,
+			},
+		]);
+		assert.deepEqual(store.rateRows(2_001), []);
 
 		// 原始明细一轮一行
 		const raw = new DatabaseSync(dbPath(dir), { readOnly: true });
@@ -91,7 +93,7 @@ test("recordTurn：一轮同时写明细、按天汇总与会话汇总", () => {
 	}
 });
 
-test("rateRow：没有耗时或没有输出的响应不进速率样本", () => {
+test("rateRows：按模型分组，没有耗时或没有输出的响应不进速率样本", () => {
 	const dir = tempDir();
 	const store = openTokenStatsStore(dbPath(dir));
 	try {
@@ -104,13 +106,28 @@ test("rateRow：没有耗时或没有输出的响应不进速率样本", () => {
 				firstTokenMs: 500,
 			}),
 		);
-		assert.deepEqual(store.rateRow(0, "deepseek/deepseek-chat"), {
-			turns: 2,
-			timedOutput: 0,
-			timedMs: 0,
-			firstTokenMs: 500,
-			firstTokenSamples: 1,
-		});
+		store.recordTurn(turn({ at: 3_000, model: "openai/gpt-5.1", durationMs: 2_000, firstTokenMs: 400 }));
+
+		assert.deepEqual(store.rateRows(0), [
+			{
+				model: "openai/gpt-5.1",
+				lastAt: 3_000,
+				turns: 1,
+				timedOutput: 100,
+				timedMs: 2_000,
+				firstTokenMs: 400,
+				firstTokenSamples: 1,
+			},
+			{
+				model: "deepseek/deepseek-chat",
+				lastAt: 2_000,
+				turns: 2,
+				timedOutput: 0,
+				timedMs: 0,
+				firstTokenMs: 500,
+				firstTokenSamples: 1,
+			},
+		]);
 	} finally {
 		store.close();
 		rmSync(dir, { recursive: true, force: true });

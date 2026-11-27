@@ -6,14 +6,14 @@
  *
  * 一次响应写三处（见 lib/token-stats-db.ts）：原始明细 `turn`、按天 × 模型的
  * `day_model`、按会话的 `session`。`/token` 显示按天用量图与模型汇总；`/token rate`
- * 显示当前模型的时间窗速率。
+ * 显示时间窗内所有模型的速率。
  *
  * 命令：
  *   /token             — 近 7 天用量图 + 模型汇总（默认）
  *   /token all         — 全部历史统计（/token 0d 亦可）
  *   /token 3d          — 近 3 天（Nd 任意天数）
  *   /token out         — 显示 Output 柱状图（可与天数组合，如 /token 7d Out）
- *   /token rate [1h]   — 当前模型的时间窗速率（默认 1h，可写 3h / 7d / all）
+ *   /token rate [1h]   — 时间窗内所有模型的速率（默认 1h，可写 3h / 7d / all）
  *
  * footer 状态行里插入最近一次响应的首字时间与输出速率（如 `R1.5M 0.9s 42t/s CH97.1%`），
  * 由 lib/footer-rate.ts 包一层内置 footer 实现。
@@ -31,7 +31,7 @@ import { createFirstTokenTimer, createRateFooter, formatFirstToken, formatRate }
 import { renderDimLines } from "./lib/render.ts";
 import type { SessionUsageTotals } from "./lib/session-usage.ts";
 import { openTokenStatsClient, type TokenStatsClient } from "./lib/token-stats-client.ts";
-import type { DayModelRow, RateRow } from "./lib/token-stats-db.ts";
+import type { DayModelRow, RateModelRow } from "./lib/token-stats-db.ts";
 
 // ─── 存储 ───
 
@@ -165,26 +165,52 @@ export function formatRateWindowLabel(ms: number): string {
 	return `${days > 0 ? `${days}d` : ""}${hours > 0 ? `${hours}h` : ""}${minutes > 0 ? `${minutes}m` : ""}`;
 }
 
-const RATE_METRIC_WIDTH = 10;
 const RATE_VALUE_WIDTH = 8;
+const RATE_TURNS_WIDTH = 5;
+const RATE_MODEL_MIN_WIDTH = 12;
+/** 模型名以外的固定宽度：缩进 + 三个数值列 + 列间距。 */
+const RATE_FIXED_WIDTH = 2 + 2 + RATE_VALUE_WIDTH + 2 + RATE_VALUE_WIDTH + 2 + RATE_TURNS_WIDTH;
 
-/** `/token rate` 的排版：当前模型的时间窗平均首字与平均输出速率。 */
-export function renderRate(row: RateRow | undefined, model: string, window: RateWindow): string[] {
+function termColumns(): number {
+	return (process.stdout as { columns?: number })?.columns ?? 80;
+}
+
+/** 模型名过长时只留后半段：provider 前缀重复度高，区分度在后半段。 */
+function fitModel(name: string, width: number): string {
+	if (name.length <= width) return name.padEnd(width);
+	return `…${name.slice(name.length - width + 1)}`;
+}
+
+/** 模型列宽：取最长模型名，但不超过终端剩余宽度，不撑出横向溢出。 */
+function rateModelWidth(rows: readonly RateModelRow[], columns: number): number {
+	const longest = rows.reduce((max, row) => Math.max(max, row.model.length), "Model".length);
+	return Math.max(RATE_MODEL_MIN_WIDTH, Math.min(longest, columns - RATE_FIXED_WIDTH));
+}
+
+/**
+ * `/token rate` 的排版：时间窗内每个模型一行，最近用过的在前；
+ * 没有计时/首字样本的模型在对应列显示 `-`。纯函数，查询在 worker 里做。
+ */
+export function renderRate(rows: readonly RateModelRow[], window: RateWindow, columns = termColumns()): string[] {
 	const title = window.label === "all" ? "📊 Token Rate · All time" : `📊 Token Rate · Last ${window.label}`;
-	const lines: string[] = [`  ${title}`, "", `  ${model}`, ""];
-	if (!row) {
-		lines.push(`  No data for ${model}.`, "");
+	const lines: string[] = [`  ${title}`, ""];
+	if (rows.length === 0) {
+		lines.push("  No data.", "");
 		return lines;
 	}
 
-	const ttft = row.firstTokenSamples > 0 ? row.firstTokenMs / row.firstTokenSamples : undefined;
-	const rate = row.timedMs > 0 ? row.timedOutput / (row.timedMs / 1000) : undefined;
-	const metric = (label: string, value: string): string =>
-		`  ${label.padEnd(RATE_METRIC_WIDTH)}  ${value.padStart(RATE_VALUE_WIDTH)}`;
-	lines.push(metric("Metric", "Value"));
-	lines.push(`  ${"─".repeat(RATE_METRIC_WIDTH)}  ${"─".repeat(RATE_VALUE_WIDTH)}`);
-	lines.push(metric("Avg TTFT", ttft === undefined ? "-" : formatFirstToken(ttft)));
-	lines.push(metric("Avg Rate", rate === undefined ? "-" : formatRate(rate)));
+	const modelWidth = rateModelWidth(rows, columns);
+	const line = (model: string, ttft: string, rate: string, turns: string): string =>
+		`  ${fitModel(model, modelWidth)}  ${ttft.padStart(RATE_VALUE_WIDTH)}  ${rate.padStart(RATE_VALUE_WIDTH)}  ${turns.padStart(RATE_TURNS_WIDTH)}`;
+	lines.push(line("Model", "Avg TTFT", "Avg Rate", "Turns"));
+	lines.push(
+		`  ${"─".repeat(modelWidth)}  ${"─".repeat(RATE_VALUE_WIDTH)}  ${"─".repeat(RATE_VALUE_WIDTH)}  ${"─".repeat(RATE_TURNS_WIDTH)}`,
+	);
+	for (const entry of rows) {
+		const ttft = entry.firstTokenSamples > 0 ? formatFirstToken(entry.firstTokenMs / entry.firstTokenSamples) : "-";
+		const rate = entry.timedMs > 0 ? formatRate(entry.timedOutput / (entry.timedMs / 1000)) : "-";
+		lines.push(line(entry.model, ttft, rate, String(entry.turns)));
+	}
 	lines.push("");
 	return lines;
 }
@@ -309,7 +335,7 @@ export function renderStats(dayRows: DayModelRow[], days: number, showOutput = f
 		lines.push("  No data.", "");
 	} else {
 		const { rows, maxInput, maxOutput } = collectChartData(dayRows);
-		const width = barWidth((process.stdout as { columns?: number })?.columns ?? 80);
+		const width = barWidth(termColumns());
 
 		if (showOutput) {
 			appendChart(lines, rows, "Tokens per Day (Output)", (row) => row.output, maxOutput, width, false);
@@ -330,7 +356,7 @@ const TOKEN_ARGS: AutocompleteItem[] = [
 	{ value: "Out", label: "Out", description: "Show Output chart" },
 ];
 
-const RATE_COMMAND: AutocompleteItem = { value: "rate", label: "rate", description: "Current model rate (default 1h)" };
+const RATE_COMMAND: AutocompleteItem = { value: "rate", label: "rate", description: "All models rate (default 1h)" };
 
 /** `/token rate` 的窗口候选：只提示默认值，其他窗口仍可手写。 */
 const RATE_ARGS: AutocompleteItem[] = [
@@ -432,14 +458,8 @@ export default function (pi: ExtensionAPI) {
 				const tokens = args.trim().split(/\s+/).filter(Boolean);
 				if (tokens[0]?.toLowerCase() === "rate") {
 					const window = parseRateWindow(tokens.slice(1).join(" "));
-					const stats = statsClient();
-					// 当前模型与落盘时的 `provider/model` 同形；拿不到时退回窗口内最近一次的模型
-					const current = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-					const model = current ?? (await stats.latestModel(window.since));
-					const row = model ? await stats.rateRow(window.since, model) : undefined;
-					pi.appendEntry<TokenStatsEntry>("token-stats", {
-						lines: renderRate(row, model ?? "unknown", window),
-					});
+					const rows = await statsClient().rateRows(window.since);
+					pi.appendEntry<TokenStatsEntry>("token-stats", { lines: renderRate(rows, window) });
 					return;
 				}
 

@@ -11,7 +11,7 @@
 
 import { parentPort, workerData } from "node:worker_threads";
 import type { SessionRecord } from "./session-usage.ts";
-import { openTokenStatsStore, type DayModelRow, type RateRow, type TokenStatsStore, type TurnInput } from "./token-stats-db.ts";
+import { openTokenStatsStore, type DayModelRow, type RateModelRow, type TokenStatsStore, type TurnInput } from "./token-stats-db.ts";
 import { importLegacyCache } from "./token-stats-legacy.ts";
 
 export interface WorkerStartData {
@@ -23,14 +23,13 @@ export type WorkerRequest =
 	| { type: "turn"; turn: TurnInput }
 	| { type: "dayRows"; id: number; from?: string }
 	| { type: "session"; id: number; sessionId: string }
-	| { type: "rate"; id: number; since: number; model: string }
-	| { type: "latest"; id: number; since: number }
+	| { type: "rate"; id: number; since: number }
 	| { type: "close" };
 
 export type WorkerReply =
 	| { type: "ready" }
 	| { type: "failed"; message: string }
-	| { type: "result"; id: number; value: DayModelRow[] | SessionRecord | RateRow | string | null }
+	| { type: "result"; id: number; value: DayModelRow[] | RateModelRow[] | SessionRecord | null }
 	| { type: "error"; id: number; message: string };
 
 const port = parentPort;
@@ -67,9 +66,7 @@ port.on("message", (message: WorkerRequest) => {
 		} else if (message.type === "dayRows") {
 			port.postMessage({ type: "result", id: message.id, value: store.dayRows(message.from) });
 		} else if (message.type === "rate") {
-			port.postMessage({ type: "result", id: message.id, value: store.rateRow(message.since, message.model) ?? null });
-		} else if (message.type === "latest") {
-			port.postMessage({ type: "result", id: message.id, value: store.latestModel(message.since) ?? null });
+			port.postMessage({ type: "result", id: message.id, value: store.rateRows(message.since) });
 		} else {
 			port.postMessage({ type: "result", id: message.id, value: store.sessionRecord(message.sessionId) ?? null });
 		}
