@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
 import { renderProgressCall } from "../extensions/lib/tui/progress.ts";
+import { normalizeMaxLines } from "../extensions/pi-progress.ts";
 import { piProgressPrompt } from "../extensions/prompt/pi-progress.ts";
 
 // ─── 测试替身 ───
@@ -66,7 +67,11 @@ function progressEntries(entries: readonly FakeEntry[]): { text: string; round: 
 
 /** 每个用例拿到全新的扩展实例，避免注册表与轮次计数互相污染。 */
 let moduleSeq = 0;
-async function setup(hasUI = true, subAgent = false): Promise<Setup> {
+async function setup(
+	hasUI = true,
+	subAgent = false,
+	settings: Record<string, unknown> = {},
+): Promise<Setup> {
 	// 导入时判角色：根代理没有 PI_AGENT_ID，子代理由 herdr-agent 注入。
 	const previousAgentId = process.env.PI_AGENT_ID;
 	if (subAgent) process.env.PI_AGENT_ID = "a1b2c3";
@@ -94,6 +99,7 @@ async function setup(hasUI = true, subAgent = false): Promise<Setup> {
 			appendEntry(customType: string, data?: unknown) {
 				entries.push({ type: "custom", customType, data });
 			},
+			getSettings: () => settings,
 		};
 		progressExtension(pi as never);
 
@@ -110,6 +116,12 @@ async function setup(hasUI = true, subAgent = false): Promise<Setup> {
 			},
 		};
 
+		const fire = (event: string, eventCtx: FakeCtx = ctx) => {
+			for (const handler of handlers.get(event) ?? []) handler({ type: event }, eventCtx);
+		};
+		// 扩展在 session_start 里读 settings 并注册，沿用 pi 的真实时序。
+		fire("session_start");
+
 		return {
 			tools,
 			tool: tools.get("progress")!,
@@ -117,9 +129,7 @@ async function setup(hasUI = true, subAgent = false): Promise<Setup> {
 			entries,
 			ctx,
 			widgets,
-			fire(event, eventCtx = ctx) {
-				for (const handler of handlers.get(event) ?? []) handler({ type: event }, eventCtx);
-			},
+			fire,
 		};
 	} finally {
 		if (previousAgentId === undefined) delete process.env.PI_AGENT_ID;
@@ -146,6 +156,24 @@ test("根代理没有 PI_AGENT_ID 时照常注册", async () => {
 	const { tools, commands } = await setup();
 	assert.deepEqual([...tools.keys()], ["progress"]);
 	assert.deepEqual([...commands.keys()], ["progress"]);
+});
+
+test("enabled: false 时工具、命令、事件都不注册", async () => {
+	const { tools, commands, fire, widgets } = await setup(true, false, { "pi-progress": { enabled: false } });
+
+	assert.equal(tools.size, 0);
+	assert.equal(commands.size, 0);
+	fire("agent_start");
+	assert.deepEqual(widgets, []);
+});
+
+test("normalizeMaxLines 把非法值与越界值收进 1-10", () => {
+	assert.equal(normalizeMaxLines(undefined), 3);
+	assert.equal(normalizeMaxLines(0), 3);
+	assert.equal(normalizeMaxLines(-2), 3);
+	assert.equal(normalizeMaxLines(4.7), 4);
+	assert.equal(normalizeMaxLines(99), 10);
+	assert.equal(normalizeMaxLines("5"), 3);
 });
 
 test("progress 注册为模型可见工具，带索引行", async () => {
@@ -203,18 +231,38 @@ test("超过 3 条时 widget 只留最近 3 条", async () => {
 	assert.equal(progressEntries(entries).length, 5);
 });
 
+test("maxLines 可以调低到 1 条", async () => {
+	const { tool, ctx, widgets } = await setup(true, false, { "pi-progress": { maxLines: 1 } });
+	await report(tool, ctx, "one");
+	await report(tool, ctx, "two");
+
+	const lines = renderWidget(widgets.at(-1)!);
+	assert.equal(lines.length, 1);
+	assert.match(lines[0], /^ ▌ \d{2}:\d{2}  two$/);
+});
+
+test("maxLines 可以调高到 5 条", async () => {
+	const { tool, ctx, widgets } = await setup(true, false, { "pi-progress": { maxLines: 5 } });
+	for (let index = 1; index <= 6; index += 1) await report(tool, ctx, `stage ${index}`);
+
+	const lines = renderWidget(widgets.at(-1)!);
+	assert.equal(lines.length, 5);
+	assert.match(lines[0], /^ {3}\d{2}:\d{2}  stage 2$/);
+	assert.match(lines.at(-1)!, /^ ▌ \d{2}:\d{2}  stage 6$/);
+});
+
 test("换行和多余空白压成一行", async () => {
 	const { tool, ctx, widgets } = await setup();
 	await report(tool, ctx, "  Running\n  the   auth tests  ");
 
-	assert.match(renderWidget(widgets[0])[0], /^ ▌ \d{2}:\d{2}  Running the auth tests$/);
+	assert.match(renderWidget(widgets.at(-1)!)[0], /^ ▌ \d{2}:\d{2}  Running the auth tests$/);
 });
 
 test("窄终端下进展行不溢出", async () => {
 	const { tool, ctx, widgets } = await setup();
 	await report(tool, ctx, "Wiring the retry loop into the uploader");
 
-	const lines = renderWidget(widgets[0], 20);
+	const lines = renderWidget(widgets.at(-1)!, 20);
 	assert.equal(lines.length, 1);
 	assert.ok(visibleWidth(lines[0]) <= 20, `line is ${visibleWidth(lines[0])} columns: ${lines[0]}`);
 });
@@ -246,6 +294,7 @@ test("空白文本返回错误，不覆盖当前进展也不写记录", async ()
 
 test("超长文本返回错误，不写 widget 与记录", async () => {
 	const { tool, ctx, widgets, entries } = await setup();
+	widgets.length = 0;
 	const result = await report(tool, ctx, "x".repeat(121));
 
 	assert.deepEqual(widgets, []);
@@ -296,6 +345,8 @@ test("会话启动后轮次编号接着历史最大值", async () => {
 
 test("会话启动与退出时也清空，避免跨会话残留", async () => {
 	const { widgets, fire } = await setup();
+	// setup 已经经历过一次 session_start，先清掉这条记录。
+	widgets.length = 0;
 
 	fire("session_start");
 	fire("session_shutdown");

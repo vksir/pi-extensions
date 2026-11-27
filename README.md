@@ -51,6 +51,20 @@ node --test tests/*.test.ts
 - 会话启动与退出时清空 widget，进展行不会跨会话残留；轮次编号接着会话里已有的最大轮次。
 - pi-herdr-agent 拉起的子代理（注入 `PI_AGENT_ID`）不注册工具与命令：子代理有自己的终端，但用户看的是父代理的 transcript。
 
+`settings.json` 配置（改后 `/reload` 生效）：
+
+```json
+{
+	"pi-progress": {
+		"enabled": true,
+		"maxLines": 3
+	}
+}
+```
+
+- `enabled` 默认 `true`；设为 `false` 时不注册工具、命令和事件，完全关闭。
+- `maxLines` 默认 `3`，取值 `1`–`10`；超出范围按边界处理，非法值退回 `3`。它只影响 widget，`/progress` 始终显示全部记录。
+
 回归测试：
 
 ```bash

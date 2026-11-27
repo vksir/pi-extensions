@@ -13,6 +13,10 @@
  *
  * pi-herdr-agent 拉起的子 agent（注入 PI_AGENT_ID）不注册任何东西：它有自己的终端，
  * 但用户看的是父 agent 的 transcript。
+ *
+ * settings.json 配置（改后 `/reload` 生效）：
+ *   - `enabled`：功能总开关，默认 true；false 时工具、命令、事件全不注册。
+ *   - `maxLines`：widget 显示条数，默认 3，取值 1-10；`/progress` 不受影响。
  */
 
 import { Type } from "typebox";
@@ -24,8 +28,9 @@ import {
 	progressInfoEntryRenderer,
 	type ProgressInfoEntry,
 } from "./lib/tui/progress-history.ts";
-import { renderProgressWidget } from "./lib/tui/progress-widget.ts";
+import { renderProgressWidget, DEFAULT_MAX_PROGRESS_LINES } from "./lib/tui/progress-widget.ts";
 import type { EntryLine } from "./lib/render.ts";
+import { readExtensionSettings } from "./lib/settings.ts";
 import { ERROR_PREFIX, piProgressPrompt } from "./prompt/pi-progress.ts";
 
 /** widget 的 key；同一 key 重复设置即覆盖。 */
@@ -34,6 +39,25 @@ const WIDGET_KEY = "pi-progress";
 const ENTRY_TYPE = "pi-progress:entry";
 /** 参数上限：一句话，不是阶段日志。 */
 const MAX_CHARS = 120;
+/** settings.json 中的扩展配置键。 */
+const SETTINGS_KEY = "pi-progress";
+/** widget 条数上限；pi 的 widget 太高会挤占对话区。 */
+const MAX_LINES_LIMIT = 10;
+
+interface PiProgressSettings {
+	/** 功能总开关；默认打开。 */
+	enabled?: boolean;
+	/** widget 显示条数；默认 3，超出 1-10 时按边界处理。 */
+	maxLines?: number;
+}
+
+/** 把 settings 里的 maxLines 收成 1-10 的整数；非法值退回默认值。 */
+export function normalizeMaxLines(value: unknown): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_MAX_PROGRESS_LINES;
+	const lines = Math.floor(value);
+	if (lines < 1) return DEFAULT_MAX_PROGRESS_LINES;
+	return Math.min(lines, MAX_LINES_LIMIT);
+}
 
 /** 一条进展：文本、所属轮次（从 1 开始）、写入时间。 */
 export interface ProgressRecord {
@@ -125,65 +149,86 @@ function failure(message: string) {
 }
 
 export default function progressExtension(pi: ExtensionAPI): void {
-	if (inSubAgentProcess()) return;
+	let initialized = false;
+	let active = false;
 
-	// 新一轮开始：上一轮的进展从 widget 上退场，但记录已经写进会话，`/progress` 还能看到。
-	pi.on("agent_start", (_event, ctx) => {
-		round += 1;
-		current = [];
-		clearWidget(ctx);
-	});
+	/**
+	 * 注册工具与事件。getSettings 是 pi 的 action 方法，扩展加载阶段不可用，
+	 * 所以推到 session_start；同一个实例只执行一次。
+	 */
+	function setup(): void {
+		if (initialized) return;
+		initialized = true;
 
-	// widget 跟着会话走；轮次编号接着会话里已有的最大轮次数。
+		const settings = readExtensionSettings<PiProgressSettings>(pi, SETTINGS_KEY);
+		// 总开关关闭，或 herdr-agent 拉起的子 agent：工具、命令、事件都不挂。
+		if (settings.enabled === false || inSubAgentProcess()) return;
+		active = true;
+		const maxLines = normalizeMaxLines(settings.maxLines);
+
+		// 新一轮开始：上一轮的进展从 widget 上退场，但记录已经写进会话，/progress 还能看到。
+		pi.on("agent_start", (_event, ctx) => {
+			round += 1;
+			current = [];
+			clearWidget(ctx);
+		});
+
+		pi.on("session_shutdown", (_event, ctx) => {
+			current = [];
+			clearWidget(ctx);
+		});
+
+		pi.registerTool({
+			name: "progress",
+			label: "Progress",
+			description: piProgressPrompt.declarations.progress.description,
+			promptSnippet: piProgressPrompt.system.snippets.progress,
+			parameters: Type.Object({
+				text: Type.String({
+					description: piProgressPrompt.declarations.progress.parameters.text,
+					maxLength: MAX_CHARS,
+				}),
+			}),
+
+			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+				// widget 和工具行都只放一行；多余空白压成单空格，防止进展行被换行撑开。
+				const text = params.text.replace(/\s+/g, " ").trim();
+				if (!text) return failure(piProgressPrompt.results.errors.empty());
+				if (text.length > MAX_CHARS) return failure(piProgressPrompt.results.errors.tooLong(MAX_CHARS));
+
+				const record: ProgressRecord = { text, round: Math.max(round, 1), at: Date.now() };
+				current = [...current, record];
+				pi.appendEntry<ProgressRecord>(ENTRY_TYPE, record);
+				if (ctx.hasUI) {
+					ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => renderProgressWidget(current, theme, maxLines));
+				}
+
+				return {
+					content: [{ type: "text" as const, text: piProgressPrompt.results.shown() }],
+					details: { text } as ProgressDetails,
+				};
+			},
+
+			renderCall: renderProgressCall,
+		});
+
+		pi.registerCommand("progress", {
+			description: "显示所有进展，含历史轮次",
+			handler: async (_rawArgs, ctx) => {
+				pi.appendEntry<ProgressInfoEntry>(PROGRESS_INFO_ENTRY, { lines: progressLines(readRecords(ctx)) });
+			},
+		});
+
+		pi.registerEntryRenderer<ProgressInfoEntry>(PROGRESS_INFO_ENTRY, progressInfoEntryRenderer);
+	}
+
+	// 加载阶段只挂这一个 handler；真正的注册等 settings 可读之后再做。
 	pi.on("session_start", (_event, ctx) => {
+		setup();
+		if (!active) return;
+		// widget 跟着会话走；轮次编号接着会话里已有的最大轮次数。
 		current = [];
 		round = maxRound(readRecords(ctx));
 		clearWidget(ctx);
 	});
-
-	pi.on("session_shutdown", (_event, ctx) => {
-		current = [];
-		clearWidget(ctx);
-	});
-
-	pi.registerTool({
-		name: "progress",
-		label: "Progress",
-		description: piProgressPrompt.declarations.progress.description,
-		promptSnippet: piProgressPrompt.system.snippets.progress,
-		parameters: Type.Object({
-			text: Type.String({
-				description: piProgressPrompt.declarations.progress.parameters.text,
-				maxLength: MAX_CHARS,
-			}),
-		}),
-
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			// widget 和工具行都只放一行；多余空白压成单空格，防止进展行被换行撑开。
-			const text = params.text.replace(/\s+/g, " ").trim();
-			if (!text) return failure(piProgressPrompt.results.errors.empty());
-			if (text.length > MAX_CHARS) return failure(piProgressPrompt.results.errors.tooLong(MAX_CHARS));
-
-			const record: ProgressRecord = { text, round: Math.max(round, 1), at: Date.now() };
-			current = [...current, record];
-			pi.appendEntry<ProgressRecord>(ENTRY_TYPE, record);
-			if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => renderProgressWidget(current, theme));
-
-			return {
-				content: [{ type: "text" as const, text: piProgressPrompt.results.shown() }],
-				details: { text } as ProgressDetails,
-			};
-		},
-
-		renderCall: renderProgressCall,
-	});
-
-	pi.registerCommand("progress", {
-		description: "显示所有进展，含历史轮次",
-		handler: async (_rawArgs, ctx) => {
-			pi.appendEntry<ProgressInfoEntry>(PROGRESS_INFO_ENTRY, { lines: progressLines(readRecords(ctx)) });
-		},
-	});
-
-	pi.registerEntryRenderer<ProgressInfoEntry>(PROGRESS_INFO_ENTRY, progressInfoEntryRenderer);
 }
