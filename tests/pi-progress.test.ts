@@ -172,6 +172,25 @@ test("一轮内多次报告按顺序堆叠，最新一条在底部", async () =>
 	assert.match(lines[2], /^ ▌ \d{2}:\d{2}  Running the auth tests$/);
 });
 
+test("历史行用 dim，最新行正文用 accent", async () => {
+	const { tool, ctx, widgets } = await setup();
+	await report(tool, ctx, "Reading the failing test");
+	await report(tool, ctx, "Running the auth tests");
+
+	const tokens: string[] = [];
+	const recording = {
+		fg(token: string, text: string) {
+			tokens.push(token);
+			return text;
+		},
+	};
+	assert.ok(widgets.at(-1)!.content);
+	widgets.at(-1)!.content!({}, recording).render(80);
+
+	// 历史行：时间 dim、正文 dim；最新行：竖块 accent、时间 dim、正文 accent。
+	assert.deepEqual(tokens, ["dim", "dim", "accent", "dim", "accent"]);
+});
+
 test("超过 8 条时 widget 只留最近 8 条", async () => {
 	const { tool, ctx, widgets, entries } = await setup();
 	for (let index = 1; index <= 9; index += 1) await report(tool, ctx, `stage ${index}`);

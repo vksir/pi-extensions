@@ -9,7 +9,7 @@
  *   20:15  Patching the uploader
  *  ▌ 20:16  Running the auth tests
  *
- * 最新一条由 accent 竖块标出、正文用默认前景色；历史行正文 muted，时间统一 dim。
+ * 最新一条由 accent 竖块与紫色正文标出；历史行正文与时间都用 dim，和 footer 统计行同色。
  * 单行截断，不折叠。
  */
 
@@ -39,7 +39,7 @@ export function renderProgressWidget(items: readonly ProgressWidgetItem[], theme
 		const time = clock(item.at);
 		// 历史行用空格占住竖块的位置，让时间戳对齐。
 		const marker = latest ? theme.fg("accent", "▌") : " ";
-		const line = `${marker} ${theme.fg("dim", time)}  ${theme.fg(latest ? "text" : "muted", item.text)}`;
+		const line = `${marker} ${theme.fg("dim", time)}  ${theme.fg(latest ? "accent" : "dim", item.text)}`;
 		container.addChild(new TruncatedText(line, 1, 0));
 	});
 	return container;

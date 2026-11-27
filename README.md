@@ -34,7 +34,7 @@ node --test tests/*.test.ts
 
 ### 进展行
 
-`progress` 工具让模型用一句话报告当前阶段，例如「正在跑 auth 测试」。文本显示在输入框上方的 widget，每条带 `HH:MM`，最新一条前面有 `▌` 强调条，历史行灰色：
+`progress` 工具让模型用一句话报告当前阶段，例如「正在跑 auth 测试」。文本显示在输入框上方的 widget，每条带 `HH:MM`，最新一条的竖条与正文是紫色，历史行与 footer 统计行同色（dim）：
 
 ```
   20:14  Reading the failing test
