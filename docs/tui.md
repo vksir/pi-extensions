@@ -14,6 +14,7 @@
 | `lib/tui/agent-job.ts` | `agent_job` 的工具调用行（`renderCall`） |
 | `lib/tui/progress.ts` | `progress` 的工具调用行（`renderCall`） |
 | `lib/tui/progress-widget.ts` | `progress` 的进展行（`ctx.ui.setWidget`，编辑器上方） |
+| `lib/tui/progress-history.ts` | `/progress` 的结果卡片（`pi.appendEntry` + `registerEntryRenderer`） |
 | `lib/tui/agent-tree.ts` | `/agent list` 的树卡片（`pi.appendEntry` + `registerEntryRenderer`） |
 | `lib/tui/note.ts` | transcript 里的单行备注（entry 渲染器） |
 
