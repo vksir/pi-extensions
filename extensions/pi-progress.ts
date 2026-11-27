@@ -2,7 +2,7 @@
  * Pi Progress Extension
  *
  * 长任务里让模型用一句话报告当前阶段，显示在输入框上方的 widget（`ctx.ui.setWidget`）。
- * widget 显示当前轮次最近 8 条；每次新的轮次（`agent_start`）开始时清空，所以它描述
+ * widget 显示当前轮次最近 3 条；每次新的轮次（`agent_start`）开始时清空，所以它描述
  * 的是本次轮次正在做什么，不是完整日志。轮次结束后仍保留最后一批，方便人回看。
  *
  * 每条进展同时以 custom entry 写进会话（`pi.appendEntry`），`/progress` 从会话读回

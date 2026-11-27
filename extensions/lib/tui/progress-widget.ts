@@ -1,8 +1,8 @@
 /**
  * progress 的进展行 —— 编辑器上方的 widget（`ctx.ui.setWidget`）。
  *
- * 展示位置：输入框上方、对话流与编辑器之间；不是 transcript 消息。最多 8 行，
- * 只显示当前轮次最近 8 条，更早的用 `/progress` 看。
+ * 展示位置：输入框上方、对话流与编辑器之间；不是 transcript 消息。最多 3 行，
+ * 只显示当前轮次最近 3 条，更早的用 `/progress` 看。
  * 效果（3 条）：
  *
  *   20:14  Reading the failing test
@@ -17,7 +17,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Container, TruncatedText } from "@earendil-works/pi-tui";
 
 /** widget 最多显示多少条；超出的只留在 `/progress` 里。 */
-export const MAX_PROGRESS_LINES = 8;
+export const MAX_PROGRESS_LINES = 3;
 
 /** widget 只需要文本与写入时间。 */
 export interface ProgressWidgetItem {

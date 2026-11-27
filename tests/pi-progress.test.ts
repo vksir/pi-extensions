@@ -191,16 +191,16 @@ test("历史行用 dim，最新行正文用 accent", async () => {
 	assert.deepEqual(tokens, ["dim", "dim", "accent", "dim", "accent"]);
 });
 
-test("超过 8 条时 widget 只留最近 8 条", async () => {
+test("超过 3 条时 widget 只留最近 3 条", async () => {
 	const { tool, ctx, widgets, entries } = await setup();
-	for (let index = 1; index <= 9; index += 1) await report(tool, ctx, `stage ${index}`);
+	for (let index = 1; index <= 5; index += 1) await report(tool, ctx, `stage ${index}`);
 
 	const lines = renderWidget(widgets.at(-1)!);
-	assert.equal(lines.length, 8);
-	assert.match(lines[0], /^ {3}\d{2}:\d{2}  stage 2$/);
-	assert.match(lines.at(-1)!, /^ ▌ \d{2}:\d{2}  stage 9$/);
-	// 全部 9 条都写进了会话，`/progress` 不会丢。
-	assert.equal(progressEntries(entries).length, 9);
+	assert.equal(lines.length, 3);
+	assert.match(lines[0], /^ {3}\d{2}:\d{2}  stage 3$/);
+	assert.match(lines.at(-1)!, /^ ▌ \d{2}:\d{2}  stage 5$/);
+	// 全部 5 条都写进了会话，`/progress` 不会丢。
+	assert.equal(progressEntries(entries).length, 5);
 });
 
 test("换行和多余空白压成一行", async () => {
