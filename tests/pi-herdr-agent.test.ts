@@ -13,6 +13,7 @@ import { hasBusyActivity, registerBusyProbe } from "../extensions/lib/activity.t
 import {
 	buildRows,
 	currentTree,
+	firstLine,
 	formatAgentTree,
 	formatRows,
 	isDescendant,
@@ -22,6 +23,7 @@ import {
 	rewriteDoneStatus,
 	rootIdOf,
 	splitDraftFromEnvelope,
+	workStateOf,
 	type AgentRow,
 } from "../extensions/pi-herdr-agent.ts";
 import { type TreeLine } from "../extensions/lib/tui/agent-tree.ts";
@@ -333,6 +335,29 @@ async function setup(
 
 function toolResultText(result: ToolCallResult): string {
 	return result.content.map((block) => block.text).join("\n");
+}
+
+/** 已经发给本地 agent 的 notice 正文，按到达顺序。 */
+function noticeBodies(pi: FakePi): string[] {
+	return pi.messages
+		.map((entry) => parseAgentEnvelope(String(entry.message.content)))
+		.filter((envelope) => envelope?.type === "notice")
+		.map((envelope) => String(envelope?.body ?? ""));
+}
+
+/** 走一次 `agent_job send`，记一笔「等它回信」。 */
+async function sendTo(pi: FakePi, id: string, message = "hi"): Promise<void> {
+	await pi.tools
+		.get("agent_job")!
+		.execute("call", { action: "send", id, message }, undefined, undefined, context());
+}
+
+/** 带一个言辞未定的子终端：地址 t10、id aaaa、父是自己。 */
+function withChild(status: HcTerminal["status"] = { app: "pi", state: "idle" }): HcTerminal[] {
+	return [
+		terminal({ address: "t4m", labels: {} }),
+		terminal({ address: "t10", name: "kid", labels: { "pi.agent": "aaaa" }, parent: "t4m", status }),
+	];
 }
 
 // ─── 工具注册 ───
@@ -927,6 +952,174 @@ test("each send needs its own reply before the ledger is clear", async () => {
 		pi.messages.filter((entry) => parseAgentEnvelope(String(entry.message.content))?.type === "notice").length,
 		1,
 	);
+});
+
+test("workStateOf 把每个状态词归到 working / stopped / gone / unknown", () => {
+	assert.equal(workStateOf({ state: "live", status: { app: "pi", state: "working" } }), "working");
+	for (const state of ["idle", "done", "blocked", "error"]) {
+		assert.equal(workStateOf({ state: "live", status: { app: "pi", state } }), "stopped");
+	}
+	assert.equal(workStateOf({ state: "live", status: null }), "unknown");
+	assert.equal(workStateOf({ state: "finished", status: { app: "pi", state: "idle" } }), "gone");
+});
+
+test("firstLine 取首行、去尾句号、截断", () => {
+	assert.equal(firstLine("\n 413 Request Entity Too Large. \nmore"), "413 Request Entity Too Large");
+	assert.equal(firstLine("a".repeat(300))?.length, 200);
+	assert.equal(firstLine(undefined), undefined);
+});
+
+test("with events, a child that stops without replying is reported once", async () => {
+	const hc = new FakeHc({ events: true });
+	hc.terminals = withChild();
+	const { pi } = await setup({ hc });
+	await sendTo(pi, "aaaa");
+	await new Promise((resolve) => setImmediate(resolve));
+
+	hc.emit("status", "t10", { status: { app: "pi", state: "working" } });
+	assert.deepEqual(noticeBodies(pi), [], "开工期间不报");
+
+	hc.emit("status", "t10", { status: { app: "pi", state: "idle" } });
+	assert.deepEqual(noticeBodies(pi), ["It stopped without replying."]);
+
+	// 同一段停止反复上报：只报一次。
+	hc.emit("status", "t10", { status: { app: "pi", state: "done" } });
+	assert.deepEqual(noticeBodies(pi), ["It stopped without replying."]);
+});
+
+test("with events, an error is reported with the first line of its message", async () => {
+	const hc = new FakeHc({ events: true });
+	hc.terminals = withChild();
+	const { pi } = await setup({ hc });
+	await sendTo(pi, "aaaa");
+	await new Promise((resolve) => setImmediate(resolve));
+
+	hc.emit("status", "t10", { status: { app: "pi", state: "working" } });
+	hc.emit("status", "t10", {
+		status: { app: "pi", state: "error", msg: "413 Request Entity Too Large.\nbody: too long" },
+	});
+	assert.deepEqual(noticeBodies(pi), ["It hit an error: 413 Request Entity Too Large and has not replied."]);
+});
+
+test("with events, a blocked child names what it is waiting for", async () => {
+	const hc = new FakeHc({ events: true });
+	hc.terminals = withChild();
+	const { pi } = await setup({ hc });
+	await sendTo(pi, "aaaa");
+	await new Promise((resolve) => setImmediate(resolve));
+
+	hc.emit("status", "t10", { status: { app: "pi", state: "working" } });
+	hc.emit("status", "t10", { status: { app: "pi", state: "blocked", kind: "permission" } });
+	// 同一段里的第二次上报：已经有通知了，不再发。
+	hc.emit("status", "t10", { status: { app: "pi", state: "blocked", kind: "" } });
+	assert.deepEqual(noticeBodies(pi), ["It is blocked (permission) and has not replied."]);
+});
+
+test("with events, a child that stops twice without replying is reported twice", async () => {
+	const hc = new FakeHc({ events: true });
+	hc.terminals = withChild();
+	const { pi } = await setup({ hc });
+	await sendTo(pi, "aaaa");
+	await new Promise((resolve) => setImmediate(resolve));
+
+	hc.emit("status", "t10", { status: { app: "pi", state: "working" } });
+	hc.emit("status", "t10", { status: { app: "pi", state: "idle" } });
+	hc.emit("status", "t10", { status: { app: "pi", state: "working" } });
+	hc.emit("status", "t10", { status: { app: "pi", state: "idle" } });
+	assert.deepEqual(noticeBodies(pi), ["It stopped without replying.", "It stopped without replying."]);
+});
+
+test("a reply does not start a ledger: nobody owes an answer to it", async () => {
+	const hc = new FakeHc({ events: true });
+	hc.terminals = withChild({ app: "pi", state: "working" });
+	const { pi } = await setup({ hc });
+	await pi.tools
+		.get("agent_job")!
+		.execute("call", { action: "send", id: "aaaa", message: "done", type: "reply" }, undefined, undefined, context());
+	await new Promise((resolve) => setImmediate(resolve));
+
+	// 对方停了、甚至没了，都不该冒出「它没回信」。
+	hc.emit("status", "t10", { status: { app: "pi", state: "idle" } });
+	hc.terminals = [terminal({ address: "t4m", labels: {} })];
+	hc.emit("removed", "t10");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(noticeBodies(pi), []);
+});
+
+test("with events, a child that was already working at subscribe time still reports its stop", async () => {
+	// 订阅那一刻它就在干活（send 之后才开始盯）：快照要算开工过，
+	// 否则错过那条 working，停下时就认不出来。
+	const hc = new FakeHc({ events: true });
+	hc.terminals = withChild({ app: "pi", state: "working" });
+	const { pi } = await setup({ hc });
+	await sendTo(pi, "aaaa");
+	await new Promise((resolve) => setImmediate(resolve));
+
+	hc.emit("status", "t10", { status: { app: "pi", state: "idle" } });
+	assert.deepEqual(noticeBodies(pi), ["It stopped without replying."]);
+});
+
+test("with events, an idle snapshot right after a send is not a stop", async () => {
+	// 刚发出去它还是 idle 快照：没有「变了」的含义，等真事件。
+	const hc = new FakeHc({ events: true });
+	hc.terminals = withChild();
+	const { pi } = await setup({ hc });
+	await sendTo(pi, "aaaa");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(noticeBodies(pi), []);
+});
+
+test("a stop notice is not repeated when the target exits afterwards", async () => {
+	const hc = new FakeHc({ events: true });
+	hc.terminals = withChild();
+	const { pi } = await setup({ hc, replyExitGraceMs: 0 });
+	await sendTo(pi, "aaaa");
+	await new Promise((resolve) => setImmediate(resolve));
+
+	hc.emit("status", "t10", { status: { app: "pi", state: "working" } });
+	hc.emit("status", "t10", { status: { app: "pi", state: "idle" } });
+	hc.terminals = [
+		terminal({ address: "t4m", labels: {} }),
+		terminal({ address: "t10", labels: { "pi.agent": "aaaa" }, parent: "t4m", state: "finished" }),
+	];
+	hc.emit("finished", "t10");
+	await new Promise((resolve) => setImmediate(resolve));
+	await new Promise((resolve) => setImmediate(resolve));
+
+	assert.deepEqual(noticeBodies(pi), ["It stopped without replying."]);
+});
+
+test("without event support, polling still reports a stop exactly once", async () => {
+	const hc = new FakeHc();
+	hc.terminals = withChild();
+	const clock = { value: 1_000 };
+	const scheduler = manualSchedule();
+	const { pi } = await setup({ hc, schedule: scheduler.schedule, now: () => clock.value });
+	await sendTo(pi, "aaaa");
+
+	await tickOnce(scheduler.ticks.shift());
+	assert.deepEqual(noticeBodies(pi), [], "启动宽限内不报");
+
+	clock.value += 21_000;
+	await tickOnce(scheduler.ticks.shift());
+	await tickOnce(scheduler.ticks.shift());
+	assert.deepEqual(noticeBodies(pi), ["It stopped without replying."]);
+});
+
+test("stopping an awaited target on purpose is not reported", async () => {
+	const hc = new FakeHc();
+	hc.terminals = withChild();
+	const scheduler = manualSchedule();
+	const { pi } = await setup({ hc, schedule: scheduler.schedule, stopGraceMs: 20 });
+	await sendTo(pi, "aaaa");
+
+	const result = await pi.tools
+		.get("agent_job")!
+		.execute("call", { action: "stop", id: "aaaa" }, undefined, undefined, context());
+	assert.match(toolResultText(result), /^Stopped agent aaaa/);
+
+	for (const tick of scheduler.ticks.splice(0)) await tickOnce(tick);
+	assert.deepEqual(noticeBodies(pi), []);
 });
 
 test("only quit tears down direct children", async () => {

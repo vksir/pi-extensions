@@ -86,6 +86,7 @@ import {
 	HcError,
 	inHcEnv,
 	type HcClient,
+	type HcStatus,
 	type HcSubscribeParams,
 	type HcSubscription,
 	type HcTerminal,
@@ -120,6 +121,12 @@ const REPLY_WATCH_MS = 10_000;
 
 /** 目标终端退出后，给回信留的宽限：回信可能还在 hc 的 quiet 等待里。 */
 const DEFAULT_REPLY_EXIT_GRACE_MS = 5_000;
+
+/**
+ * 没见过它开工之前的耐心：`send` 之后目标要从空闲切到 working，
+ * 这中间别急着宣布「它没回信」。只比时间戳，不起定时器。
+ */
+const REPLY_START_GRACE_MS = 20_000;
 
 /** 子进程从 env 读自己的空闲销毁秒数；0 或缺省表示不销毁。 */
 const DESTROY_ENV = "PI_AGENT_DESTROY_TIME";
@@ -358,6 +365,12 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		name?: string;
 		address: string;
 		pending: number;
+		/** 发出去的那一刻：它一直没开工时，启动宽限从这里算。 */
+		sentAt: number;
+		/** 本周期见过它在 working：见过就不受启动宽限限制。 */
+		started?: boolean;
+		/** 本周期已经就「它没回信」通知过一次（停住 / 退出都算）。 */
+		told?: boolean;
 		/** 目标终端的事件订阅；目标还活着时一直挂着。 */
 		watch?: HcSubscription;
 		checking?: boolean;
@@ -412,6 +425,8 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 						.filter((terminal) => terminal.state === "live")
 						.map((terminal) => terminal.address),
 				);
+				// 错过的那条 `working` 快照里能补回来；停着的等真变化。
+				observeSnapshot(message.terminals);
 				return;
 			case "event": {
 				const address = message.terminal;
@@ -421,6 +436,11 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 				} else if (message.type === "finished" || message.type === "removed") {
 					liveChildren.delete(address);
 					onTerminalGone(address);
+				} else if (message.type === "status") {
+					// 停止工作就看这一条：不发定时器、不额外读账。
+					for (const [id, entry] of awaitingReply) {
+						if (entry.address === address) observeWork(id, entry, liveRecord(statusFromEvent(message.data)));
+					}
 				}
 				return;
 			}
@@ -481,8 +501,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		replyGrace.set(id, () => clearTimeout(timer));
 	};
 
-	const notifyExited = (id: string, entry: ReplyEntry): void => {
-		const body = piHerdrAgentPrompt.notices.exitedWithoutReply();
+	const notifyNotice = (id: string, entry: ReplyEntry, body: string): void => {
 		try {
 			pi.sendMessage<AgentMessageDetails>(
 				{
@@ -495,6 +514,57 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			);
 		} catch (error) {
 			appendNote(`could not report ${id}: ${errorMessage(error)}`);
+		}
+	};
+
+	/** 停下来却没回信时那句话：弹窗带等待种类，报错带错误首行。 */
+	const stoppedBody = (terminal: Pick<HcTerminal, "status">): string => {
+		const status = terminal.status;
+		if (status?.state === "blocked") {
+			return piHerdrAgentPrompt.notices.blockedWithoutReply(status.kind || "waiting");
+		}
+		const message = status?.state === "error" ? firstLine(status.msg) : undefined;
+		return message
+			? piHerdrAgentPrompt.notices.failedWithoutReply(message)
+			: piHerdrAgentPrompt.notices.stoppedWithoutReply();
+	};
+
+	/**
+	 * 目标不干活了：`working` 只复位标记，`idle` / `done` / `blocked` / `error`
+	 * 都发一条「它没回信」。同一段停止只报一次（`told`）；它重新开工、或者
+	 * 我又发了一条，才算新的一段。退出（`gone`）交给退出路径：那里要核整棵子树。
+	 *
+	 * `fromPolling` 是轮询看到的：它分不出「刚变成这样」和「一直这样」，
+	 * 所以没见过目标开工时先留一段启动宽限；有事件时只看真变化，不必等。
+	 */
+	const observeWork = (
+		id: string,
+		entry: ReplyEntry,
+		terminal: Pick<HcTerminal, "state" | "status">,
+		fromPolling = false,
+	): void => {
+		if (awaitingReply.get(id) !== entry) return;
+		const work = workStateOf(terminal);
+		if (work === "working") {
+			// 又开工了：下一次停下是新的一段。
+			entry.started = true;
+			entry.told = undefined;
+			return;
+		}
+		if (entry.told || work !== "stopped") return;
+		if (fromPolling && !entry.started && now() - entry.sentAt < REPLY_START_GRACE_MS) return;
+		entry.told = true;
+		notifyNotice(id, entry, stoppedBody(terminal));
+	};
+
+	/**
+	 * 快照是「订阅那一刻」的事实，没有「变了」的含义：只认它正在干活（补上错过的那条
+	 * `working`），已经停着的交给后续事件。
+	 */
+	const observeSnapshot = (terminals: readonly HcTerminal[]): void => {
+		for (const [id, entry] of awaitingReply) {
+			const record = terminals.find((terminal) => terminal.address === entry.address);
+			if (record && workStateOf(record) === "working") observeWork(id, entry, record);
 		}
 	};
 
@@ -552,8 +622,9 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 				return;
 			}
 
+			// 停住时已经报过「没回信」：这里只销账，不补第二条。
 			dropReplyEntry(id);
-			notifyExited(id, entry);
+			if (!entry.told) notifyNotice(id, entry, piHerdrAgentPrompt.notices.exitedWithoutReply());
 		} finally {
 			entry.checking = false;
 			if (entry.recheck) {
@@ -577,6 +648,7 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 				return;
 			}
 			if (message.kind === "snapshot" || message.kind === "missed") {
+				observeSnapshot(message.terminals);
 				if (!message.terminals.some((terminal) => terminal.state === "live")) {
 					scheduleReplyExitCheck(id, entry);
 				}
@@ -584,6 +656,10 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			}
 			if (message.kind === "event" && (message.type === "finished" || message.type === "removed")) {
 				scheduleReplyExitCheck(id, entry);
+				return;
+			}
+			if (message.kind === "event" && message.type === "status") {
+				observeWork(id, entry, liveRecord(statusFromEvent(message.data)));
 			}
 		});
 		if (subscription === WATCH_GONE) {
@@ -632,13 +708,17 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			entry = existing;
 			entry.pending += 1;
 			entry.name = peer.name ?? entry.name;
+			// 我又发了一条：新的一段，之前那次「没回信」不再算数。
+			entry.sentAt = now();
+			entry.started = undefined;
+			entry.told = undefined;
 			if (entry.address !== address) {
 				entry.address = address;
 				entry.watch?.close();
 				entry.watch = undefined;
 			}
 		} else {
-			entry = { name: peer.name, address, pending: 1 };
+			entry = { name: peer.name, address, pending: 1, sentAt: now() };
 			awaitingReply.set(peer.id, entry);
 		}
 
@@ -696,12 +776,15 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 					entry.address = alive.address;
 					void watchReplyTarget(id, entry);
 				}
+				// 事件不可用时，这里是唯一能看到它停下来的地方。
+				observeWork(id, entry, alive, true);
 				continue;
 			}
 			if (subtreeAlive(entry.address)) continue;
 
+			// 停住时已经报过「没回信」：这里只销账，不补第二条。
 			dropReplyEntry(id);
-			notifyExited(id, entry);
+			if (!entry.told) notifyNotice(id, entry, piHerdrAgentPrompt.notices.exitedWithoutReply());
 		}
 
 		// 事件恢复后把轮询停掉；订阅建立是异步的，建立后自己会再检查一次。
@@ -1169,6 +1252,8 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 			return fail(piHerdrAgentPrompt.results.errors.notDescendant(params.id), "stop", params.id);
 		}
 		await requestQuit(target.address);
+		// 是我叫它停的：不要再补一条「它没回信」。
+		dropReplyEntry(params.id);
 		return ok(piHerdrAgentPrompt.results.stopped(params.id), { action: "stop", id: params.id });
 	};
 
@@ -1262,21 +1347,25 @@ export default function piHerdrAgent(pi: ExtensionAPI, options: HerdrAgentOption
 		const target = await requireTarget(params.id);
 		if (target.row.id === myId) return fail(piHerdrAgentPrompt.results.errors.cannotActOnSelf("send to"), "send", params.id);
 
+		const type = params.type ?? "task";
 		await hc.send({
 			terminal: target.terminal.address,
 			caller: self,
 			text: formatAgentEnvelope({
 				from: myId,
 				name: displayName(ctx),
-				type: params.type ?? "task",
+				type,
 				body: params.message,
 			}),
 		});
-		void expectReply(
-			{ id: target.row.id, name: target.row.name },
-			target.terminal.address,
-			target.terminal.parent === self,
-		);
+		// 回信不需要回答：只有派活 / 催问才记一笔「等它回信」。
+		if (type !== "reply") {
+			void expectReply(
+				{ id: target.row.id, name: target.row.name },
+				target.terminal.address,
+				target.terminal.parent === self,
+			);
+		}
 		return ok(piHerdrAgentPrompt.results.sent(target.row.id, target.row.name), {
 			action: "send",
 			id: target.row.id,
@@ -1353,6 +1442,42 @@ export function parseDestroyTime(raw: string | undefined): number {
 	if (raw === undefined) return 0;
 	const value = Number.parseInt(raw.trim(), 10);
 	return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/** 目标此刻在干什么：判定「停止工作但没回信」用。 */
+export type WorkState = "working" | "stopped" | "gone" | "unknown";
+
+/**
+ * 子终端现在的干活状态：`working` 才算在干活；`idle` / `done` / `blocked` /
+ * `error` 都是停了（后两个是停下来的理由）；程序从不上报状态时是 `unknown`，
+ * 这类目标只能靠退出事件。
+ */
+export function workStateOf(terminal: Pick<HcTerminal, "state" | "status">): WorkState {
+	if (terminal.state === "finished") return "gone";
+	const state = terminal.status?.state;
+	if (!state) return "unknown";
+	return state === "working" ? "working" : "stopped";
+}
+
+/** 把程序上报的错误压成一句话：首行、去尾句号、截断。 */
+export function firstLine(message: string | null | undefined, max = 200): string | undefined {
+	const line = message
+		?.split(/\r?\n/)
+		.map((part) => part.trim())
+		.find(Boolean);
+	if (!line) return undefined;
+	return line.replace(/[.。]+$/, "").slice(0, max);
+}
+
+/** `status` 事件里的状态对象；形状不对就当它没上报。 */
+function statusFromEvent(data: Record<string, unknown> | undefined): HcStatus | null {
+	const status = data?.status;
+	return status && typeof status === "object" ? (status as HcStatus) : null;
+}
+
+/** 事件只带状态、不带整条记录：按「还活着」组装一份够判定的形状。 */
+function liveRecord(status: HcStatus | null): Pick<HcTerminal, "state" | "status"> {
+	return { state: "live", status };
 }
 
 /** 默认调度器：`setInterval`，返回取消函数。 */

@@ -28,7 +28,8 @@
 - 每个子 agent 都是一个完整 pi 进程：内存与启动开销真实存在；树深限三层，并发不设上限（扇出由模型自己控制）。
 - 结果正文按 bash 工具同款（2000 行 / 50 KB）尾部截断，全文落 `pi-herdr-agent-*.log`，由 asker 自己读。
 - 子 agent 的 settle 状态从 pi 内置的 `done` 改写成 `idle`（stdout 层改写 OSC 7501）；根 agent 保持原生 `done` 行为。
-- `blocked` 只覆盖扩展 UI 弹窗（`ui_prompt_start`）；pi 内置的其他等待不会自动通知 asker，需 `agent_job list` / `wait` 发现。
+- `blocked` 在子 agent 上会被认出来：它停在工作就发一条「没回信」通知给发消息的一方，`blocked` / `error` 附上等待种类或错误首行（见下方增补）。
+- 目标停止工作（`idle` / `done` / `blocked` / `error`）后不会再自己回信，所以等回信的一笔记的是「停止」而不是「退出」：`agent_job list` 仍可查，但不必等它退出。
 - root 的终端前台是 shell，hc 原生的「子随父程序结束」不覆盖 root：正常退出靠扩展显式清理，硬崩溃会留下孤儿，`list` 标记 `orphan`，没有看门狗。
 - resume 依赖会话文件仍在磁盘；agent 的终端被销毁不影响 resume。
 
@@ -52,3 +53,20 @@
 - 一个 `destroy_time: 0` 的子 agent 会永久钉住父 agent（父永远有子）；同理循环 cron 会永久钉住它的 agent。要收尾只能 `kill` 或删 cron。
 - 忙探测只覆盖**本进程**：别的 pi 进程里的任务不算，这与「销毁只影响自己这棵子树」一致。
 - 倒计时期间 agent 仍是 `idle`：`ask` 照常可用，`list` / `wait` 也看不出它即将消失。
+
+## 增补：等回信的账记在「停止工作」上（2026-11）
+
+原来只有终端消失（`finished` / `removed`）才补一条「它退出了但没回信」。子 agent 停止工作后不会再自己回信——413 之类的错误停在 `error`、弹窗停在 `blocked`、正常收工停在 `idle` / `done`——这些情况以前只能靠 `agent_job list` 发现，发消息的一方会一直等。
+
+- **判据是 hc 的状态词**：`working` 算在干活；`idle` / `done` / `blocked` / `error` 都算停了。信号只来自已有的 `events.subscribe`（`children_of: self` 或单个终端）的 `status` 事件，以及没有事件时的 `hc.list()` 轮询，不新增定时器、不打 stdout。
+- **一段停止只报一次**：见过 `working`、或我又发了一条，才算新的一段；`told` 标记随账走，收到回信或账销掉即清。停住后再退出，只销账不补第二条。
+- **自己停的不报**：`agent_job stop` 成功后销账，避免「我叫它停的」变成「它没回信」。
+- **只有派活要回答**：`agent_job send` 的 `type=reply` 不记账——否则回信本身会再记一笔「等对方回答回信」，子父之间来回触发。
+- **订阅快照只认 `working`**：事件订阅建立得晚时，快照里的 `working` 补上错过的那条；快照里就停着的没有「变了」的含义，交给后续事件（轮询路径另有 20 秒启动宽限，防止刚发出去就宣布没回）。
+- **hc 的 note 照旧关掉**（拉起时 `no_notify: true`），通知只有一种形态：扩展发的 `type="notice"` 卡片。
+
+### 被否决的选项（增补）
+
+- **停止后的固定宽限**：等 5 秒再报只换来「通知变慢」，而 `status` 事件本身就是变化通知，不重复。
+- **靠抢在 hc 的 note 之前 `terminal.get` 标已读**：`no_notify` 已经让 core 根本不生成 note，不需要竞态。
+- **轮询所有账**：事件路径健康时仍然轮询会把「不发定时器」的设计退回去。

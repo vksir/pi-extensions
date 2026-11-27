@@ -59,6 +59,12 @@ export const piHerdrAgentPrompt = {
 	notices: {
 		/** 消息发出去后，目标整个子树都退出了，一直没有回信。 */
 		exitedWithoutReply: () => "It exited without replying.",
+		/** 目标停止工作（idle / done）了，再没回信：它不会自己动起来。 */
+		stoppedWithoutReply: () => "It stopped without replying.",
+		/** 目标卡在弹窗上：它自己动不了，除非有人回答那个弹窗。 */
+		blockedWithoutReply: (kind: string) => `It is blocked (${kind}) and has not replied.`,
+		/** 目标以错误收场（例如 413）：附错误首行。 */
+		failedWithoutReply: (message: string) => `It hit an error: ${message} and has not replied.`,
 	},
 
 	// ─── 常驻·系统提示词 ───
