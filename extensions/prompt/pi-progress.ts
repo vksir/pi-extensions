@@ -15,7 +15,7 @@ export const piProgressPrompt = {
 		progress: {
 			// 常驻·工具声明。只讲用途与调用时机，格式约束留给字段 text。
 			description:
-				"Report your progress to the user. On long or complex tasks, call it when you start a stage or switch approach.",
+				"Report your progress to the user. Call it when you start a stage or switch approach during a long or complex task.",
 			parameters: {
 				// 常驻·工具声明。
 				text: "One short sentence. Say what you are doing now, not what you already did.",
